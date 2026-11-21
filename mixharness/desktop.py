@@ -15,6 +15,7 @@ from .desktop_agent import AgentDialog, ApprovalDialog
 from .agent_settings import PERMISSIONS, SPEEDS, available_speeds
 from .slash import execute_command
 from .desktop_clients import ClientHistory
+from .desktop_inputs import ComposerInputs
 from .desktop_usage import UsageDialog
 from .desktop_style import RESOURCES, THEMES, apply_theme
 from .desktop_widgets import (
@@ -106,7 +107,11 @@ class Window(QMainWindow):
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("搜索项目或会话")
         self.filter.setClearButtonEnabled(True)
-        self.filter.textChanged.connect(self.fill_history)
+        self.filter_timer = QTimer(self)
+        self.filter_timer.setSingleShot(True)
+        self.filter_timer.setInterval(220)
+        self.filter_timer.timeout.connect(self.select_source)
+        self.filter.textChanged.connect(self.search_changed)
         col.addWidget(self.filter)
         self.filter.hide()
         col.addSpacing(20)
@@ -191,7 +196,7 @@ class Window(QMainWindow):
         self.heading.setAlignment(ALIGN.AlignCenter)
         col.addWidget(self.heading)
         col.addSpacing(12)
-        self.timeline = Timeline()
+        self.timeline = Timeline(self.engine.store.inputs)
         col.addWidget(self.timeline, 1)
         self.preview = Document()
         self.preview.setAccessibleName("正在生成的内容")
@@ -214,6 +219,11 @@ class Window(QMainWindow):
         self.editor.submitted.connect(self.send)
         self.editor.textChanged.connect(self.editor_changed)
         self.editor.focus_changed.connect(self.composer_focus)
+        self.inputs = ComposerInputs(self)
+        self.inputs.changed.connect(self.editor_changed)
+        self.editor.image_files.connect(self.inputs.add_files)
+        self.editor.image_bytes.connect(self.inputs.paste_image)
+        controls.addWidget(self.inputs)
         controls.addWidget(self.editor)
         tools = QHBoxLayout()
         tools.setSpacing(6)
@@ -226,12 +236,13 @@ class Window(QMainWindow):
             pick.usage_requested.connect(self.show_usage)
             self.pickers[provider] = pick
             tools.addWidget(pick)
-        tools.addStretch()
         self.speed_box = QComboBox()
-        self.speed_box.setAccessibleName("Codex 速度")
+        self.speed_box.setAccessibleName("GPT Fast 速度")
+        self.speed_box.setObjectName("flat")
         self.speed_box.setToolTip("Codex 速度")
         self.speed_box.currentIndexChanged.connect(self.change_speed)
         tools.addWidget(self.speed_box, 0, ALIGN.AlignBottom)
+        tools.addStretch()
         self.backend_box = QComboBox()
         self.backend_box.setAccessibleName("会话执行方式")
         self.backend_box.setToolTip("执行方式")
@@ -240,6 +251,9 @@ class Window(QMainWindow):
         self.backend_box.addItem("本机客户端", "clients")
         self.backend_box.currentIndexChanged.connect(self.change_backend)
         tools.addWidget(self.backend_box, 0, ALIGN.AlignBottom)
+        self.add_input = button("添加附件或引用", self.inputs.menu, "plus", icon_only=True)
+        self.add_input.setFixedSize(30, 32)
+        tools.addWidget(self.add_input, 0, ALIGN.AlignBottom)
         self.send_button = button("发送消息", self.send, "send", "send", icon_only=True)
         self.send_button.setFixedSize(32, 32)
         self.send_button.setEnabled(False)
@@ -404,10 +418,15 @@ class Window(QMainWindow):
     def search(self):
         self.sidebar.show()
         self.expand_side.hide()
-        self.sources_box.setCurrentIndex(0)
         self.filter.show()
         self.filter.setFocus()
         self.filter.selectAll()
+
+    def search_changed(self):
+        if self.sources_box.currentData() == "mixharness":
+            self.fill_history()
+        else:
+            self.filter_timer.start()
 
     def new_session(self, checked=False, directory=None):
         if directory is not None:
@@ -424,12 +443,12 @@ class Window(QMainWindow):
         self.open_view(pid, None)
 
     def select_source(self):
+        self.filter_timer.stop()
         source = self.sources_box.currentData()
         local = source == "mixharness"
         self.history.setVisible(local)
         self.client_history.setVisible(not local)
-        if not local:
-            self.filter.hide()
+        self.client_history.query = self.filter.text().strip()
         self.client_history.select_source(None if local else source)
 
     def run_task(self, coroutine):
@@ -743,6 +762,7 @@ class Window(QMainWindow):
         self.settings.setValue("recent/" + (pid or "local"), sid or "")
         self.timeline.reset()
         self.editor.setPlainText(str(self.settings.value(self.draft_key(), "")))
+        self.inputs.restore()
         self.refresh(force=True)
         self.editor.setFocus()
 
@@ -768,8 +788,9 @@ class Window(QMainWindow):
         self.settings.setValue(key, value)
         self.settings.setValue(key + "-effort", effort)
         if not self.sid:
+            previous = self.pickers[provider].model
             self.pickers[provider].select(value, catalog.view(), effort)
-            if provider == "openai":
+            if provider == "openai" and previous != value:
                 self.draft_speed = "standard"
                 self.refresh_access()
             self.editor_changed()
@@ -820,13 +841,14 @@ class Window(QMainWindow):
         ready = self.backend_box.currentData() != "clients" or all(
             p.model in p.catalog.get("models", []) for p in self.pickers.values())
         text = self.editor.toPlainText().strip()
-        self.send_button.setEnabled(bool(text) and (ready or text.startswith("/")) and self.backend_task is None)
+        self.send_button.setEnabled(bool(text or self.inputs.items) and (ready or (text.startswith("/") and not self.inputs.items))
+                                    and self.backend_task is None)
 
     def send(self):
         text = self.editor.toPlainText().strip()
-        if not text or self.backend_task:
+        if not (text or self.inputs.items) or self.backend_task:
             return
-        if text.startswith("/"):
+        if text.startswith("/") and not self.inputs.items:
             self.send_command(text)
             return
         if self.backend_box.currentData() == "clients" and any(
@@ -842,12 +864,13 @@ class Window(QMainWindow):
                                              backend=self.backend_box.currentData(),
                                              permission=self.draft_permission, speed=self.draft_speed,
                                              efforts={p: picker.effort for p, picker in self.pickers.items()})["id"]
-        _, changed = self.engine.submit(sid, text, new_id())
+        seq, changed = self.engine.submit(sid, text, new_id(), draft=self.draft_key())
         if changed and self.engine.steering:
-            task = asyncio.create_task(self.engine.steer(sid, text))
+            task = asyncio.create_task(self.engine.steer(sid, text, seq))
             self.steering.add(task)
             task.add_done_callback(self.steering.discard)
         self.editor.clear()
+        self.inputs.restore()
         if self.sid:
             self.save_draft()
             self.refresh()
@@ -1053,7 +1076,8 @@ class Window(QMainWindow):
             self.permission_box.setCurrentIndex(self.permission_box.findData(permission))
         catalog = self.engine.client_catalogs["openai"]
         model = self.pickers["openai"].model
-        speeds = available_speeds(group_for(catalog.groups, model)) if self.backend_box.currentData() == "clients" else {}
+        native = self.backend_box.currentData() == "clients"
+        speeds = available_speeds(group_for(catalog.groups, model)) if native else {}
         speed = session.get("speed", self.draft_speed)
         if self.backend_task is None and catalog.groups and not catalog.error and speed != "standard" and speed not in speeds:
             speed = self.draft_speed = "standard"
@@ -1062,9 +1086,16 @@ class Window(QMainWindow):
         with QSignalBlocker(self.speed_box):
             self.speed_box.clear()
             for key in ("standard", *speeds):
-                self.speed_box.addItem(SPEEDS[key], key)
-            self.speed_box.setCurrentIndex(self.speed_box.findData(speed))
-        self.speed_box.setVisible(bool(speeds) and self.backend_task is None)
+                self.speed_box.addItem({"standard": "Fast 关", "fast": "Fast 开"}.get(key, SPEEDS[key]), key)
+            self.speed_box.setCurrentIndex(max(0, self.speed_box.findData(speed)))
+        self.speed_box.setEnabled(bool(speeds) and self.backend_task is None)
+        if not native:
+            reason = "切换到本机客户端即可查看 Codex 加速档位"
+        elif self.backend_task or self.pickers["openai"].loading:
+            reason = "正在读取 Codex 模型速度"
+        else:
+            reason = catalog.error or ("Codex 速度" if speeds else "当前账户或模型未提供加速档位")
+        self.speed_box.setToolTip(reason)
 
     def change_permission(self):
         mode = self.permission_box.currentData()

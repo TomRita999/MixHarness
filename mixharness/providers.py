@@ -6,6 +6,7 @@ from google import genai
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
+from .attachments import image_parts
 from .catalog import MODELS
 from .store import pack
 
@@ -110,6 +111,7 @@ class Turn:
 
 
 async def google_turn(key, job, context, results, preview):
+    content = [{"type": "text", "text": context}, *image_parts(job.get("images", []), "gemini")]
     async with genai.Client(api_key=key, vertexai=False).aio as client:
         options = {"model": job["model"], "system_instruction": PROMPTS[job["kind"]], "store": True,
                    "api_version": "v1", "timeout": 180}
@@ -117,13 +119,13 @@ async def google_turn(key, job, context, results, preview):
             options["generation_config"] = {"thinking_level": job["effort"]}
         if job["kind"] == "plan":
             response = await client.interactions.create(
-                **options, input=context,
+                **options, input=content if job.get("images") else context,
                 response_format={"type": "text", "mime_type": "application/json", "schema": Plan.model_json_schema()},
             )
             return Plan.model_validate_json(response.output_text)
         inputs = [{"type": "function_result", "name": call["name"], "call_id": call["cid"],
                    "result": [{"type": "text", "text": pack(call["result"])}]} for call in results]
-        inputs.append({"type": "user_input", "content": [{"type": "text", "text": context}]})
+        inputs.append({"type": "user_input", "content": content})
         if job["cursor"]:
             options["previous_interaction_id"] = job["cursor"]
         stream = await client.interactions.create(**options, tools=declarations(job["kind"]), input=inputs, stream=True)
@@ -160,7 +162,8 @@ def openai_result(response):
 
 async def openai_turn(key, job, context, results, preview, register_steer):
     inputs = [{"type": "function_call_output", "call_id": c["cid"], "output": pack(c["result"])} for c in results]
-    inputs.append({"role": "user", "content": context})
+    images = image_parts(job.get("images", []), "openai")
+    inputs.append({"role": "user", "content": [{"type": "input_text", "text": context}, *images] if images else context})
     functions = [dict(tool, strict=False) for tool in declarations(job["kind"])]
     options = {"model": job["model"], "input": inputs, "instructions": PROMPTS[job["kind"]],
                "store": True, "tools": [*functions, {"type": "web_search"}]}

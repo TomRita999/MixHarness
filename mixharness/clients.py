@@ -3,13 +3,16 @@ import csv
 import hashlib
 import io
 import json
+import sqlite3
 from pathlib import Path
 from datetime import datetime
 
 from markdown_it import MarkdownIt
 from pydantic import BaseModel, ConfigDict
 
+from . import antigravity_index
 from .agent_settings import codex_speeds
+from .attachments import Attachment, MAX_REFERENCE, image_parts
 from .client_rpc import ClientError, Rpc, executable
 from .providers import FUNCTIONS, PROMPTS, TOOLS, Plan, Turn, declarations
 from .reasoning import antigravity_groups, model_group
@@ -96,46 +99,98 @@ async def models(client):
     return labels
 
 
-async def chats(client, cursor=None):
+async def codex_tool_references():
+    result = []
+    async with asyncio.timeout(40), connection("codex") as rpc:
+        await rpc.initialize("codex")
+        cursor = None
+        while True:
+            page = await rpc.request("mcpServerStatus/list", {"detail": "toolsAndAuthOnly", "cursor": cursor})
+            for server in page["data"]:
+                for key, tool in server["tools"].items():
+                    name = tool.get("name") or key
+                    target = server["name"] + "/" + name
+                    description = tool.get("description") or name
+                    result.append(Attachment.reference("tool", target, "Codex MCP", target, description))
+            cursor = page.get("nextCursor")
+            if not cursor:
+                return result
+
+
+async def chats(client, cursor=None, query=""):
+    if client == "antigravity" and (not cursor or cursor.startswith("index:")):
+        try:
+            index = await asyncio.to_thread(antigravity_index.conversations, cursor, query)
+        except sqlite3.Error as exc:
+            raise ClientError(f"无法读取 Antigravity 会话索引：{exc}") from exc
+        if index is not None:
+            return index
+        if cursor:
+            raise ClientError("Antigravity 会话索引已更换，请刷新列表")
     async with asyncio.timeout(60), connection(client) as rpc:
         await rpc.initialize(client)
         if client == "codex":
             params = {"limit": 35, "cursor": cursor, "currentAccountOnly": True,
                       "sourceKinds": ["cli", "vscode", "appServer", "exec"], "sortKey": "updated_at"}
+            if query:
+                params["searchTerm"] = query
             page = await rpc.request("thread/list", params)
             entries = [{"id": t["id"], "title": t.get("name") or t["preview"].split("\n", 1)[0][:100] or "未命名会话",
                         "cwd": t.get("cwd", ""), "updated": t.get("updatedAt")} for t in page["data"] if not t["ephemeral"]]
         else:
             page = await rpc.request("session/list", {"cursor": cursor} if cursor else {})
-            entries = [{"id": t["sessionId"], "title": t.get("title") or "未命名会话", "cwd": t["cwd"],
-                        "updated": t.get("updatedAt")} for t in page["sessions"]]
+            entries = [{"id": t["sessionId"], "title": t.get("title") or "未命名会话", "cwd": t.get("cwd") or "",
+                        "updated": t.get("updatedAt")} for t in page["sessions"] if query.casefold() in (t.get("title") or "").casefold()]
         return {"source": client, "data": [dict(t, source=client) for t in entries], "next": page.get("nextCursor")}
 
 
-async def list_conversations(store, source, cursor=None, query=""):
+def updated_time(row):
+    value = row.get("updated")
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except (ValueError, OverflowError):
+            pass
+    return 0
+
+
+async def list_conversations(store, source, cursor=None, query="", on_page=None):
     if source == "mixharness":
-        return {"source": source, "data": store.sessions(query=query), "next": None}
+        page = {"source": source, "data": store.sessions(query=query), "next": None}
+        if on_page:
+            on_page(page["data"])
+        return page
     if source in ("codex", "antigravity"):
-        return await chats(source, cursor)
+        page = await chats(source, cursor, query)
+        if on_page:
+            on_page(page["data"])
+        return page
     if source != "all":
         raise ValueError("未知的会话来源")
     pages = json.loads(cursor) if cursor else {"codex": None, "antigravity": None}
     if not isinstance(pages, dict) or any(c not in ("codex", "antigravity") for c in pages):
         raise ValueError("会话分页游标无效")
-    results = await asyncio.gather(*(chats(c, token) for c, token in pages.items()), return_exceptions=True)
     entries = [] if cursor else store.sessions(query=query)
+    if on_page:
+        on_page(entries)
     following, errors = {}, {}
-    for client, result in zip(pages, results):
-        if isinstance(result, Exception):
-            errors[client] = str(result) or type(result).__name__
-        else:
-            entries.extend(result["data"])
-            if result["next"]:
-                following[client] = result["next"]
-    def timestamp(row):
-        value = row.get("updated")
-        return datetime.fromisoformat(value).timestamp() if isinstance(value, str) else value or 0
-    entries.sort(key=timestamp, reverse=True)
+    async def fetch(client, token):
+        try:
+            result = await chats(client, token, query)
+        except (OSError, ValueError, ClientError) as exc:
+            errors[client] = str(exc) or "读取会话超时"
+            return
+        entries.extend(result["data"])
+        if result["next"]:
+            following[client] = result["next"]
+        if on_page:
+            on_page(result["data"])
+    async with asyncio.TaskGroup() as group:
+        for client, token in pages.items():
+            group.create_task(fetch(client, token))
+    entries.sort(key=updated_time, reverse=True)
     return {"source": "all", "data": entries, "next": pack(following) if following else None, "errors": errors}
 
 
@@ -148,7 +203,7 @@ def add_message(messages, role, text, *, chunk=False):
         messages.append({"role": role, "text": text})
 
 
-async def history(client, identifier, cwd=None, cursor=None):
+async def history(client, identifier, cwd=None, cursor=None, *, recent=False):
     async with asyncio.timeout(90), connection(client) as rpc:
         await rpc.initialize(client)
         messages, following = [], None
@@ -158,14 +213,24 @@ async def history(client, identifier, cwd=None, cursor=None):
                 turns = (await rpc.request("thread/read", {"threadId": identifier, "includeTurns": True}))["thread"]["turns"]
             else:
                 page = await rpc.request("thread/turns/list", {"threadId": identifier, "itemsView": "full",
-                                         "limit": 8, "sortDirection": "asc", "cursor": cursor})
+                                         "limit": 16 if recent else 8, "sortDirection": "desc" if recent else "asc", "cursor": cursor})
                 turns, following = page["data"], page.get("nextCursor")
+                if recent:
+                    turns.reverse()
             for turn in turns:
                 for item in turn["items"]:
                     if item["type"] == "agentMessage":
                         add_message(messages, "assistant", item["text"])
                     elif item["type"] == "userMessage":
-                        add_message(messages, "user", "\n".join(p.get("text", "") for p in item["content"] if p["type"] == "text"))
+                        pieces = []
+                        for part in item["content"]:
+                            if part["type"] == "text":
+                                pieces.append(part["text"])
+                            elif part["type"] in ("localImage", "image"):
+                                pieces.append("[图片]")
+                            elif part["type"] in ("skill", "mention"):
+                                pieces.append("@" + part["name"])
+                        add_message(messages, "user", "\n".join(pieces))
         else:
             if not cwd:
                 page_cursor = None
@@ -173,7 +238,7 @@ async def history(client, identifier, cwd=None, cursor=None):
                     page = await rpc.request("session/list", {"cursor": page_cursor} if page_cursor else {})
                     found = next((t for t in page["sessions"] if t["sessionId"] == identifier), None)
                     if found:
-                        cwd = found["cwd"]
+                        cwd = found.get("cwd") or str(Path.home())
                         break
                     page_cursor = page.get("nextCursor")
                     if not page_cursor:
@@ -182,9 +247,35 @@ async def history(client, identifier, cwd=None, cursor=None):
                 update = params.get("update", {})
                 role = {"user_message_chunk": "user", "agent_message_chunk": "assistant"}.get(update.get("sessionUpdate"))
                 if method == "session/update" and role:
-                    add_message(messages, role, update["content"].get("text", ""), chunk=True)
+                    content = update["content"]
+                    text = "[图片]" if content.get("type") == "image" else content.get("text", "")
+                    add_message(messages, role, text, chunk=True)
             await rpc.request("session/load", {"sessionId": identifier, "cwd": cwd, "mcpServers": []}, replay)
         return {"source": client, "id": identifier, "messages": messages, "next": following}
+
+
+async def chat_reference(store, row):
+    source = row["source"]
+    if source == "mixharness":
+        messages = store.rows("SELECT seq,actor AS role,body AS text FROM events WHERE sid=? AND kind='message' ORDER BY seq DESC LIMIT 33",
+                              row["id"])
+        messages.reverse()
+        inputs = store.inputs.for_session(row["id"], messages[0]["seq"] - 1) if messages else {}
+        for msg in messages:
+            names = [i["name"] for i in inputs.get(msg["seq"], [])]
+            if names:
+                msg["text"] += "\n[附件：" + "、".join(names) + "]"
+        earlier = False
+    else:
+        page = await history(source, row["id"], row.get("cwd"), recent=True)
+        messages, earlier = page["messages"], bool(page["next"])
+    if not messages:
+        raise ValueError("这条会话还没有可引用的消息")
+    text = "\n\n".join(m["role"] + " · " + m["text"] for m in messages[-32:])
+    if len(text) > MAX_REFERENCE or len(messages) > 32 or earlier:
+        note = "（节选自会话末尾）\n"
+        text = note + text[-(MAX_REFERENCE - len(note)):]
+    return Attachment.reference("chat", row["title"], NAMES[source], row["id"], text)
 
 
 class ClientCatalog:
@@ -275,7 +366,7 @@ async def codex_turn(engine, job, cwd, prompt, schema):
             elif method == "turn/completed":
                 complete = params["turn"]
         params = {"threadId": tid, "model": model, "serviceTier": tier, "outputSchema": schema,
-                  "input": [{"type": "text", "text": prompt}]}
+                  "input": [{"type": "text", "text": prompt}, *image_parts(job.get("images", []), "codex")]}
         if effort:
             params["effort"] = effort
         await rpc.request("turn/start", params, event)
@@ -291,7 +382,9 @@ async def antigravity_turn(engine, job, cwd, prompt):
     sid, model, permission = job["sid"], job["model"], job["permission"]
     profile = private_directory(engine.home, sid)
     async with engine.client_locks.setdefault(sid, asyncio.Lock()), connection("antigravity", private=profile, permission=permission) as rpc:
-        await rpc.initialize("antigravity")
+        info = await rpc.initialize("antigravity")
+        if job.get("images") and not info.get("agentCapabilities", {}).get("promptCapabilities", {}).get("image"):
+            raise ClientError("当前 Antigravity 客户端不支持图片输入")
         rpc.handle_request = lambda method, params: client_approval(engine, job, method, params)
         bound = engine.store.session(sid)["antigravity_session"]
         spec = {"cwd": str(cwd), "mcpServers": []}
@@ -316,7 +409,8 @@ async def antigravity_turn(engine, job, cwd, prompt):
             update = params.get("update", {})
             if method == "session/update" and params.get("sessionId") == bound and update.get("sessionUpdate") == "agent_message_chunk":
                 fragments.append(update["content"].get("text", ""))
-        result = await rpc.request("session/prompt", {"sessionId": bound, "prompt": [{"type": "text", "text": prompt}]}, event)
+        parts = [{"type": "text", "text": prompt}, *image_parts(job.get("images", []), "antigravity")]
+        result = await rpc.request("session/prompt", {"sessionId": bound, "prompt": parts}, event)
         if result["stopReason"] != "end_turn":
             raise ClientError("Antigravity 返回状态 " + result["stopReason"])
         return "".join(fragments)

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -12,6 +13,7 @@ from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .attachments import Attachment, MAX_IMAGE, MAX_ITEMS
 from .engine import open_engine
 from .commands import control_server
 from .providers import MODELS
@@ -74,8 +76,14 @@ class ChatDetails(BaseModel):
     archived: bool | None = None
 
 
+class ImageInput(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    data: str = Field(max_length=4 * ((MAX_IMAGE + 2) // 3))
+
+
 class Message(BaseModel):
-    text: str = Field(min_length=1, max_length=120000)
+    text: str = Field(default="", max_length=120000)
+    images: list[ImageInput] = Field(default_factory=list, max_length=MAX_ITEMS)
     client_id: str = Field(min_length=1, max_length=100)
 
 
@@ -248,12 +256,14 @@ def create_app(project=None, home=None):
     @app.post("/api/sessions/{sid}/messages", status_code=202)
     async def message(sid: str, data: Message, background: BackgroundTasks):
         text = data.text.strip()
-        if not text:
-            raise HTTPException(422, "请填写需求")
         e = app.state.engine
-        seq, changed = e.submit(sid, text, data.client_id)
+        try:
+            images = [Attachment.image(i.name, base64.b64decode(i.data, validate=True)) for i in data.images]
+            seq, changed = e.submit(sid, text, data.client_id, attachments=images)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         if changed:
-            background.add_task(e.steer, sid, text)
+            background.add_task(e.steer, sid, text, seq)
         return {"seq": seq}
 
     @app.post("/api/sessions/{sid}/tasks/{jid}/retry")

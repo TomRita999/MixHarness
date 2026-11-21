@@ -29,7 +29,9 @@ MixHarness 就是为了解决这两个问题设计的：
 - **文件安全与快照隔离**：
   - 工程修改文件前会核对读取时的 SHA256，防止覆盖你在编辑期间手动改过的代码；
   - 验证命令都在 `.mixharness/snapshots` 的独立文件副本里执行，不会在原代码目录留下临时缓存或测试垃圾；如果验证期间你又改了源码，引擎会自动作废旧结果并按新文件重测；
-  - 输入框下方支持三档权限（**请求批准** / **帮我批准** / **完全访问**，对应 Antigravity 的 Default / Auto / Turbo），对 Pro 200 及以上 Codex 套餐且模型支持时还会开放 Fast / Ultrafast 加速档位。
+  - 输入框下方支持三档权限（**请求批准** / **帮我批准** / **完全访问**，对应 Antigravity 的 Default / Auto / Turbo）。使用本机客户端时，GPT 模型旁可以切换 **Fast**。可选档位来自 Codex；**Ultrafast** 还需要 Pro 200 或以上套餐。
+  - 点发送键旁的 **＋** 可以添加图片、引用 MixHarness / Codex / Antigravity 会话、指定工具或使用本次消息的技能。会话引用保存最近 32 条可读取消息的文字节选，最多 24,000 字。点附件可以预览，点 × 可以移除。
+  - 图片也可以直接粘贴或拖进输入框，支持 PNG、JPEG、WebP。命令行使用 `mixharness run --image 截图.png "请分析这张图"`，也可以用 `mixharness send 会话编号 --image 截图.png` 给已有会话补图。
 
 ## 快速上手
 

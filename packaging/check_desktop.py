@@ -39,6 +39,16 @@ def check_window(executable, cli, work, env):
                                                       capture_output=True, check=True, timeout=25)
                             if "共享输入约" not in terminal.stdout or terminal.stderr:
                                 raise RuntimeError(terminal.stderr or terminal.stdout)
+                            sid = db.execute("SELECT id FROM sessions WHERE project_id=?", (pid,)).fetchone()[0]
+                            image = ROOT / "mixharness/resources/app.png"
+                            sent = subprocess.run([cli, "--library", work, "--data-dir", home, "send", sid,
+                                                   "--image", image, "--no-wait"], env=env, capture_output=True,
+                                                  check=True, timeout=20)
+                            seq = json.loads(sent.stdout)["seq"]
+                            saved = db.execute("SELECT i.data FROM message_inputs m JOIN input_items i ON m.item=i.id "
+                                               "WHERE m.seq=? AND i.mime='image/png'", (seq,)).fetchone()
+                            if not saved or saved[0] != image.read_bytes():
+                                raise RuntimeError("桌面会话没有收到命令行发送的原图")
                             return
                 time.sleep(0.1)
             raise RuntimeError("桌面应用未能打开独立会话库")

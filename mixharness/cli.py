@@ -70,7 +70,8 @@ def parser():
             cmd.add_argument("--gemini-effort", help="Gemini / Antigravity 思考强度")
             cmd.add_argument("--openai-effort", help="OpenAI / Codex 思考强度")
         if name in ("run", "send"):
-            cmd.add_argument("message", help="消息内容；传 - 从标准输入读取")
+            cmd.add_argument("message", nargs="?", default="", help="消息内容；传 - 从标准输入读取")
+            cmd.add_argument("--image", action="append", help="附加图片文件，可重复")
             cmd.add_argument("--wait", action=argparse.BooleanOptionalAction, default=True, help="等待执行完成")
             cmd.add_argument("--request-id", help="幂等请求标识")
         if name in ("run", "send", "wait"):
@@ -151,6 +152,8 @@ def main(argv=None):
     home = (data_dir or project / ".mixharness").expanduser().resolve()
     if options.get("message") == "-":
         options["message"] = sys.stdin.read()
+    if options.get("image"):
+        options["image"] = [str(Path(f).expanduser().resolve()) for f in options["image"]]
     if options.get("folder"):
         options["folder"] = [str(Path(f).expanduser().resolve()) for f in options["folder"]]
     if options.get("skill_dir"):

@@ -146,9 +146,15 @@ def available_speeds(group):
 
 
 def codex_speeds(account, model):
-    if account.get("type") != "chatgpt" or account.get("planType") not in ("pro", "promax"):
-        return {}
-    names = {"priority": "fast", "fast": "fast", "ultrafast": "ultrafast"}
-    tiers = ([t["id"] for t in model["serviceTiers"]] if "serviceTiers" in model
-             else model.get("additionalSpeedTiers", []))
-    return {names[value]: value for value in tiers if value in names}
+    result = {}
+    tiers = model.get("serviceTiers")
+    if tiers is None:
+        tiers = [{"id": t} for t in model.get("additionalSpeedTiers", [])]
+    for tier in tiers:
+        name = (tier.get("name") or tier["id"]).casefold()
+        if name == "ultrafast" or tier["id"] == "ultrafast":
+            if account.get("type") == "chatgpt" and account.get("planType") in ("pro", "promax"):
+                result["ultrafast"] = tier["id"]
+        elif name == "fast" or tier["id"] in ("fast", "priority"):
+            result["fast"] = tier["id"]
+    return result

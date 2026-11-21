@@ -8,12 +8,15 @@ from .desktop_widgets import Timeline, button, label
 
 
 class ClientHistory(QWidget):
-    def __init__(self, window):
+    def __init__(self, window, *, selecting=False):
         super().__init__()
         self.window = window
         self.source = None
         self.cursor = None
         self.loading = None
+        self.generation = 0
+        self.query = ""
+        self.rows = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         head = QHBoxLayout()
@@ -23,8 +26,9 @@ class ClientHistory(QWidget):
         layout.addLayout(head)
         self.list = QListWidget()
         self.list.setAccessibleName("客户端会话列表")
-        self.list.itemActivated.connect(self.open_item)
-        self.list.itemClicked.connect(self.open_item)
+        if not selecting:
+            self.list.itemActivated.connect(self.open_item)
+            self.list.itemClicked.connect(self.open_item)
         layout.addWidget(self.list, 1)
         self.status = label("", "caption")
         self.status.setWordWrap(True)
@@ -33,6 +37,7 @@ class ClientHistory(QWidget):
         layout.addWidget(self.more)
 
     def select_source(self, source):
+        self.generation += 1
         if self.loading:
             self.loading.cancel()
         self.source = source
@@ -40,27 +45,46 @@ class ClientHistory(QWidget):
             self.load()
 
     def load(self, more=False):
+        if not self.source:
+            return
         if self.loading:
             self.loading.cancel()
+        self.generation += 1
+        generation = self.generation
         source = self.source
         if not more:
+            self.rows.clear()
             self.list.clear()
             self.cursor = None
         self.caption.setText("全部会话" if source == "all" else clients.NAMES[source] + " 会话")
         self.status.setText("加载中…")
         self.more.hide()
-        async def fetch():
-            try:
-                data = await clients.list_conversations(self.window.engine.store, source, self.cursor)
-            except (OSError, ValueError, RuntimeError) as exc:
-                self.status.setText(str(exc) or "读取客户端会话超时")
+        def add_rows(rows):
+            if generation != self.generation or not rows:
                 return
-            for row in data["data"]:
+            current = self.list.currentItem()
+            selected = current.data(Qt.ItemDataRole.UserRole) if current else {}
+            scroll = self.list.verticalScrollBar().value()
+            self.rows.update({(r["source"], r["id"]): r for r in rows})
+            self.list.clear()
+            for key, row in sorted(self.rows.items(), key=lambda kv: clients.updated_time(kv[1]), reverse=True):
                 name = clients.NAMES[row["source"]]
                 item = QListWidgetItem(name + "  ·  " + row["title"])
                 item.setData(Qt.ItemDataRole.UserRole, row)
                 item.setToolTip(name + " · " + (row.get("cwd") or row.get("workspace") or "") + "\n" + row["title"])
                 self.list.addItem(item)
+                if key == (selected.get("source"), selected.get("id")):
+                    self.list.setCurrentItem(item)
+            self.list.verticalScrollBar().setValue(scroll)
+        async def fetch():
+            try:
+                data = await clients.list_conversations(self.window.engine.store, source, self.cursor, self.query, add_rows)
+            except (OSError, ValueError, RuntimeError) as exc:
+                if generation == self.generation:
+                    self.status.setText(str(exc) or "读取客户端会话超时")
+                return
+            if generation != self.generation:
+                return
             self.cursor = data["next"]
             self.more.setVisible(bool(self.cursor))
             errors = [clients.NAMES[c] + " · " + msg for c, msg in data.get("errors", {}).items()]
@@ -116,6 +140,7 @@ class ClientHistory(QWidget):
         more.hide()
         actions.addWidget(more)
         actions.addWidget(button("刷新", lambda: load(reload=True)))
+        actions.addWidget(button("引用到输入框", lambda: self.window.inputs.attach_chat(row, dialog)))
         actions.addWidget(button("关闭", dialog.accept))
         layout.addLayout(actions)
         dialog.finished.connect(lambda _: task.cancel() if task else None)

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from .attachments import InputLibrary
 from .reasoning import LEVELS
 
 
@@ -148,6 +149,7 @@ class Store:
             self.db.execute("CREATE INDEX IF NOT EXISTS project_sessions ON sessions(project_id,updated)")
             self.db.execute("UPDATE jobs SET status='ready' WHERE status='running'")
             self.db.execute("UPDATE approvals SET decision='expired' WHERE decision='pending' AND source!='MixHarness'")
+        self.inputs = InputLibrary(self.db)
 
     def rows(self, sql, *params):
         return [unpack(row) for row in self.db.execute(sql, params)]
@@ -331,6 +333,8 @@ class Store:
             self.db.execute("DELETE FROM calls WHERE job IN (SELECT id FROM jobs WHERE sid=?)", (sid,))
             for table in ("artifacts", "events", "jobs"):
                 self.db.execute(f"DELETE FROM {table} WHERE sid=?", (sid,))
+            self.db.execute("DELETE FROM draft_inputs WHERE draft=?", ("drafts/" + sid,))
+            self.inputs.prune()
             self.db.execute("DELETE FROM sessions WHERE id=?", (sid,))
             self.db.execute("INSERT INTO session_cleanup VALUES(?)", (sid,))
         return [j["id"] for j in jobs]
@@ -383,21 +387,31 @@ class Store:
             self.db.execute("INSERT INTO sessions(id,title,workspace,gemini,openai,brief,versions,updated,project_id,"
                             "backend,efforts,revision,planned) SELECT ?,?,workspace,gemini,openai,brief,versions,?,"
                             "project_id,backend,efforts,revision,planned FROM sessions WHERE id=?", (branch, name, now(), sid))
-            self.db.execute("INSERT INTO events(sid,kind,actor,body,meta,at) SELECT ?,kind,actor,body,"
-                            "CASE WHEN actor='user' THEN meta ELSE '{}' END,at FROM events "
-                            "WHERE sid=? AND kind='message' ORDER BY seq", (branch, sid))
+            for event in self.db.execute("SELECT seq,kind,actor,body,meta,at FROM events WHERE sid=? AND kind='message' ORDER BY seq", (sid,)):
+                seq = self.db.execute("INSERT INTO events(sid,kind,actor,body,meta,at) VALUES(?,?,?,?,?,?)",
+                                      (branch, event["kind"], event["actor"], event["body"],
+                                       event["meta"] if event["actor"] == "user" else "{}", event["at"])).lastrowid
+                self.db.execute("INSERT INTO message_inputs SELECT ?,item FROM message_inputs WHERE seq=? ORDER BY rowid",
+                                (seq, event["seq"]))
             self.event(branch, "progress", "system", "从原会话创建分支", {"source_session": sid})
         return self.session(branch)
 
-    def message(self, sid, body, client_id):
+    def message(self, sid, body, client_id, *, draft=None, attachments=()):
         with self.db:
             session = self.session(sid)
             sent = self.rows("SELECT seq FROM events WHERE sid=? AND client_id=?", sid, client_id)
             if sent:
                 return sent[0]["seq"]
+            staged = self.inputs.metadata(draft) if draft else []
+            if not body.strip() and not attachments and not staged:
+                raise ValueError("请输入消息或添加附件")
             rev = session["revision"] + 1
             seq = self.event(sid, "message", "user", body, {"revision": rev}, client_id)
-            title = body.splitlines()[0][:36] if rev == 1 and session["title"] == "新会话" else session["title"]
+            self.inputs.commit_message(seq, draft, attachments)
+            title = session["title"]
+            if rev == 1 and title == "新会话":
+                title = (body.strip().splitlines()[0] if body.strip() else
+                         (staged[0]["name"] if staged else attachments[0].name))[:36]
             self.db.execute("UPDATE sessions SET revision=?,title=? WHERE id=?", (rev, title, sid))
             self.db.execute("UPDATE jobs SET status='obsolete' WHERE sid=? AND kind='plan' AND status!='done'", (sid,))
             self.enqueue(session, "plan", {"revision": rev})
@@ -544,10 +558,15 @@ class Store:
                 self.db.execute("UPDATE jobs SET status='ready' WHERE id=?", (job["id"],))
 
     def snapshot(self, sid):
+        events = self.rows("SELECT * FROM events WHERE sid=? ORDER BY seq", sid)
+        inputs = self.inputs.for_session(sid)
+        for event in events:
+            if event["seq"] in inputs:
+                event["attachments"] = inputs[event["seq"]]
         return {
             "session": self.session(sid),
             "approvals": self.approvals(sid),
-            "events": self.rows("SELECT * FROM events WHERE sid=? ORDER BY seq", sid),
+            "events": events,
             "tasks": self.rows("SELECT id,kind,status,title,model,effort,draft,error,basis,at FROM jobs WHERE sid=? ORDER BY rowid", sid),
             "artifacts": self.rows("SELECT id,job,name,digest,meta,at FROM artifacts WHERE sid=? ORDER BY rowid", sid),
         }

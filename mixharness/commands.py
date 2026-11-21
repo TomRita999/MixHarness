@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from . import clients
+from .attachments import Attachment, MAX_ITEMS
 from .agent_settings import available_speeds, skill_catalog
 from .catalog import MODELS
 from .reasoning import group_for
@@ -132,8 +133,13 @@ async def dispatch(engine, args):
         return engine.store.snapshot(args["id"])
     if cmd in ("send", "run"):
         message = args["message"].strip()
-        if not 1 <= len(message) <= 120000:
-            raise ValueError("消息长度需要在 1 至 120000 个字符之间")
+        paths = args.get("image") or []
+        if not message and not paths or len(message) > 120000:
+            raise ValueError("请输入消息或添加图片，消息最多 120,000 个字符")
+        if len(paths) > MAX_ITEMS:
+            raise ValueError(f"每次最多添加 {MAX_ITEMS} 项")
+        attachments = [Attachment.from_file(path) for path in paths]
+        engine.store.inputs.validate([{"kind": item.kind, "size": len(item.data)} for item in attachments])
     efforts = {p: args[p + "_effort"] for p in clients.CLIENTS if args.get(p + "_effort") is not None}
     if cmd in ("new", "run"):
         session = await new_session(engine, args)
@@ -148,9 +154,9 @@ async def dispatch(engine, args):
                 await asyncio.gather(*(engine.client_catalogs[p].refresh() for p in efforts))
             engine.set_choices(sid, {p: (session[p], e) for p, e in efforts.items()})
     if cmd in ("send", "run"):
-        seq, changed = engine.submit(sid, message, args.get("request_id") or new_id())
+        seq, changed = engine.submit(sid, message, args.get("request_id") or new_id(), attachments=attachments)
         if changed:
-            await engine.steer(sid, message)
+            await engine.steer(sid, message, seq)
         if not args.get("wait"):
             return {"source": "mixharness", "id": sid, "seq": seq}
     elif cmd != "wait":

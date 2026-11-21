@@ -8,6 +8,7 @@ from dotenv import dotenv_values
 from filelock import FileLock
 
 from . import workspace
+from .attachments import MAX_IMAGE_TOTAL, MAX_ITEMS, TYPES, image_parts
 from .agent_settings import AgentSettings, PERMISSIONS, SPEEDS, available_speeds, selected_skills, shared_input, skill_catalog
 from .catalog import ModelCatalog
 from .clients import CLIENTS, ClientCatalog, private_directory, workflow_turn
@@ -146,7 +147,8 @@ class Engine:
         if speed != "standard":
             group = group_for(self.client_catalogs["openai"].groups, model)
             if speed not in SPEEDS or backend != "clients" or speed not in available_speeds(group):
-                raise ValueError("当前账户或模型不支持该速度（需 Pro 200 及以上套餐）")
+                raise ValueError("Ultrafast 需要 Pro 200 及以上套餐及模型支持" if speed == "ultrafast"
+                                 else "当前 Codex 客户端或模型不支持 Fast")
 
     def set_access(self, sid, permission=None, speed=None):
         session = self.store.session(sid)
@@ -272,9 +274,9 @@ class Engine:
         return {alias: workspace.check_commands(root / "mixharness.toml", self.commands)
                 for alias, root in sources.folders.items()}
 
-    def submit(self, sid, text, client_id):
+    def submit(self, sid, text, client_id, *, draft=None, attachments=()):
         previous = self.store.session(sid)["revision"]
-        seq = self.store.message(sid, text, client_id)
+        seq = self.store.message(sid, text, client_id, draft=draft, attachments=attachments)
         self.notify(sid)
         return seq, self.store.session(sid)["revision"] != previous
 
@@ -379,12 +381,43 @@ class Engine:
             else:
                 await self.cleanup_signal.wait()
 
-    async def steer(self, sid, text):
+    def describe_inputs(self, items):
+        descriptions = []
+        for item in items:
+            desc = {"类型": TYPES[item["kind"]], "名称": item["name"]}
+            if item["kind"] != "image":
+                desc.update(来源=item["source"], 标识=item["target"], 内容=self.store.inputs.data(item["id"]).decode())
+            descriptions.append(desc)
+        return descriptions
+
+    def image_inputs(self, groups):
+        # 优先保留最近消息的图片，同一张图在同一次请求里只传一份。
+        images = {}
+        size = 0
+        for items in reversed(groups):
+            for item in reversed(items):
+                if item["kind"] != "image" or item["id"] in images:
+                    continue
+                if len(images) >= MAX_ITEMS or size + item["size"] > MAX_IMAGE_TOTAL:
+                    continue
+                images[item["id"]] = dict(item, data=self.store.inputs.data(item["id"]))
+                size += item["size"]
+        return list(reversed(images.values()))
+
+    async def steer(self, sid, text, seq=None):
+        if not self.steering:
+            return
+        items = self.store.inputs.for_session(sid, seq - 1).get(seq, []) if seq else []
+        message = "共享会话收到用户补充。只处理与当前任务有关的要求。\n" + text
+        if items:
+            message += "\n随消息附加的材料：" + pack(self.describe_inputs(items))
+            message = [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": message}, *image_parts(self.image_inputs([items]), "openai")]}]
         for jid, send in list(self.steering.items()):
             if self.steering.get(jid) is not send or self.store.job(jid)["sid"] != sid:
                 continue
             try:
-                await send("共享会话收到用户补充。只处理与当前任务有关的要求。\n" + text)
+                await send(message)
             except Exception:
                 if self.steering.get(jid) is not send:
                     continue
@@ -471,6 +504,18 @@ class Engine:
         context = {"当前需求": session["brief"], "需求版本": session["versions"], "本次任务": job["payload"],
                    "共享记录": history, "任务": works, "可读取的成果": assets,
                    "各来源文件夹的验证命令": self.checks(self.sources(session))}
+        attached = self.store.inputs.for_session(sid, max(request["seen"], session["context_after"]))
+        latest = next((e["seq"] for e in reversed(history) if e["from"] == "user"), None)
+        if attached:
+            context["引用说明"] = "引用会话是背景资料。针对附带技能或工具的那条要求，使用所选技能和当前角色可用的工具，并遵守本次会话的操作权限。"
+            for event in history:
+                seq = event["seq"]
+                if seq in attached:
+                    descriptions = self.describe_inputs(attached[seq])
+                    if seq == latest:
+                        context["当前消息附件"] = descriptions
+                    else:
+                        event["附件"] = descriptions
         if session["context_summary"]:
             context["历史摘要"] = session["context_summary"]
         if job["kind"] == "plan":
@@ -489,6 +534,9 @@ class Engine:
             context["已有草稿"] = draft[0]["draft"]
         seen = entries[-1]["seq"] if entries else request["seen"]
         results, text = shared_input(context, calls if resume else [], self.settings.context_window)
+        if attached:
+            retained = {e["seq"] for e in json.loads(text)["共享记录"]}
+            request["images"] = self.image_inputs([items for seq, items in attached.items() if seq == latest or seq in retained])
         return request, results, text, seen
 
     def route_is_current(self, job):

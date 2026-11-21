@@ -7,8 +7,8 @@ from math import ceil
 from pathlib import Path
 
 from dotenv import set_key
-from PySide6.QtCore import QEasingCurve, QIODevice, QPoint, QPointF, QPropertyAnimation, QSaveFile, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QPainter, QTextDocument
+from PySide6.QtCore import QBuffer, QEasingCurve, QIODevice, QPoint, QPointF, QPropertyAnimation, QSaveFile, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QImage, QPainter, QPixmap, QTextDocument
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QToolButton, QToolTip,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from .desktop_style import Glyph
+from .attachments import TYPES
 from .reasoning import LEVEL_NAMES, api_group, group_for
 
 
@@ -52,6 +53,8 @@ def button(text, callback, glyph=None, name="", icon_only=False):
 
 
 class Editor(QPlainTextEdit):
+    image_files = Signal(list)
+    image_bytes = Signal(bytes)
     submitted = Signal()
     focus_changed = Signal(bool)
 
@@ -68,6 +71,25 @@ class Editor(QPlainTextEdit):
     def focusInEvent(self, event):
         super().focusInEvent(event)
         self.focus_changed.emit(True)
+
+    def canInsertFromMimeData(self, source):
+        return source.hasImage() or source.hasUrls() or super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source):
+        paths = [url.toLocalFile() for url in source.urls() if url.isLocalFile()]
+        if paths:
+            self.image_files.emit(paths)
+        elif source.hasImage():
+            picture = source.imageData()
+            if isinstance(picture, QPixmap):
+                picture = picture.toImage()
+            if isinstance(picture, QImage) and not picture.isNull():
+                buffer = QBuffer()
+                buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+                if picture.save(buffer, "PNG"):
+                    self.image_bytes.emit(bytes(buffer.data()))
+        else:
+            super().insertFromMimeData(source)
 
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
@@ -354,7 +376,7 @@ class Document(QTextBrowser):
 
 
 class MessageRow(QWidget):
-    def __init__(self, event):
+    def __init__(self, event, input_library=None):
         super().__init__()
         self.user = event["actor"] == "user"
         self.text = event["body"]
@@ -394,9 +416,21 @@ class MessageRow(QWidget):
             stamp = datetime.fromisoformat(event["at"]).astimezone().strftime("%Y-%m-%d %H:%M")
             self.block.setToolTip(author + " · " + stamp)
         box.addWidget(self.body)
+        inputs = event.get("attachments", [])
+        if inputs and input_library:
+            from .desktop_inputs import attachment_button
+            for item in inputs:
+                control = attachment_button(self, input_library, item)
+                box.addWidget(control, 0, ALIGN.AlignLeft)
+            if not self.text:
+                self.body.hide()
         row.addWidget(self.block)
         metrics = QFontMetrics(self.body.font())
         self.natural = max((metrics.horizontalAdvance(line[:1024]) for line in self.text.splitlines()), default=0)
+        if inputs:
+            self.natural = max(self.natural, 150)
+            if not self.text:
+                self.text = "、".join(item["name"] for item in inputs)
 
     def fit(self, available):
         width = max(50, available - 6)
@@ -412,8 +446,9 @@ class MessageRow(QWidget):
 class Timeline(QScrollArea):
     navigation_changed = Signal()
 
-    def __init__(self):
+    def __init__(self, input_library=None):
         super().__init__()
+        self.input_library = input_library
         self.setAccessibleName("共享会话记录")
         self.setObjectName("timeline")
         self.setWidgetResizable(True)
@@ -513,13 +548,14 @@ class Timeline(QScrollArea):
             kind = event["kind"]
             if kind not in ("message", "verification", "failure", "progress", "requirements"):
                 continue
-            self.records.append(event["body"])
+            names = [TYPES[i["kind"]] + " · " + i["name"] for i in event.get("attachments", [])]
+            self.records.append("\n".join(s for s in [event["body"], *names] if s))
             changed = True
             if kind in ("progress", "requirements"):
                 self.progress(event["body"])
                 continue
             self.group_button = self.group_body = None
-            row = MessageRow(event)
+            row = MessageRow(event, self.input_library)
             row.fit(self.viewport().width() - 4)
             self.rows.append(row)
             self.column.insertWidget(self.column.count() - 1, row)
