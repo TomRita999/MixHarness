@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dotenv import set_key
 from PySide6.QtCore import QIODevice, QPoint, QSaveFile, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QIcon, QTextDocument
+from PySide6.QtGui import QDesktopServices, QFontMetrics, QIcon, QTextDocument
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QToolButton, QVBoxLayout, QWidget,
@@ -52,6 +52,7 @@ def button(text, callback, glyph=None, name="", icon_only=False):
 
 class Editor(QPlainTextEdit):
     submitted = Signal()
+    focus_changed = Signal(bool)
 
     def __init__(self):
         super().__init__()
@@ -60,8 +61,16 @@ class Editor(QPlainTextEdit):
         self.setAccessibleName("消息")
         self.setPlaceholderText("输入消息，或用 / 调用指令…")
         self.setTabChangesFocus(True)
-        self.setFixedHeight(70)
+        self.setFixedHeight(66)
         self.document().setDocumentMargin(3)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.focus_changed.emit(True)
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self.focus_changed.emit(False)
 
     def inputMethodEvent(self, event):
         self.preedit = bool(event.preeditString())
@@ -376,7 +385,7 @@ class MessageRow(QWidget):
         self.block.setObjectName("userBubble" if self.user else "reply")
         box = QVBoxLayout(self.block)
         box.setSpacing(5)
-        margins = (12, 8, 12, 8) if self.user else (0, 2, 0, 4)
+        margins = (14, 9, 14, 9) if self.user else (0, 2, 0, 4)
         box.setContentsMargins(*margins)
         author = ACTORS.get(event["actor"], event["actor"])
         if self.user:
@@ -393,6 +402,10 @@ class MessageRow(QWidget):
         self.body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.body.document().setDocumentMargin(0)
+        self.body.document().setIndentWidth(18)
+        # 先应用样式表字体，再测量宽高，避免首次显示时被截断。
+        self.body.ensurePolished()
+        self.body.document().setDefaultFont(self.body.font())
         if self.user or event["kind"] != "message":
             self.body.setPlainText(self.text)
         else:
@@ -402,18 +415,18 @@ class MessageRow(QWidget):
             self.block.setToolTip(author + " · " + stamp)
         box.addWidget(self.body)
         row.addWidget(self.block)
-        metrics = self.body.fontMetrics()
+        metrics = QFontMetrics(self.body.font())
         self.natural = max((metrics.horizontalAdvance(line[:1024]) for line in self.text.splitlines()), default=0)
 
     def fit(self, available):
         width = max(50, available - 6)
         if self.user:
-            width = max(40, min(int(width * 0.8), self.natural + 30))
-        padding = 24 if self.user else 0
+            width = max(40, min(int(width * 0.78), self.natural + 34))
+        padding = 28 if self.user else 0
         self.block.setFixedWidth(width)
         self.body.setFixedWidth(width - padding)
         self.body.document().setTextWidth(width - padding)
-        self.body.setFixedHeight(max(self.body.fontMetrics().height(), ceil(self.body.document().size().height())) + 2)
+        self.body.setFixedHeight(max(self.body.fontMetrics().height(), ceil(self.body.document().size().height())) + 4)
 
 
 class Timeline(QScrollArea):

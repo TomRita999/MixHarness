@@ -23,7 +23,17 @@ def main():
     mac, windows = sys.platform == "darwin", sys.platform == "win32"
     if mac or windows:
         with Image.open(ROOT / "mixharness/resources/app.png") as image:
-            image.save(WORK / ("MixHarness.icns" if mac else "MixHarness.ico"))
+            if mac and shutil.which("iconutil"):
+                iconset = WORK / "MixHarness.iconset"
+                shutil.rmtree(iconset, ignore_errors=True)
+                iconset.mkdir()
+                for size in (16, 32, 128, 256, 512):
+                    image.resize((size, size), Image.LANCZOS).save(iconset / f"icon_{size}x{size}.png")
+                    image.resize((size * 2, size * 2), Image.LANCZOS).save(iconset / f"icon_{size}x{size}@2x.png")
+                subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(WORK / "MixHarness.icns")], check=True)
+            else:
+                image.save(WORK / ("MixHarness.icns" if mac else "MixHarness.ico"),
+                           **({} if mac else {"sizes": [(s, s) for s in (16, 24, 32, 48, 64, 128, 256)]}))
     subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--workpath", str(WORK / "build"),
                     "--distpath", str(WORK / "output"), str(ROOT / "packaging/MixHarness.spec")], cwd=ROOT, env=env, check=True)
     system = "macOS" if mac else "Windows" if windows else "Ubuntu"

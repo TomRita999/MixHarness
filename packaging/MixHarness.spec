@@ -29,6 +29,8 @@ bundle = COLLECT(exe, cli, a.binaries, a.datas, name="MixHarness", upx=False)
 if mac:
     app = BUNDLE(bundle, name="MixHarness.app", icon=str(icon), bundle_identifier="local.mixharness.desktop",
                  info_plist={"CFBundleDisplayName": "MixHarness", "CFBundleShortVersionString": "0.7.0",
-                             "CFBundleVersion": "8", "NSHighResolutionCapable": True,
+                             "CFBundleVersion": "9", "NSHighResolutionCapable": True,
+                             # 包内同时有命令行程序，PyInstaller 会因此标记为后台程序；桌面应用需要出现在程序坞。
+                             "LSBackgroundOnly": False, "LSUIElement": False,
                              "LSApplicationCategoryType": "public.app-category.developer-tools",
                              "NSDesktopFolderUsageDescription": "读取你选择的桌面项目和已有会话记录。"})

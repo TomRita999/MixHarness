@@ -3,9 +3,10 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLineEdit, QListWidget, QListWidgetItem,
+    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QHeaderView, QInputDialog,
+    QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QSizePolicy, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -117,6 +118,7 @@ class Window(QMainWindow):
         project_actions.addWidget(self.create_project_button)
         col.addLayout(project_actions)
         self.sources_box = QComboBox()
+        self.sources_box.setObjectName("flat")
         self.sources_box.setAccessibleName("会话来源")
         for title, value in (("MixHarness", "mixharness"), ("全部来源", "all"),
                              ("Codex", "codex"), ("Antigravity", "antigravity")):
@@ -199,12 +201,17 @@ class Window(QMainWindow):
         self.work_status.hide()
         self.composer = QFrame()
         self.composer.setObjectName("composer")
+        self.composer_shadow = QGraphicsDropShadowEffect(self.composer)
+        self.composer_shadow.setBlurRadius(28)
+        self.composer_shadow.setOffset(0, 4)
+        self.composer.setGraphicsEffect(self.composer_shadow)
         controls = QVBoxLayout(self.composer)
-        controls.setContentsMargins(14, 11, 12, 10)
+        controls.setContentsMargins(16, 12, 12, 10)
         controls.setSpacing(6)
         self.editor = Editor()
         self.editor.submitted.connect(self.send)
         self.editor.textChanged.connect(self.editor_changed)
+        self.editor.focus_changed.connect(self.composer_focus)
         controls.addWidget(self.editor)
         tools = QHBoxLayout()
         tools.setSpacing(8)
@@ -232,6 +239,7 @@ class Window(QMainWindow):
         self.backend_box.currentIndexChanged.connect(self.change_backend)
         tools.addWidget(self.backend_box, 0, ALIGN.AlignBottom)
         self.send_button = button("发送消息", self.send, "send", "send", icon_only=True)
+        self.send_button.setFixedSize(32, 32)
         self.send_button.setEnabled(False)
         tools.addWidget(self.send_button, 0, ALIGN.AlignBottom)
         controls.addLayout(tools)
@@ -1130,6 +1138,7 @@ class Window(QMainWindow):
     def set_theme(self, name):
         self.theme = name if name in THEMES else "light"
         apply_theme(QApplication.instance(), self.theme)
+        self.composer_shadow.setColor(QColor(THEMES[self.theme]["shadow"]))
         self.theme_button.setIcon(icon("sun" if self.theme == "dark" else "moon"))
         self.theme_button.setToolTip("切换为浅色主题" if self.theme == "dark" else "切换为深色主题")
         if hasattr(self, "state"):
@@ -1139,6 +1148,11 @@ class Window(QMainWindow):
     def toggle_theme(self):
         self.set_theme("dark" if self.theme == "light" else "light")
         self.settings.setValue("theme", self.theme)
+
+    def composer_focus(self, focused):
+        self.composer.setProperty("focused", focused)
+        self.composer.style().unpolish(self.composer)
+        self.composer.style().polish(self.composer)
 
     def closeEvent(self, event):
         self.timer.stop()
