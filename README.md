@@ -82,7 +82,7 @@ mixharness settings --context-window 64000
 
 - **macOS** 打开 dist 中的 **MixHarness.app**。也可以将应用拖入「应用程序」。
 - **Windows** 解压对应的桌面发行包，在 MixHarness 文件夹里双击 **MixHarness.exe**，并将同目录的 _internal 文件夹与程序一起保留。
-- **Ubuntu** 解压对应的 tar.gz，在 MixHarness 文件夹中运行 **./MixHarness**。桌面会话需要 Qt 的系统图形库，包括 libegl1、libgl1、libxcb-cursor0 和 libxkbcommon-x11-0。
+- **Ubuntu** 解压对应的 tar.gz，在 MixHarness 文件夹中运行 **./MixHarness**。若系统尚未安装 Qt 所需的图形库，请运行 `sudo apt install libegl1 libgl1 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxkbcommon-x11-0`。
 
 发行包包含 Python、Qt 和两家服务商的 SDK。直接打开应用即可使用。首次启动使用当前用户的应用数据目录。「连接设置」中可查看配置文件的完整路径。要继续已有会话，选择「文件 → 打开已有会话库」，然后选择包含 **.mixharness** 的原项目目录。
 
