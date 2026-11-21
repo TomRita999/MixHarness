@@ -16,7 +16,7 @@ class ProjectDialog(QDialog):
         super().__init__(parent)
         self.store = store
         self.pid = project["id"] if project else None
-        self.setWindowTitle("编辑项目" if project else "新建本地项目")
+        self.setWindowTitle("编辑项目" if project else "新建项目")
         self.setMinimumWidth(450)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
@@ -29,11 +29,11 @@ class ProjectDialog(QDialog):
         layout.addWidget(self.name)
         layout.addSpacing(5)
         row = QHBoxLayout()
-        row.addWidget(label("来源文件夹", "panelTitle"), 1)
-        row.addWidget(button("添加文件夹…", self.choose_folder, "plus", "quiet"))
+        row.addWidget(label("项目文件夹", "panelTitle"), 1)
+        row.addWidget(button("添加…", self.choose_folder, "plus", "quiet"))
         layout.addLayout(row)
         self.folders = QListWidget()
-        self.folders.setAccessibleName("来源文件夹")
+        self.folders.setAccessibleName("项目文件夹")
         self.folders.setMinimumHeight(85)
         self.folders.setMaximumHeight(158)
         layout.addWidget(self.folders)
@@ -41,8 +41,8 @@ class ProjectDialog(QDialog):
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
         actions = QHBoxLayout()
-        self.primary = button("设为主要文件夹", self.make_primary, name="quiet")
-        self.remove = button("移除文件夹", self.remove_folder, name="quiet")
+        self.primary = button("设为主目录", self.make_primary, name="quiet")
+        self.remove = button("移除", self.remove_folder, name="quiet")
         actions.addWidget(self.primary)
         actions.addWidget(self.remove)
         actions.addStretch()
@@ -54,7 +54,7 @@ class ProjectDialog(QDialog):
         footer = QHBoxLayout()
         footer.addStretch()
         footer.addWidget(button("取消", self.reject))
-        self.save = button("保存" if project else "创建项目", self.commit, name="primary")
+        self.save = button("保存" if project else "创建", self.commit, name="primary")
         self.save.setDefault(True)
         footer.addWidget(self.save)
         layout.addLayout(footer)
@@ -66,7 +66,7 @@ class ProjectDialog(QDialog):
         self.name.setFocus()
 
     def choose_folder(self):
-        picker = QFileDialog(self, "选择来源文件夹")
+        picker = QFileDialog(self, "选择项目文件夹")
         picker.setFileMode(QFileDialog.FileMode.Directory)
         picker.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         picker.fileSelected.connect(self.add_folder)
@@ -101,7 +101,9 @@ class ProjectDialog(QDialog):
         self.save.setEnabled(bool(self.name.text().strip()))
         self.primary.setEnabled(self.folders.currentRow() > 0)
         self.remove.setEnabled(self.folders.currentRow() >= 0)
-        self.hint.setText("第一个文件夹是项目的主要工作目录。" if count else "留空时，MixHarness 会为这个项目创建工作目录。")
+        hint = "留空将自动创建工作目录" if count == 0 else ("首项为主工作目录" if count > 1 else "")
+        self.hint.setText(hint)
+        self.hint.setVisible(bool(hint))
 
     def commit(self):
         folders = [self.folders.item(i).data(ROLE) for i in range(self.folders.count())]
@@ -120,14 +122,13 @@ class ArchiveDialog(QDialog):
         super().__init__(window)
         self.window = window
         self.store = window.engine.store
-        self.setWindowTitle("归档管理")
+        self.setWindowTitle("归档")
         self.resize(465, 335)
         layout = QVBoxLayout(self)
-        layout.addWidget(label("已归档会话与已移除项目", "panelTitle"))
         self.entries = QListWidget()
         self.entries.setAccessibleName("归档列表")
         layout.addWidget(self.entries, 1)
-        self.empty = label("这里还没有归档记录。", "caption")
+        self.empty = label("暂无归档内容", "caption")
         layout.addWidget(self.empty)
         row = QHBoxLayout()
         self.delete = button("删除会话…", self.confirm_delete, "trash", "quiet")

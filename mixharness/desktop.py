@@ -112,13 +112,14 @@ class Window(QMainWindow):
         caption = label("项目", "section")
         caption.setIndent(8)
         project_actions.addWidget(caption, 1)
-        self.create_project_button = button("新建项目", self.project_dialog, "plus", "quiet")
+        self.create_project_button = button("新建项目", self.project_dialog, "plus", "rowAction", icon_only=True)
+        self.create_project_button.setFixedSize(26, 26)
         project_actions.addWidget(self.create_project_button)
         col.addLayout(project_actions)
         self.sources_box = QComboBox()
         self.sources_box.setAccessibleName("会话来源")
-        for title, value in (("MixHarness 会话", "mixharness"), ("全部来源", "all"),
-                             ("Codex 会话", "codex"), ("Antigravity 会话", "antigravity")):
+        for title, value in (("MixHarness", "mixharness"), ("全部来源", "all"),
+                             ("Codex", "codex"), ("Antigravity", "antigravity")):
             self.sources_box.addItem(title, value)
         col.addWidget(self.sources_box)
         self.history = QTreeWidget()
@@ -142,9 +143,9 @@ class Window(QMainWindow):
         col.addWidget(self.client_history, 1)
         self.client_history.hide()
         self.sources_box.currentIndexChanged.connect(self.select_source)
-        col.addWidget(button("归档管理", self.show_archive, "archive", "nav"))
+        col.addWidget(button("归档", self.show_archive, "archive", "nav"))
         foot = QHBoxLayout()
-        foot.addWidget(button("连接设置", self.connections, "settings", "nav"), 1)
+        foot.addWidget(button("设置", self.connections, "settings", "nav"), 1)
         self.theme_button = button("切换主题", self.toggle_theme, "moon", icon_only=True)
         foot.addWidget(self.theme_button)
         col.addLayout(foot)
@@ -219,12 +220,12 @@ class Window(QMainWindow):
         tools.addStretch()
         self.speed_box = QComboBox()
         self.speed_box.setAccessibleName("Codex 速度")
-        self.speed_box.setToolTip("当前 Codex 套餐和模型可用的处理速度")
+        self.speed_box.setToolTip("Codex 速度")
         self.speed_box.currentIndexChanged.connect(self.change_speed)
         tools.addWidget(self.speed_box, 0, ALIGN.AlignBottom)
         self.backend_box = QComboBox()
         self.backend_box.setAccessibleName("会话执行方式")
-        self.backend_box.setToolTip("切换当前会话的执行方式")
+        self.backend_box.setToolTip("执行方式")
         self.backend_box.setCursor(Qt.CursorShape.PointingHandCursor)
         self.backend_box.addItem("API", "api")
         self.backend_box.addItem("本机客户端", "clients")
@@ -238,7 +239,7 @@ class Window(QMainWindow):
         foot = QHBoxLayout()
         self.permission_box = QComboBox()
         self.permission_box.setAccessibleName("操作权限")
-        self.permission_box.setToolTip("Antigravity 权限依次对应 Default、Auto、Turbo")
+        self.permission_box.setToolTip("对应 Antigravity 的 Default / Auto / Turbo")
         for mode, title in PERMISSIONS.items():
             self.permission_box.addItem(title, mode)
         self.permission_box.currentIndexChanged.connect(self.change_permission)
@@ -246,7 +247,6 @@ class Window(QMainWindow):
         self.connection_state = button("", self.connections, name="quiet")
         foot.addWidget(self.connection_state)
         foot.addStretch()
-        foot.addWidget(label("Shift + Enter 换行", "caption"))
         col.addLayout(foot)
         col.addStretch(1)
         shell.addWidget(view)
@@ -288,17 +288,17 @@ class Window(QMainWindow):
             (file_menu, "新建会话", QKeySequence.StandardKey.New, self.new_session),
             (file_menu, "新建项目…", "", self.project_dialog),
             (file_menu, "打开项目…", QKeySequence.StandardKey.Open, self.choose_project),
-            (file_menu, "添加来源文件夹…", "", self.choose_source),
+            (file_menu, "添加文件夹…", "", self.choose_source),
             (file_menu, "新建独立会话", "Ctrl+Shift+N", self.new_standalone),
-            (file_menu, "归档管理…", "", self.show_archive),
-            (file_menu, "打开已有会话库…", "", self.choose_library),
-            (file_menu, "连接设置…", QKeySequence.StandardKey.Preferences, self.connections),
-            (file_menu, "Agent 设置…", "", self.agent_settings),
+            (file_menu, "归档…", "", self.show_archive),
+            (file_menu, "打开会话库…", "", self.choose_library),
+            (file_menu, "设置…", QKeySequence.StandardKey.Preferences, self.connections),
+            (file_menu, "技能与上下文…", "", self.agent_settings),
             (file_menu, "退出 MixHarness", QKeySequence.StandardKey.Quit, self.close),
             (view_menu, "搜索会话", QKeySequence.StandardKey.Find, self.search),
-            (view_menu, "显示或隐藏侧栏", "Ctrl+B", self.toggle_sidebar),
+            (view_menu, "切换侧栏", "Ctrl+B", self.toggle_sidebar),
             (view_menu, "任务与成果", "Ctrl+Shift+I", self.toggle_inspector),
-            (view_menu, "切换黑白主题", "Ctrl+Shift+L", self.toggle_theme),
+            (view_menu, "切换主题", "Ctrl+Shift+L", self.toggle_theme),
         ):
             action = QAction(title, self)
             action.setShortcut(QKeySequence(key))
@@ -321,7 +321,7 @@ class Window(QMainWindow):
     def fill_history(self):
         query = self.filter.text().strip()
         groups = self.engine.store.projects()
-        groups.append({"id": None, "name": "最近独立会话", "folders": [], "pinned": False})
+        groups.append({"id": None, "name": "独立会话", "folders": [], "pinned": False})
         by_project = {}
         chats = self.session_list(query)
         for chat in chats:
@@ -575,10 +575,10 @@ class Window(QMainWindow):
             try:
                 self.engine.store.attach_folder(pid, path)
             except (OSError, ValueError) as exc:
-                QMessageBox.warning(self, "无法添加来源文件夹", str(exc))
+                QMessageBox.warning(self, "无法添加文件夹", str(exc))
                 return
             self.refresh(force=True)
-        self.pick_folder("添加来源文件夹", selected)
+        self.pick_folder("添加文件夹", selected)
 
     def history_menu(self, point):
         item = self.history.itemAt(point)
@@ -614,7 +614,7 @@ class Window(QMainWindow):
                 path = folder["path"]
                 folders.addAction(path, lambda checked=False, path=path: QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
             menu.addSeparator()
-            menu.addAction("从侧栏移除项目", lambda: self.hide_project(pid))
+            menu.addAction("移出侧栏", lambda: self.hide_project(pid))
         menu.popup(position)
 
     def pin_row(self, identifier, project, pinned):
@@ -652,8 +652,8 @@ class Window(QMainWindow):
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.setWindowTitle("删除会话")
         dialog.setTextFormat(Qt.TextFormat.PlainText)
-        dialog.setText("永久删除「" + chat["title"] + "」？")
-        dialog.setInformativeText("会话消息、草稿、任务和验证记录将被删除。项目源文件会保留。")
+        dialog.setText("删除会话「" + chat["title"] + "」？")
+        dialog.setInformativeText("聊天记录与生成内容将被移除，本地项目文件不受影响。")
         cancel = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
         delete = dialog.addButton("删除会话", QMessageBox.ButtonRole.DestructiveRole)
         dialog.setDefaultButton(cancel)
@@ -697,7 +697,7 @@ class Window(QMainWindow):
             self.new_standalone()
 
     def choose_library(self):
-        dialog = QFileDialog(self, "选择已有 .mixharness 会话库所在的项目目录")
+        dialog = QFileDialog(self, "选择包含 .mixharness 的目录")
         dialog.setFileMode(QFileDialog.FileMode.Directory)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.fileSelected.connect(self.open_library)
@@ -708,7 +708,7 @@ class Window(QMainWindow):
         if project == self.engine.project:
             return
         if not (project / ".mixharness" / "sessions.sqlite3").is_file():
-            QMessageBox.information(self, "未找到会话库", "请选择包含原有 .mixharness 目录的项目。")
+            QMessageBox.information(self, "未找到会话库", "所选目录中没有 .mixharness 会话库。")
             return
         args = [] if getattr(sys, "frozen", False) else ["-m", "mixharness"]
         started, _ = QProcess.startDetached(sys.executable, [*args, "--project", str(project)])
@@ -819,7 +819,7 @@ class Window(QMainWindow):
                 p.model not in p.catalog.get("models", []) for p in self.pickers.values()):
             return
         if len(text) > 120000:
-            QMessageBox.information(self, "消息过长", "每条消息最多可发送 120000 个字符。")
+            QMessageBox.information(self, "消息过长", "单条消息上限为 120,000 字符。")
             return
         sid = self.sid
         if not sid:
@@ -910,29 +910,31 @@ class Window(QMainWindow):
         running = next((j for j in active if j["status"] == "running"), None)
         self.work_status.setEnabled(self.backend_task is None)
         if self.backend_task:
-            self.work_status.setText("正在读取 Antigravity 和 Codex 的模型…")
+            self.work_status.setText("正在读取客户端模型…")
         elif self.backend_error:
-            self.work_status.setText(self.backend_error + "　·　重新连接客户端")
+            self.work_status.setText(self.backend_error + " · 重试")
         elif self.state.get("approvals"):
             request = self.state["approvals"][0]
-            self.work_status.setText("等待批准　" + request["title"] + "　·　查看操作")
+            self.work_status.setText("待批准：" + request["title"] + " · 查看")
         elif pending:
             provider = "Gemini" if pending["kind"] in ("plan", "report", "section") else "OpenAI"
-            self.work_status.setText("消息已保存，正在等待 " + provider + " API Key　·　打开连接设置")
+            self.work_status.setText("等待 " + provider + " API Key · 去配置")
         elif running:
-            self.work_status.setText(running["title"] + "中　·　查看进度")
+            self.work_status.setText(running["title"] + "…")
         elif active:
-            self.work_status.setText("等待执行或验证结果　·　查看进度")
+            self.work_status.setText("等待前置任务…")
         self.work_status.setVisible(bool(active or self.backend_task or self.backend_error))
         if getattr(self, "state", {}).get("session", {}).get("backend") == "clients":
             errors = [c.error for c in self.engine.client_catalogs.values() if c.error]
-            self.connection_state.setText(errors[0] if errors else "使用本机 Antigravity 和 Codex")
-            self.connection_state.setToolTip("本机客户端使用各自的登录状态")
+            self.connection_state.setText(errors[0] if errors else "")
+            self.connection_state.setToolTip("客户端连接状态")
+            self.connection_state.setVisible(bool(errors))
             return
-        states = [title + (" 已配置" if self.engine.keys[key] else " 未配置")
-                  for key, title in (("gemini", "Gemini"), ("openai", "OpenAI"))]
-        self.connection_state.setText(self.engine.config_error or "密钥　" + "　·　".join(states))
-        self.connection_state.setToolTip("打开连接设置\n" + str(self.engine.project / ".env"))
+        missing = [title + " 未配置" for key, title in (("gemini", "Gemini"), ("openai", "OpenAI")) if not self.engine.keys[key]]
+        text = self.engine.config_error or " · ".join(missing)
+        self.connection_state.setText(text)
+        self.connection_state.setToolTip("打开设置\n" + str(self.engine.project / ".env"))
+        self.connection_state.setVisible(bool(text))
 
     def status_action(self):
         if self.backend_error:
@@ -971,7 +973,7 @@ class Window(QMainWindow):
                 elif not widget.currentItem():
                     widget.setCurrentRow(0)
         brief = self.state["session"]["brief"]
-        self.brief.setPlainText("\n\n".join(LABELS[k] + "\n" + v for k, v in brief.items() if v) or "尚未生成需求记录")
+        self.brief.setPlainText("\n\n".join(LABELS[k] + "\n" + v for k, v in brief.items() if v) or "暂无需求记录")
         self.inspector_action()
 
     def inspector_action(self):
@@ -1010,7 +1012,7 @@ class Window(QMainWindow):
                     QMessageBox.information(dialog, "任务状态", str(exc))
                 dialog.accept()
                 self.refresh()
-            actions.addWidget(button("重试任务", retry))
+            actions.addWidget(button("重试", retry))
         actions.addWidget(button("关闭", dialog.reject))
         layout.addLayout(actions)
         dialog.open()
@@ -1129,7 +1131,7 @@ class Window(QMainWindow):
         self.theme = name if name in THEMES else "light"
         apply_theme(QApplication.instance(), self.theme)
         self.theme_button.setIcon(icon("sun" if self.theme == "dark" else "moon"))
-        self.theme_button.setToolTip("切换到白色主题" if self.theme == "dark" else "切换到黑色主题")
+        self.theme_button.setToolTip("切换为浅色主题" if self.theme == "dark" else "切换为深色主题")
         if hasattr(self, "state"):
             self.timeline.reset()
             self.refresh(force=True)

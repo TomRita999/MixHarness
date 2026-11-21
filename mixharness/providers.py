@@ -35,7 +35,7 @@ class EditFile(Arguments):
 
 class RunCheck(Arguments):
     name: str
-    folder: str | None = Field(default=None, description="多目录项目中要运行验证的来源文件夹名称。省略时使用主目录。")
+    folder: str | None = Field(default=None, description="多目录项目中指定要运行验证的目录名称，省略时使用主目录。")
 
 
 class ReadArtifact(Arguments):
@@ -60,14 +60,14 @@ class WritingTask(Arguments):
 
 
 FUNCTIONS = {
-    "list_files": (Arguments, "列出当前项目文件和已注册的验证命令。"),
-    "read_file": (ReadFile, "读取 UTF-8 项目文件，返回内容和 SHA256。"),
-    "edit_file": (EditFile, "编辑 UTF-8 文件，传入读取时的摘要和完整新内容。新文件的摘要使用空字符串。"),
-    "run_check": (RunCheck, "在项目快照上运行已注册的实际命令，记录退出码、日志和源文件版本。"),
-    "read_artifact": (ReadArtifact, "按编号读取本会话的报告、证据或章节。offset 为字符偏移。"),
-    "request_verification": (Verify, "把缺少证据的具体问题交给 GPT 验证，完成后从此工具调用继续写作。"),
-    "save_section": (Section, "保存已写好的报告章节，需求修改或验证等待期间可继续使用。"),
-    "draft_section": (WritingTask, "安排独立撰写一个有充足材料的章节，在其他章节等待验证期间并行进行。"),
+    "list_files": (Arguments, "列出项目文件与已注册的验证命令。"),
+    "read_file": (ReadFile, "读取 UTF-8 文件内容与 SHA256 摘要。"),
+    "edit_file": (EditFile, "编辑 UTF-8 文件，传入读取时的摘要与完整新内容（新建文件摘要传空字符串）。"),
+    "run_check": (RunCheck, "在项目快照中运行验证命令，记录退出码、日志与文件版本。"),
+    "read_artifact": (ReadArtifact, "按编号读取本会话的报告、日志或章节，offset 为字符偏移。"),
+    "request_verification": (Verify, "把需要实测或核实的问题交给 GPT 验证，拿到结果后继续写作。"),
+    "save_section": (Section, "保存已完成的报告章节。"),
+    "draft_section": (WritingTask, "并行起草已有足够资料的独立章节。"),
 }
 TOOLS = {
     "engineering": ["list_files", "read_file", "edit_file", "run_check", "read_artifact"],
@@ -77,29 +77,22 @@ TOOLS = {
 }
 
 PROMPTS = {
-    "plan": """你负责解析共享会话中的新用户消息。根据当前需求逐项输出变更。
-engineering 是 GPT 的开发或理论研究任务，verification 是需要专门检验的条件，report 是 Gemini 的交付要求。
-各字段没有变化时严格返回 null；需要修改时返回该字段完整的新要求；明确取消时返回空字符串。
-首次任务按实际需要填写字段。需要交付文字或向用户解释工程结果时填写 report。
-如果用户要求写作者在发现依据缺失时再申请验证，将这个要求写入 report，保留 verification 原值。
-用户只改读者时仅更新 report。纯状态询问用 reply 简短回答，各字段返回 null。
-用户明确要求在相同条件下重新执行，或已经手动修改文件时，在 rerun 中填写需要重新执行的任务类型。
-reply 可以为空。依据提供的真实任务与结果回答，不声称未执行的操作已经完成。""",
-    "engineering": """你是共享会话的工程和研究负责人。使用工具读取真实项目、编辑文件、运行验证。
-读取当前文件后再编辑，尊重用户在工作期间的手动修改。研究任务交付可复查的假设、推导及来源。
-最终用中文交代实际改变、验证结果、未决问题及证据编号。其他模型的输出是协作资料。""",
-    "verification": """你负责独立验证。针对指定问题检查项目快照、执行已注册的实际命令或查阅原始来源。
-区分成立、不成立和证据不足。给出方法、观察值、文件或来源链接及适用条件。
-没有可用测量时明确指出，不把编译成功、零个测试或未经验证的推测当作实测结果。""",
-    "report": """你是面向用户的中文作者。结合最新要求和已有证据完成所需文字，使用 Markdown。
-写长文时用 save_section 保存完成的章节。等待验证时，可用 draft_section 安排有依据的独立章节。
-技术事实或测量缺少证据时调用 request_verification，
-写明章节、具体问题与所需证据。在收到验证结论后继续写作并引用依据。
-如已有同一问题的验证或执行失败记录，先使用已有结果及其限制，避免重复请求。
-使用当前项目版本的证据。证据不足时说明缺少哪项验证，不能声称结论已获证实。
-若收到的是普通对话则直接回答。最终输出完整可阅读的成稿。""",
-    "section": """你负责完成本次任务指定的一个章节。读取已有成果、按当前读者要求写作。
-只输出该章节正文。需要核实事实时可以请求验证，完成后给出依据。""",
+    "plan": """解析共享会话中的最新用户消息，按当前需求输出变更：
+engineering 为 GPT 负责的开发或研究任务，verification 为需要单独执行的验证条件，report 为 Gemini 负责的写作或汇总要求。
+未变化的字段返回 null；有修改时返回完整的新要求；明确取消时返回空字符串。
+首次提问按需填写对应字段；需要输出说明、报告或解释工程结果时填写 report。
+若用户让写作者在缺数据时自行发起验证，将该要求放入 report，verification 保持不变；仅调整读者或篇幅时只更新 report。
+纯状态询问在 reply 中简短作答，各任务字段返回 null。
+用户要求重跑或已手动改过文件时，将对应任务类型填入 rerun。reply 可留空。""",
+    "engineering": """你负责会话中的工程开发与技术研究。用工具先读文件再修改，运行验证命令检查改动。
+研究与推导需写明前提和依据。完成后用简洁自然的中文说明改动内容与验证结果，避免套话和防御性免责声明。""",
+    "verification": """你负责针对具体问题做验证。检查项目快照、运行验证命令或核对资料来源，如实给出方法、结果与结论。
+如果缺少测试条件或数据，直接说明缺什么，不要堆砌防御性套话。""",
+    "report": """你负责面向读者撰写内容，使用自然、通俗易懂的中文和 Markdown，避免机器味和防御性套话。
+长文可用 save_section 保存章节，等待验证期间可用 draft_section 并行撰写其他章节。
+遇到需要实测或核实的问题时，调用 request_verification 写明章节、问题与所需数据，拿到结果后再下结论。
+同一问题若已有验证结果或失败记录，直接使用现有结论，不要重复请求。日常对话直接自然回复。""",
+    "section": """按当前读者要求完成指定章节，只输出该章节正文，文风自然简洁。需要核实数据时调用 request_verification。""",
 }
 
 

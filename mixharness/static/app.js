@@ -4,9 +4,9 @@ const content = $("#content");
 const promptBox = $("#prompt");
 const statusNames = {
   ready: "待执行", running: "执行中", waiting: "等待结果", done: "已完成",
-  obsolete: "需求已更新", failed: "执行失败", needs_key: "等待密钥",
+  obsolete: "已跳过", failed: "失败", needs_key: "等待密钥",
 };
-const roleNames = {user: "你", gemini: "Gemini", openai: "OpenAI", system: "工作台"};
+const roleNames = {user: "你", gemini: "Gemini", openai: "OpenAI", system: "过程"};
 const scopeNames = {engineering: "开发与研究", verification: "验证条件", report: "报告要求"};
 let config, current, source, state;
 let projects = [];
@@ -73,7 +73,7 @@ function modal(title, ...nodes) {
 }
 function connection(online) {
   $("#connection").classList.toggle("online", online);
-  $("#connection span").textContent = online ? "本地服务在线" : "正在连接本地服务";
+  $("#connection span").textContent = online ? "已连接" : "连接中…";
 }
 const narrowScreen = matchMedia("(max-width: 760px)");
 const systemTheme = matchMedia("(prefers-color-scheme: dark)");
@@ -147,12 +147,12 @@ function drawModels() {
     const signature = JSON.stringify([options, data.source, data.configured, data.error]);
     if (select.value !== model || select.dataset.catalog !== signature) {
       const group = el("optgroup");
-      group.label = data.source === "account" ? "当前密钥返回的目录" : "官方参考目录";
+      group.label = data.source === "account" ? "可用模型" : "常用模型";
       group.append(...data.models.map(id => new Option(id, id)));
       select.replaceChildren(group);
-      if (!data.models.includes(model)) select.prepend(new Option(model + "（当前选择）", model));
-      if (data.configured) select.append(new Option("刷新账户模型目录", "__refresh"));
-      select.append(new Option("输入其他模型 ID…", "__custom"));
+      if (!data.models.includes(model)) select.prepend(new Option(model + " · 当前", model));
+      if (data.configured) select.append(new Option("刷新列表", "__refresh"));
+      select.append(new Option("自定义 ID…", "__custom"));
       select.value = model;
       select.dataset.catalog = signature;
     }
@@ -188,7 +188,7 @@ function drawConfig() {
   drawModels();
 }
 function settings() {
-  const text = el("p", "", "在项目目录创建 .env，填入两家的密钥后重新读取配置。");
+  const text = el("p", "", "在项目目录的 .env 中填入密钥后重新加载。");
   const path = el("code", "", config.project);
   const rows = el("div");
   for (const [id, name, env, url] of [
@@ -202,14 +202,14 @@ function settings() {
     row.append(main, el("span", "badge " + (config.keys[id] ? "done" : "needs_key"), config.keys[id] ? "已配置" : "待配置"));
     rows.append(row);
   }
-  const directory = el("p", "", "当前会话工作目录");
+  const directory = el("p", "", "当前工作目录");
   const projectPath = el("code", "", state.session.workspace);
   const actions = el("div", "dialog-actions");
-  actions.append(button("重新读取配置", "send", async () => {
+  actions.append(button("重新加载", "send", async () => {
     config = await api("config/reload", "POST");
-    drawConfig(); syncCatalogs(); settings(); toast("已重新读取本地配置");
+    drawConfig(); syncCatalogs(); settings(); toast("已重新加载配置");
   }));
-  modal("连接设置", text, path, rows, directory, projectPath, actions);
+  modal("设置", text, path, rows, directory, projectPath, actions);
 }
 function showBrief() {
   const parts = [];
@@ -223,10 +223,10 @@ function showBrief() {
 }
 function showModels(provider) {
   const input = el("input");
-  input.placeholder = "输入官方 API 的模型 ID";
+  input.placeholder = "输入模型 ID";
   input.value = state.session[provider];
   input.setAttribute("aria-label", "模型 ID");
-  const apply = button("使用此模型", "send", async () => {
+  const apply = button("确定", "send", async () => {
     const id = input.value.trim();
     if (!/^[A-Za-z0-9._:/-]{1,150}$/.test(id)) throw new Error("请输入有效的模型 ID");
     await saveModel(provider, id); $("#dialog").close();
@@ -264,9 +264,9 @@ function empty(title, subtitle, mark) {
 }
 function buildSuggestions() {
   for (const [label, mark, text] of [
-    ["理解项目", "book", "请阅读当前项目，说明它解决的问题、主要模块和运行方式。"],
-    ["验证代码", "code", "请检查当前项目，运行适用的测试，并根据实际结果编写一份验证报告。"],
-    ["撰写报告", "file-text", "请根据项目资料撰写一份研究报告。遇到缺少依据的结论，请 GPT 补做验证并注明来源。"],
+    ["梳理结构", "book", "看看这个项目，讲一下它主要做什么、目录怎么分、怎么跑起来。"],
+    ["运行测试", "code", "跑一下项目里的测试，看看哪些能通过、哪些有问题。"],
+    ["撰写说明", "file-text", "根据项目内容写份说明，缺数据或拿不准的地方让 GPT 测一下。"],
   ]) {
     const b = button(label, "", () => fillPrompt(text));
     b.prepend(icon(mark)); $("#suggestions").append(b);
@@ -293,13 +293,13 @@ function chat() {
     const detail = el("details", "notice");
     detail.append(el("summary", "", "等待批准 · " + request.source + " · " + request.title),
       el("pre", "artifact-text", request.detail),
-      button("允许本次", "quiet", () => api(path, "POST", {allow: true})),
-      button("拒绝本次", "quiet", () => api(path, "POST", {allow: false})));
+      button("允许", "quiet", () => api(path, "POST", {allow: true})),
+      button("拒绝", "quiet", () => api(path, "POST", {allow: false})));
     transcript.append(detail);
   }
   if (transcript.childNodes.length) {
     const waiting = state.tasks.filter((t) => t.status === "needs_key");
-    if (waiting.length) transcript.append(el("div", "notice", "消息已保存。配置相应的 API 密钥后，任务会继续执行。"));
+    if (waiting.length) transcript.append(el("div", "notice", "等待配置 API 密钥后继续执行。"));
     const active = state.tasks.filter((t) => t.status === "running" || t.status === "waiting");
     if (active.length) transcript.append(el("div", "notice", active.map((t) => t.title + " · " + statusNames[t.status]).join("　")));
   }
@@ -320,7 +320,7 @@ function drawLive() {
   if (atBottom && Object.keys(live).length) content.scrollTop = content.scrollHeight;
 }
 function tasks() {
-  if (!state.tasks.length) return empty("暂无任务", "发送需求后，可以在这里查看分工、进度和验证请求。", "workflow");
+  if (!state.tasks.length) return empty("暂无任务", "发送消息后会显示任务进度。", "workflow");
   const group = el("div");
   for (const task of [...state.tasks].reverse()) {
     const wrapper = el("div");
@@ -351,7 +351,7 @@ async function showArtifact(id) {
   modal(item.name, ...details, text, actions);
 }
 function files() {
-  if (!state.artifacts.length) return empty("暂无成果", "报告草稿、文件改动和验证证据会保存在这里。", "files");
+  if (!state.artifacts.length) return empty("暂无成果", "生成的文件与验证日志会显示在这里。", "files");
   const group = el("div");
   for (const item of [...state.artifacts].reverse()) {
     const row = button("", "row row-link", () => showArtifact(item.id));
@@ -368,7 +368,7 @@ function drawContent(forceScroll = false) {
   $("#conversation").classList.toggle("empty-session", starting);
   $("#welcome").hidden = !starting;
   $("#suggestions").hidden = !starting;
-  promptBox.placeholder = starting ? "描述任务，或提出问题…" : "继续对话，或修改当前需求…";
+  promptBox.placeholder = starting ? "输入消息…" : "继续输入或补充要求…";
   content.replaceChildren(chat());
   drawLive();
   content.scrollTop = forceScroll || atBottom ? content.scrollHeight : oldScroll;

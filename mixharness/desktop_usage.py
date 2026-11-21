@@ -64,7 +64,7 @@ class UsageDialog(QDialog):
     def refresh(self):
         self.stop()
         source = self.source.currentData()
-        self.summary.setText("正在读取" + self.source.currentText() + " 套餐用量…")
+        self.summary.setText("正在读取…")
         self.stamp.clear()
         self.refresh_button.setEnabled(False)
         content = QWidget()
@@ -98,15 +98,15 @@ class UsageDialog(QDialog):
                         bar.setFixedHeight(5)
                         rows.addWidget(bar)
                     if entry.get("reset"):
-                        rows.addWidget(label("重置时间　" + local_time(entry["reset"]), "caption"))
+                        rows.addWidget(label("重置于 " + local_time(entry["reset"]), "caption"))
                 credits = data.get("credits") or {}
                 has_balance = credits.get("unlimited") or credits.get("balance") is not None
                 if has_balance:
-                    rows.addWidget(label("点数余额　" + ("不限额" if credits.get("unlimited") else str(credits["balance"]))))
+                    rows.addWidget(label("点数　" + ("不限额" if credits.get("unlimited") else str(credits["balance"]))))
                 if not data["buckets"] and not has_balance:
-                    rows.addWidget(label("客户端未返回额度明细", "caption"))
+                    rows.addWidget(label("暂无额度明细", "caption"))
                 rows.addStretch()
-                self.stamp.setText("更新时间　" + local_time(data["updated"]))
+                self.stamp.setText("更新于 " + local_time(data["updated"]))
             finally:
                 if self.task is asyncio.current_task():
                     self.refresh_button.setEnabled(True)

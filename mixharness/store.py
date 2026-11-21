@@ -17,9 +17,9 @@ DEPENDS = {
     "section": SCOPES,
 }
 PROVIDERS = {"plan": "gemini", "report": "gemini", "section": "gemini", "engineering": "openai", "verification": "openai"}
-LABELS = {"plan": "理解需求", "engineering": "开发与研究", "verification": "补做验证", "report": "撰写报告", "section": "整理章节"}
-STATUSES = {"ready": "等待执行", "running": "进行中", "needs_key": "等待密钥", "waiting": "等待结果",
-            "done": "已完成", "failed": "执行失败", "obsolete": "已停止或已替换"}
+LABELS = {"plan": "解析需求", "engineering": "开发与研究", "verification": "验证", "report": "撰写报告", "section": "撰写章节"}
+STATUSES = {"ready": "待执行", "running": "进行中", "needs_key": "等待密钥", "waiting": "等待中",
+            "done": "已完成", "failed": "失败", "obsolete": "已跳过"}
 JSON_FIELDS = {"brief", "versions", "basis", "payload", "args", "result", "meta", "backend_models", "efforts"}
 
 
@@ -259,7 +259,7 @@ class Store:
     def require_idle_project(self, pid):
         if self.rows("SELECT j.id FROM jobs j JOIN sessions s ON s.id=j.sid WHERE s.project_id=? "
                      "AND j.status NOT IN ('done','obsolete','failed') LIMIT 1", pid):
-            raise ValueError("项目中还有待处理的任务，完成后可以更改来源文件夹")
+            raise ValueError("请等当前任务跑完后再调整项目文件夹")
 
     def attach_folder(self, pid, directory):
         path = Path(directory).expanduser().resolve(strict=True)
@@ -386,7 +386,7 @@ class Store:
             self.db.execute("INSERT INTO events(sid,kind,actor,body,meta,at) SELECT ?,kind,actor,body,"
                             "CASE WHEN actor='user' THEN meta ELSE '{}' END,at FROM events "
                             "WHERE sid=? AND kind='message' ORDER BY seq", (branch, sid))
-            self.event(branch, "progress", "system", "已从原会话复制消息与需求", {"source_session": sid})
+            self.event(branch, "progress", "system", "从原会话创建分支", {"source_session": sid})
         return self.session(branch)
 
     def message(self, sid, body, client_id):
@@ -419,7 +419,7 @@ class Store:
                     [(model, selected[p], sid, kind, model, old["backend"], old["backend"])
                      for kind, provider in PROVIDERS.items() if provider == p],
                 )
-            self.event(sid, "models", "system", "已更新协作模型设置", {**models, "efforts": selected})
+            self.event(sid, "models", "system", "已切换模型", {**models, "efforts": selected})
 
     def switch_backend(self, sid, backend, models, efforts=None):
         if backend not in ("api", "clients") or not all(models.get(p) for p in ("gemini", "openai")):
@@ -440,7 +440,7 @@ class Store:
                 [(models[provider], selected.get(provider, ""), sid, kind) for kind, provider in PROVIDERS.items()],
             )
             name = "本机客户端" if backend == "clients" else "API"
-            self.event(sid, "progress", "system", "会话执行方式已切换为" + name, {"backend": backend, **models})
+            self.event(sid, "progress", "system", "已切换至" + name, {"backend": backend, **models})
 
     def guard(self, job):
         if not self.rows("SELECT 1 FROM jobs WHERE id=? AND status='running'", job["id"]):
@@ -476,7 +476,7 @@ class Store:
                 if s["brief"][kind] and changed.intersection(DEPENDS[kind]):
                     self.enqueue(s, kind)
             if changed:
-                self.event(s["id"], "requirements", "system", "已更新任务要求", {"brief": s["brief"], "versions": s["versions"]})
+                self.event(s["id"], "requirements", "system", "需求已更新", {"brief": s["brief"], "versions": s["versions"]})
             if answer:
                 self.event(s["id"], "message", "gemini", answer)
             self.db.execute("UPDATE jobs SET status='done',model=?,effort=? WHERE id=?", (job["model"], job["effort"], job["id"]))

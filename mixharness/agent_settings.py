@@ -23,7 +23,7 @@ class AgentSettings(BaseModel):
     @classmethod
     def valid_window(cls, value):
         if 0 < value < 4096:
-            raise ValueError("上下文窗口至少需要 4096 个 token，填写 0 使用自动设置")
+            raise ValueError("上下文窗口至少需要 4096 token（填 0 为自动）")
         return value
 
 
@@ -52,7 +52,7 @@ def selected_skills(settings, folders):
     result = []
     for name in settings.skills:
         if name not in catalog:
-            raise ValueError("找不到已启用的技能 " + name + "，请在 Agent 设置中检查技能目录")
+            raise ValueError(f"找不到技能 {name}，请检查技能目录设置")
         path = Path(catalog[name]["path"])
         result.append({"名称": name, "目录": str(path.parent), "使用说明": frontmatter.load(str(path)).content})
     return result
@@ -95,7 +95,7 @@ def result_excerpt(result, limit):
     head = low // 2
     brief["节选"] = content[:head] + " … " + content[len(content) - low + head:]
     if tokens(encode_context(brief)) > limit:
-        raise ValueError("当前窗口无法容纳工具结果的证据编号，请增大上下文窗口")
+        raise ValueError("上下文窗口过小，无法容纳工具结果，请调大窗口")
     return brief
 
 
@@ -105,9 +105,9 @@ def compact_context(context, limit):
         return packed
     # 固定保留当前需求、工具要求和启用的技能，按时间优先保留最近的历史与成果。
     recent = {key: context[key] for key in ("共享记录", "本次任务的工具记录", "可读取的成果", "任务") if key in context}
-    kept = {**context, **dict.fromkeys(recent, []), "历史说明": "早期记录保存在会话历史中，可按编号读取成果。"}
+    kept = {**context, **dict.fromkeys(recent, []), "历史说明": "早期消息已折叠，可按编号读取历史成果。"}
     if tokens(encode_context(kept)) > limit:
-        raise ValueError("当前需求、草稿或技能说明超过上下文窗口，请增大窗口或减少启用的技能")
+        raise ValueError("当前需求、草稿或技能说明超出上下文窗口，请调大窗口或减少技能")
     if "本次任务的工具记录" in recent:
         room = max(128, (limit - tokens(encode_context(kept))) // 2)
         recent["本次任务的工具记录"] = [

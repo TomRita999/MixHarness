@@ -146,7 +146,7 @@ class Engine:
         if speed != "standard":
             group = group_for(self.client_catalogs["openai"].groups, model)
             if speed not in SPEEDS or backend != "clients" or speed not in available_speeds(group):
-                raise ValueError("当前套餐或模型未开放该速度。加速档位需要 Pro 200 或以上套餐及模型支持")
+                raise ValueError("当前账户或模型不支持该速度（需 Pro 200 及以上套餐）")
 
     def set_access(self, sid, permission=None, speed=None):
         session = self.store.session(sid)
@@ -389,7 +389,7 @@ class Engine:
                 if self.steering.get(jid) is not send:
                     continue
                 with self.store.db:
-                    self.store.event(sid, "progress", "system", "实时连接未接收补充要求，已保存到会话供下一步读取", {"job": jid})
+                    self.store.event(sid, "progress", "system", "补充内容已写入会话，将在下一轮生效", {"job": jid})
                 self.notify(sid)
 
     async def serve(self):
@@ -524,7 +524,7 @@ class Engine:
                 self.store.db.execute("UPDATE jobs SET status='obsolete' WHERE id=?", (check["id"],))
                 del check["payload"]["source"]
                 child = self.store.enqueue(session, "verification", check["payload"], check["title"])
-                self.store.event(job["sid"], "progress", "system", "报告引用的验证版本已变化，重新检查当前项目", {"job": child})
+                self.store.event(job["sid"], "progress", "system", "文件已变动，正在重新验证", {"job": child})
 
     async def execute(self, job, key):
         jid, sid = job["id"], job["sid"]
@@ -585,7 +585,7 @@ class Engine:
                     with self.store.db:
                         self.store.db.execute("UPDATE jobs SET cursor=NULL,seen=0,status='ready',draft='',payload=? WHERE id=?",
                                               (pack(job["payload"]), jid))
-                        self.store.event(sid, "progress", "system", "项目文件已变化，按最新版本重新验证", {"job": jid})
+                        self.store.event(sid, "progress", "system", "文件已变动，正在重新验证", {"job": jid})
                     return
             with self.store.db:
                 self.store.guard(job)
@@ -594,7 +594,7 @@ class Engine:
                     self.store.db.execute("UPDATE jobs SET status='ready' WHERE id=?", (jid,))
                 elif job["kind"] == "report" and self.store.pending_work(sid):
                     self.store.db.execute("UPDATE jobs SET status='waiting' WHERE id=?", (jid,))
-                    self.store.event(sid, "progress", "gemini", "草稿已保存，正在等待工程或验证结果", {"job": jid})
+                    self.store.event(sid, "progress", "gemini", "等待工程或验证结果", {"job": jid})
                 else:
                     meta = {"kind": job["kind"], "basis": job["basis"], "sources": reply.sources}
                     if job["kind"] == "verification":

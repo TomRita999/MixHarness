@@ -251,7 +251,7 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                     break
             tier = codex_speeds(account, record or {}).get(speed)
             if not tier:
-                raise ClientError("当前 Codex 账户和模型未开放所选速度，请切换为标准速度")
+                raise ClientError("当前 Codex 账户或模型不支持所选速度，请改用标准速度")
         options = {"model": model, "cwd": str(cwd), "ephemeral": True, "serviceTier": tier,
                    "sandbox": "danger-full-access" if mode == "full" else "workspace-write",
                    "approvalPolicy": "never" if mode == "full" else "on-request",
@@ -262,7 +262,7 @@ async def codex_turn(engine, job, cwd, prompt, schema):
         started = await rpc.request("thread/start", options)
         tid = started["thread"]["id"]
         if not started["thread"]["ephemeral"]:
-            raise ClientError("Codex 未启用临时线程，已停止发送任务")
+            raise ClientError("Codex 未启用临时线程，已取消本次调用")
         fragments, complete, final = [], None, ""
         def event(method, params):
             nonlocal complete, final
@@ -326,9 +326,9 @@ async def workflow_turn(engine, job, context, cwd):
     kind, sid = job["kind"], job["sid"]
     schema = (Plan if kind == "plan" else ClientReply).model_json_schema()
     tools = declarations(kind) if kind != "plan" else []
-    prompt = (PROMPTS[kind] + "\n你通过 MixHarness 的工具与项目交互。请只返回符合以下 JSON Schema 的 JSON 对象。"
-              "需要调用工具时，在 calls 中填写 name 和 JSON 字符串 arguments，工具的实际执行结果会在下一轮发给你。"
-              "\n输出格式\n" + pack(schema) + "\n本次可用工具\n" + pack(tools) + "\n共享会话\n" + context)
+    prompt = (PROMPTS[kind] + "\n请严格返回符合下方 JSON Schema 的 JSON 对象。"
+              "需要调用 MixHarness 工具时，在 calls 中填写工具名与 JSON 字符串 arguments，结果会在下一轮返回。"
+              "\n输出格式\n" + pack(schema) + "\n可用工具\n" + pack(tools) + "\n共享会话\n" + context)
     if kind in ("engineering", "verification"):
         raw = await codex_turn(engine, job, cwd, prompt, schema)
     else:

@@ -77,7 +77,7 @@ def edit_source(root, args):
     if current == data:
         return {"path": args["path"], "sha256": digest(data)}
     if (digest(current) if current is not None else "") != expected:
-        raise ValueError("文件已发生变化，请重新读取当前版本后编辑")
+        raise ValueError("文件已变动，请重新读取后再编辑")
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".mixharness-", delete=False) as stream:
         staging = Path(stream.name)

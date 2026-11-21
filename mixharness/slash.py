@@ -14,22 +14,22 @@ from .usage import plan_usage
 COMMANDS = {
     "help": "查看指令和参数",
     "new": "在当前项目开始新会话", "resume": "[会话编号]　列出或继续会话",
-    "history": "[关键词]　搜索已有会话", "rename": "名称　重命名当前会话", "fork": "[名称]　从当前对话创建分支",
-    "projects": "列出项目", "project": "项目编号或文件夹　切换项目并开始会话",
-    "add-dir": "文件夹　加入当前项目", "tools": "查看可用工具与项目验证命令",
+    "history": "[关键词]　搜索会话", "rename": "名称　重命名当前会话", "fork": "[名称]　从当前对话创建分支",
+    "projects": "列出项目", "project": "项目编号或目录　切换项目",
+    "add-dir": "文件夹　加入当前项目", "tools": "查看工具与项目验证命令",
     "model": "[gemini|openai] [模型 ID]　查看或切换模型",
     "effort": "gemini|openai [档位|default]　设置思考强度",
-    "backend": "[clients|api]　切换执行方式", "permissions": "[ask|auto|full]　查看或更改操作权限",
+    "backend": "[clients|api]　切换执行方式", "permissions": "[ask|auto|full]　查看或设置权限",
     "fast": "[off|fast|ultrafast]　设置 Codex 速度",
-    "status": "查看会话、模型、权限和任务", "usage": "[codex|antigravity|openai|gemini]　查看用量",
+    "status": "查看会话状态", "usage": "[codex|antigravity|openai|gemini]　查看用量",
     "skills": "[on 名称|off 名称|add 目录|remove 目录]　配置技能",
-    "context": "[auto|token 数]　查看或设置共享上下文窗口", "compact": "压缩本会话的历史上下文",
-    "settings": "查看当前会话库的 Agent 设置", "plan": "[要求]　查看当前计划或请求制定方案",
-    "review": "[关注点]　让 GPT 检查项目并提供依据", "diff": "查看项目的 Git 改动",
-    "init": "让模型阅读当前项目并维护 AGENTS.md", "mcp": "[codex|antigravity]　查看客户端的 MCP 服务",
-    "approvals": "查看待批准操作", "approve": "审批编号　允许本次操作", "deny": "审批编号　拒绝本次操作",
-    "stop": "停止本会话正在处理的任务", "retry": "任务编号　重试失败任务",
-    "export": "[文件路径]　导出会话 Markdown", "exit": "退出交互式命令行",
+    "context": "[auto|token 数]　设置上下文窗口", "compact": "压缩会话历史",
+    "settings": "查看技能与上下文设置", "plan": "[要求]　查看或制定方案",
+    "review": "[关注点]　让 GPT 审查项目", "diff": "查看 Git 改动",
+    "init": "阅读项目并更新 AGENTS.md", "mcp": "[codex|antigravity]　查看 MCP 服务",
+    "approvals": "查看待批准操作", "approve": "审批编号　允许", "deny": "审批编号　拒绝",
+    "stop": "停止当前任务", "retry": "任务编号　重试失败任务",
+    "export": "[文件路径]　导出为 Markdown", "exit": "退出命令行",
 }
 ALIASES = {"": "help", "?": "help", "quit": "exit", "clear": "new", "chats": "history", "models": "model",
            "config": "settings", "approvals-mode": "permissions", "sandbox": "permissions",
@@ -92,7 +92,7 @@ def context_command(engine, argument, sid, pid):
             calls = [c for c in engine.store.calls(jobs[0]) if c["result"] is not None]
             _, results, content, _ = engine.turn_input(jobs[0], session, calls)
             size = tokens(content) + sum(tokens(encode_context(c["result"])) for c in results)
-        lines.append(f"最近任务按当前设置组装的共享输入约 {size:,} token")
+        lines.append(f"最近一次共享输入约 {size:,} token")
         if session["context_after"]:
             lines.append(f"历史已压缩至第 {session['context_after']} 条记录")
     return "\n".join(lines)
@@ -112,7 +112,7 @@ def compact(engine, session):
         engine.store.db.execute("UPDATE sessions SET context_after=?,context_summary=? WHERE id=?",
                                 (events[-1]["seq"], summary, sid))
     engine.notify(sid)
-    return f"已将 {len(events)} 条消息整理为历史摘要。完整消息可通过会话历史和 /export 查看。"
+    return f"已压缩 {len(events)} 条消息，原记录仍可查看或通过 /export 导出。"
 
 
 async def model_command(engine, cmd, arg, session):
@@ -283,7 +283,7 @@ async def execute_command(engine, args):
         branch = engine.store.fork_session(sid, arg)
         engine.notify(branch["id"])
         result.update(id=branch["id"], project_id=branch["project_id"])
-        text = "已复制消息与当前需求到 " + branch["title"] + "　" + branch["id"]
+        text = "已创建分支：" + branch["title"] + "　" + branch["id"]
     elif cmd == "add-dir":
         if not pid or not arg:
             raise ValueError("请在项目会话中输入 /add-dir 文件夹路径")
@@ -359,13 +359,13 @@ async def execute_command(engine, args):
         text = "\n".join(name + "　" + session["brief"][k] for k, name in (
             ("engineering", "开发与研究"), ("verification", "验证"), ("report", "报告")) if session["brief"].get(k)) or "当前尚未制定计划"
     elif cmd == "init":
-        request = "请先阅读当前项目的真实文件，依据构建方式、测试命令与已有约定，在项目根目录创建或更新 AGENTS.md，保留用户现有规则。"
+        request = "阅读项目文件，按构建方式、测试命令与已有约定在根目录创建或更新 AGENTS.md，保留现有规则。"
         engine.submit(sid, request, new_id())
         await engine.steer(sid, request)
         text = "已提交项目说明任务"
     elif cmd in ("plan", "review"):
-        question = ("只制定实施方案，给出待验证事项。用户要求为 " + arg if cmd == "plan"
-                    else "审查项目的正确性，指出具体文件、问题及依据。" + arg)
+        question = ("制定实施方案并列出验证点：" + arg if cmd == "plan"
+                    else "审查项目代码，指出具体文件、问题与依据。" + arg)
         with engine.store.db:
             title = "制定方案" if cmd == "plan" else "代码审查"
             jid = engine.store.enqueue(session, "verification", {"question": question, "direct": True}, title)

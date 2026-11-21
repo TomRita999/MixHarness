@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mixharness"
 version = "0.7.0"
-description = "使用 Gemini 和 OpenAI 协作开发、验证和撰写报告的本地工作台"
+description = "让 Gemini 和 GPT 在同一会话中协作开发的桌面与命令行工作台"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115,<1",

@@ -29,7 +29,7 @@ class ClientHistory(QWidget):
         self.status = label("", "caption")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        self.more = button("加载更多会话", lambda: self.load(more=True))
+        self.more = button("加载更多", lambda: self.load(more=True))
         layout.addWidget(self.more)
 
     def select_source(self, source):
@@ -47,7 +47,7 @@ class ClientHistory(QWidget):
             self.list.clear()
             self.cursor = None
         self.caption.setText("全部会话" if source == "all" else clients.NAMES[source] + " 会话")
-        self.status.setText("正在读取会话…")
+        self.status.setText("加载中…")
         self.more.hide()
         async def fetch():
             try:
@@ -64,7 +64,7 @@ class ClientHistory(QWidget):
             self.cursor = data["next"]
             self.more.setVisible(bool(self.cursor))
             errors = [clients.NAMES[c] + " · " + msg for c, msg in data.get("errors", {}).items()]
-            self.status.setText("\n".join(errors) if errors else ("" if self.list.count() else "客户端中暂无会话"))
+            self.status.setText("\n".join(errors) if errors else ("" if self.list.count() else "暂无会话"))
         self.loading = self.window.run_task(fetch())
 
     def open_item(self, item):
@@ -80,7 +80,7 @@ class ClientHistory(QWidget):
         layout = QVBoxLayout(dialog)
         transcript = Timeline()
         layout.addWidget(transcript, 1)
-        status = label("正在读取会话…", "caption")
+        status = label("加载中…", "caption")
         layout.addWidget(status)
         actions = QHBoxLayout()
         actions.addStretch()
@@ -94,7 +94,7 @@ class ClientHistory(QWidget):
             if task:
                 task.cancel()
             more.setEnabled(False)
-            status.setText("正在读取会话…")
+            status.setText("加载中…")
             async def fetch():
                 nonlocal cursor
                 try:
@@ -110,9 +110,9 @@ class ClientHistory(QWidget):
                 cursor = page["next"]
                 more.setEnabled(bool(cursor))
                 more.setVisible(bool(cursor))
-                status.setText("" if transcript.seen else "此会话还没有消息")
+                status.setText("" if transcript.seen else "暂无消息")
             task = self.window.run_task(fetch())
-        more = button("加载后续消息", load)
+        more = button("加载更多", load)
         more.hide()
         actions.addWidget(more)
         actions.addWidget(button("刷新", lambda: load(reload=True)))

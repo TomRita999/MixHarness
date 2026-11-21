@@ -89,7 +89,7 @@ class Terminal:
         for job in data["needs_key"]:
             if job["id"] not in self.missing:
                 provider = "OpenAI" if job["kind"] in ("engineering", "verification") else "Gemini"
-                print(f"任务已保存，正在等待 {provider} API Key", flush=True)
+                print(f"等待 {provider} API Key", flush=True)
         self.missing = {j["id"] for j in data["needs_key"]}
         for job in data["running"]:
             if job["id"] not in self.running:
@@ -116,7 +116,7 @@ class Terminal:
         if self.sid:
             session = (await self.invoke(dict(command="status", id=self.sid)))["session"]
             self.options.update(project_id=session["project_id"], backend=session["backend"])
-        print("MixHarness　输入需求，或输入 /help 查看指令。", flush=True)
+        print("MixHarness · 输入消息开始协作，/help 查看指令", flush=True)
         with patch_stdout() if self.prompt else nullcontext():
             monitor = asyncio.create_task(self.monitor())
             try:

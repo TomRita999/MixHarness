@@ -20,7 +20,7 @@ from .reasoning import LEVEL_NAMES, api_group, group_for
 
 ALIGN = Qt.AlignmentFlag
 MARKDOWN = QTextDocument.MarkdownFeature.MarkdownDialectGitHub | QTextDocument.MarkdownFeature.MarkdownNoHTML
-ACTORS = {"user": "你", "gemini": "Gemini", "openai": "GPT", "system": "工作记录"}
+ACTORS = {"user": "你", "gemini": "Gemini", "openai": "GPT", "system": "过程"}
 
 
 def label(text, name=""):
@@ -58,7 +58,7 @@ class Editor(QPlainTextEdit):
         self.preedit = False
         self.setObjectName("editor")
         self.setAccessibleName("消息")
-        self.setPlaceholderText("输入需求、补充要求，或输入 /help 查看指令…")
+        self.setPlaceholderText("输入消息，或用 / 调用指令…")
         self.setTabChangesFocus(True)
         self.setFixedHeight(70)
         self.document().setDocumentMargin(3)
@@ -186,7 +186,7 @@ class ModelPicker(QWidget):
         choices = group["choices"] if variants else {"": group["id"], **group["choices"]}
         level = self.selected_level(group) if variants else self.effort
         for value, model in choices.items():
-            name = LEVEL_NAMES.get(value, value) if value else "模型默认"
+            name = LEVEL_NAMES.get(value, value) if value else "默认"
             if not value and group["default"]:
                 name += " · " + LEVEL_NAMES.get(group["default"], group["default"])
             action = menu.addAction(name)
@@ -213,9 +213,6 @@ class ModelPicker(QWidget):
             return
         menu = self.new_menu(self.title + " 模型")
         selected = group_for(self.catalog["groups"], self.model)
-        if not client:
-            origin = "当前密钥的模型" if self.catalog["source"] == "account" else "API 参考模型"
-            menu.addSection(origin)
         for group in self.catalog["groups"]:
             levels = group["choices"]
             if not client and not levels and group is not selected:
@@ -235,11 +232,11 @@ class ModelPicker(QWidget):
             action.setCheckable(True)
             action.setChecked(group is selected)
         if client and not self.catalog["groups"]:
-            menu.addAction(self.catalog["error"] or "正在读取模型目录…").setEnabled(False)
+            menu.addAction(self.catalog["error"] or "正在读取…").setEnabled(False)
         menu.addSeparator()
         if not client:
             menu.addAction("搜索全部模型…", self.open_dialog)
-        refresh = menu.addAction("刷新模型目录", lambda: self.refresh_requested.emit(self.provider))
+        refresh = menu.addAction("刷新列表", lambda: self.refresh_requested.emit(self.provider))
         refresh.setEnabled(client or self.catalog["configured"])
         menu.addAction("查看套餐用量", lambda: self.usage_requested.emit(self.provider))
         self.popup(menu, self.control)
@@ -267,14 +264,14 @@ class ModelPicker(QWidget):
         self.options.setAccessibleName(self.title + " 模型列表")
         layout.addWidget(self.options, 1)
         actions = QHBoxLayout()
-        self.reload = button("刷新目录", lambda: self.refresh_requested.emit(self.provider))
+        self.reload = button("刷新", lambda: self.refresh_requested.emit(self.provider))
         actions.addWidget(self.reload)
-        self.manual = button("输入模型 ID…", self.custom)
+        self.manual = button("自定义 ID…", self.custom)
         actions.addWidget(self.manual)
         actions.addWidget(button("查看套餐用量", lambda: self.usage_requested.emit(self.provider)))
         actions.addStretch()
         actions.addWidget(button("取消", dialog.reject))
-        self.apply = button("使用模型", self.choose, name="primary")
+        self.apply = button("确定", self.choose, name="primary")
         actions.addWidget(self.apply)
         layout.addLayout(actions)
         self.options.itemActivated.connect(self.choose)
@@ -289,19 +286,17 @@ class ModelPicker(QWidget):
 
     def update_list(self):
         data = self.catalog
-        source = "当前密钥返回的目录" if data["source"] == "account" else "官方参考目录"
         local = data["source"] == "client"
-        if local:
-            source = self.title + " 客户端目录"
         self.manual.setVisible(not local)
-        message = data["error"]
         if self.loading:
-            message = "正在读取模型目录…"
-        elif not data["configured"]:
-            message = "填写 API Key 后可查询自己的模型"
-        elif data["source"] == "account":
-            message = message or "此工作台需要支持文本输出和函数调用的模型"
-        self.origin.setText(f"{source} · {len(data['models'])} 个模型\n{message}".rstrip())
+            info = "正在读取模型…"
+        elif data["error"]:
+            info = data["error"]
+        elif not local and not data["configured"]:
+            info = f"常用模型（共 {len(data['models'])} 个，配置密钥后可拉取账户列表）"
+        else:
+            info = f"共 {len(data['models'])} 个模型"
+        self.origin.setText(info)
         self.reload.setEnabled(data["configured"] and not self.loading)
         query = self.search.text().strip().casefold()
         current = self.options.currentItem()
@@ -314,9 +309,7 @@ class ModelPicker(QWidget):
                 continue
             text = name
             if value == self.model:
-                text += "   · 当前选择"
-                if value not in data["models"]:
-                    text += "（目录未列出）"
+                text += "  · 当前"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, value)
             self.options.addItem(item)
@@ -339,13 +332,13 @@ class ModelPicker(QWidget):
         dialog.setWindowTitle(self.title + " 模型")
         dialog.setLabelText("模型 ID")
         dialog.setTextValue(self.model)
-        dialog.setOkButtonText("使用模型")
+        dialog.setOkButtonText("确定")
         dialog.setCancelButtonText("取消")
 
         def choose(value):
             value = value.strip()
             if not re.fullmatch(r"[a-zA-Z0-9._:/-]{1,150}", value):
-                QMessageBox.warning(self, "模型 ID 无效", "请输入服务商提供的模型 ID。")
+                QMessageBox.warning(self, "模型 ID 无效", "模型 ID 格式无效。")
                 return
             self.changed.emit(self.provider, value, self.effort if value == self.model else "")
             if self.dialog:
@@ -389,7 +382,7 @@ class MessageRow(QWidget):
         if self.user:
             row.addStretch()
         else:
-            title = {"verification": "Gemini 请求 GPT 验证", "failure": author + " · 执行失败"}.get(event["kind"], author)
+            title = {"verification": "Gemini 请求 GPT 验证", "failure": author + " · 失败"}.get(event["kind"], author)
             box.addWidget(label(title, "messageAuthor"))
         self.body = Document()
         self.body.setObjectName("messageText")
@@ -485,7 +478,7 @@ class Timeline(QScrollArea):
             self.column.insertWidget(self.column.count() - 1, group)
         prior = self.group_body.text()
         self.group_body.setText(prior + "\n" + text if prior else text)
-        self.group_button.setText("工作记录")
+        self.group_button.setText("过程")
 
     def update_events(self, events, colors):
         bar = self.verticalScrollBar()
@@ -535,7 +528,7 @@ class SettingsDialog(QDialog):
 
     def __init__(self, parent, engine):
         super().__init__(parent)
-        self.setWindowTitle("连接设置")
+        self.setWindowTitle("设置")
         self.setMinimumWidth(405)
         self.engine = engine
         layout = QVBoxLayout(self)
@@ -563,21 +556,17 @@ class SettingsDialog(QDialog):
                 field.setEnabled(False)
             self.fields[variable] = field
             layout.addWidget(field)
-            if engine.key_sources[name]:
-                origin = label("来源　" + engine.key_sources[name], "caption")
-                origin.setWordWrap(True)
-                layout.addWidget(origin)
-        layout.addSpacing(10)
-        path = label("配置文件\n" + str(engine.project / ".env"), "caption")
+        layout.addSpacing(8)
+        path = label("配置文件：" + str(engine.project / ".env"), "caption")
         path.setWordWrap(True)
         path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(path)
         def agent_settings():
             from .desktop_agent import AgentDialog
             AgentDialog(self, engine, parent.sid, parent.pid).open()
-        layout.addWidget(button("技能与上下文窗口…", agent_settings), 0, ALIGN.AlignLeft)
+        layout.addWidget(button("技能与上下文…", agent_settings), 0, ALIGN.AlignLeft)
         actions = QHBoxLayout()
-        actions.addWidget(button("重新读取文件", self.reload))
+        actions.addWidget(button("重新加载", self.reload))
         actions.addStretch()
         actions.addWidget(button("取消", self.reject))
         actions.addWidget(button("保存", self.save, name="primary"))
