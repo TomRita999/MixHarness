@@ -53,7 +53,7 @@ class DesktopTests(unittest.TestCase):
                     QTest.keyClick(menu, Qt.Key.Key_Right)
                     child = family.menu()
                     self.assertTrue(child.isVisible())
-                    QTest.mouseClick(child, left, pos=child.actionGeometry(child.back).center())
+                    QTest.keyClick(child, Qt.Key.Key_Escape)
                     self.assertFalse(child.isVisible())
                     self.assertTrue(menu.isVisible())
                     QTest.keyClick(menu, Qt.Key.Key_Escape)

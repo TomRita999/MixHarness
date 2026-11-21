@@ -7,11 +7,12 @@ from math import ceil
 from pathlib import Path
 
 from dotenv import set_key
-from PySide6.QtCore import QIODevice, QPoint, QSaveFile, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFontMetrics, QIcon, QTextDocument
+from PySide6.QtCore import QEasingCurve, QIODevice, QPoint, QPointF, QPropertyAnimation, QSaveFile, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QPainter, QTextDocument
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QToolButton, QVBoxLayout, QWidget,
+    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QToolButton, QToolTip,
+    QVBoxLayout, QWidget,
 )
 
 from .desktop_style import Glyph
@@ -91,23 +92,6 @@ class Submenu(QMenu):
     def __init__(self, title, parent):
         super().__init__(title, parent)
         parent.addMenu(self)
-        self.back = self.addAction("返回上一级")
-        self.back.triggered.connect(self.hide)
-        self.addSeparator()
-
-    def mouseReleaseEvent(self, event):
-        if self.actionAt(event.position().toPoint()) == self.back:
-            self.hide()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def keyPressEvent(self, event):
-        if self.activeAction() == self.back and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
-            self.hide()
-            event.accept()
-            return
-        super().keyPressEvent(event)
 
 
 class ModelPicker(QWidget):
@@ -125,31 +109,27 @@ class ModelPicker(QWidget):
         self.dialog = None
         self.menu = None
         self.loading = False
-        row = QVBoxLayout(self)
+        row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(1)
+        row.setSpacing(0)
+        # 服务商名称放在提示里，界面上只保留图标、模型和思考强度。
         self.caption = label(title, "caption")
-        self.caption.setIndent(4)
-        heading = QHBoxLayout()
-        heading.setSpacing(2)
-        heading.addWidget(self.caption)
-        self.effort_control = QToolButton()
-        self.effort_control.setObjectName("effort")
-        self.effort_control.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.effort_control.clicked.connect(self.open_effort)
-        heading.addWidget(self.effort_control)
-        heading.addStretch(1)
-        row.addLayout(heading)
+        self.caption.hide()
         self.control = QToolButton()
         self.control.setObjectName("model")
         self.control.setAccessibleName(title + " 模型")
         self.control.setIcon(icon(provider))
         self.control.setIconSize(QSize(14, 14))
         self.control.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.control.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.control.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         self.control.setCursor(Qt.CursorShape.PointingHandCursor)
         self.control.clicked.connect(self.open_models)
-        row.addWidget(self.control)
+        row.addWidget(self.control, 1)
+        self.effort_control = QToolButton()
+        self.effort_control.setObjectName("effort")
+        self.effort_control.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.effort_control.clicked.connect(self.open_effort)
+        row.addWidget(self.effort_control)
 
     def select(self, model, catalog, effort=""):
         self.model = model
@@ -161,7 +141,7 @@ class ModelPicker(QWidget):
         self.caption.setText(self.title)
         self.control.setAccessibleName(self.title + " 模型")
         group = group_for(catalog["groups"], model)
-        self.control.setText((group["name"] if group else model or "选择模型") + "  ▾")
+        self.control.setText((group["name"] if group else model or "选择模型") + " ▾")
         self.control.setToolTip(self.title + " · " + (model or "选择模型"))
         level = self.selected_level(group)
         self.effort_control.setText((LEVEL_NAMES.get(level, level) or "默认") + " ▾")
@@ -430,6 +410,8 @@ class MessageRow(QWidget):
 
 
 class Timeline(QScrollArea):
+    navigation_changed = Signal()
+
     def __init__(self):
         super().__init__()
         self.setAccessibleName("共享会话记录")
@@ -449,6 +431,11 @@ class Timeline(QScrollArea):
         self.group_button = None
         self.group_body = None
         self.seen = 0
+        self.scroller = QPropertyAnimation(self.verticalScrollBar(), b"value", self)
+        self.scroller.setDuration(260)
+        self.scroller.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.verticalScrollBar().valueChanged.connect(self.navigation_changed)
+        self.verticalScrollBar().rangeChanged.connect(self.navigation_changed)
 
     def reset(self):
         while self.column.count() > 1:
@@ -459,14 +446,36 @@ class Timeline(QScrollArea):
         self.records.clear()
         self.group_button = self.group_body = None
         self.seen = 0
+        self.navigation_changed.emit()
 
     def toPlainText(self):
         return "\n\n".join(self.records)
+
+    def user_rows(self):
+        return [row for row in self.rows if row.user]
+
+    def current_index(self):
+        rows = self.user_rows()
+        bar = self.verticalScrollBar()
+        if rows and bar.value() >= bar.maximum() - 2:
+            return len(rows) - 1
+        line = bar.value() + 48
+        return max((i for i, row in enumerate(rows) if row.y() <= line), default=0)
+
+    def jump(self, index):
+        rows = self.user_rows()
+        if 0 <= index < len(rows):
+            bar = self.verticalScrollBar()
+            self.scroller.stop()
+            self.scroller.setStartValue(bar.value())
+            self.scroller.setEndValue(min(bar.maximum(), max(0, rows[index].y() - 12)))
+            self.scroller.start()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         for row in self.rows:
             row.fit(self.viewport().width() - 4)
+        self.navigation_changed.emit()
 
     def progress(self, text):
         if self.group_button is None:
@@ -518,6 +527,77 @@ class Timeline(QScrollArea):
             self.column.activate()
             self.canvas.adjustSize()
             bar.setValue(bar.maximum())
+        if changed:
+            self.navigation_changed.emit()
+
+
+class MessageNav(QWidget):
+    """会话右侧的快速定位条：每个圆点对应一条你发送的消息，点击即可跳转。"""
+    STEP = 14
+
+    def __init__(self, timeline, parent):
+        super().__init__(parent)
+        self.timeline = timeline
+        self.hovered = -1
+        self.setAccessibleName("消息快速定位")
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        timeline.navigation_changed.connect(self.refresh)
+        self.hide()
+
+    def refresh(self):
+        count = len(self.timeline.user_rows())
+        self.setFixedSize(22, count * self.STEP + 10)
+        self.setVisible(count >= 2 and self.timeline.isVisible())
+        self.reposition()
+        self.update()
+
+    def reposition(self):
+        host = self.parentWidget()
+        if host:
+            self.move(host.width() - self.width() - 8, max(48, (host.height() - self.height()) // 2))
+            self.raise_()
+
+    def index_at(self, y):
+        index = int((y - 5) // self.STEP)
+        return index if 0 <= index < len(self.timeline.user_rows()) else -1
+
+    def paintEvent(self, event):
+        rows = self.timeline.user_rows()
+        current = self.timeline.current_index()
+        palette = QApplication.palette()
+        ink, muted = palette.color(palette.ColorRole.Text), palette.color(palette.ColorRole.PlaceholderText)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for i in range(len(rows)):
+            color = QColor(ink if i in (current, self.hovered) else muted)
+            if i not in (current, self.hovered):
+                color.setAlphaF(0.55)
+            radius = 3.6 if i == current else (3.2 if i == self.hovered else 2.6)
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(self.width() / 2, 5 + self.STEP * i + self.STEP / 2), radius, radius)
+        painter.end()
+
+    def mouseMoveEvent(self, event):
+        index = self.index_at(event.position().y())
+        if index != self.hovered:
+            self.hovered = index
+            self.update()
+            if index >= 0:
+                text = " ".join(self.timeline.user_rows()[index].text.split())
+                QToolTip.showText(event.globalPosition().toPoint(), text[:80] + ("…" if len(text) > 80 else ""), self)
+            else:
+                QToolTip.hideText()
+
+    def leaveEvent(self, event):
+        self.hovered = -1
+        self.update()
+
+    def mousePressEvent(self, event):
+        index = self.index_at(event.position().y())
+        if index >= 0:
+            self.timeline.jump(index)
 
 
 def save_keys(project, values):

@@ -141,7 +141,8 @@ def apply_theme(app, name):
         QPushButton#send:hover { background: $secondary; }
         QPushButton#send:disabled { background: $line; }
         QToolButton#model { text-align: left; padding: 3px 8px 3px 6px; font-size: 13px; font-weight: 500; border-radius: 8px; }
-        QToolButton#effort { color: $muted; padding: 1px 6px; font-size: 11px; border-radius: 6px; }
+        QToolButton#effort { color: $muted; padding: 3px 8px; font-size: 12px; border-radius: 8px; }
+        QToolButton#effort:hover { color: $ink; }
         QToolButton#effort:disabled { color: $muted; }
 
         QComboBox { background: transparent; border: 1px solid $line; border-radius: 8px;
@@ -181,6 +182,8 @@ def apply_theme(app, name):
         QMenu::separator { height: 1px; background: $line; margin: 4px 6px; }
         QMenu::section { color: $muted; font-size: 11px; padding: 6px 12px 2px; }
 
+        QSplitter#panes::handle { background: transparent; }
+        QSplitter#panes::handle:hover { background: $line; }
         QProgressBar { background: $line; border: none; border-radius: 2px; }
         QProgressBar::chunk { background: $ink; border-radius: 2px; }
         QTabWidget::pane { border: none; }

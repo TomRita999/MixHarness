@@ -2,12 +2,12 @@ import asyncio
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QProcess, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QHeaderView, QInputDialog,
     QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMenu, QMessageBox, QSizePolicy, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QMessageBox, QSizePolicy, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .desktop_projects import ArchiveDialog, ProjectDialog
@@ -18,7 +18,7 @@ from .desktop_clients import ClientHistory
 from .desktop_usage import UsageDialog
 from .desktop_style import RESOURCES, THEMES, apply_theme
 from .desktop_widgets import (
-    ALIGN, ArtifactDialog, Document, Editor, ModelPicker, SettingsDialog, Submenu, Timeline, button, icon, label,
+    ALIGN, ArtifactDialog, Document, Editor, MessageNav, ModelPicker, SettingsDialog, Submenu, Timeline, button, icon, label,
 )
 from .providers import MODELS
 from .clients import CLIENTS
@@ -50,16 +50,16 @@ class Window(QMainWindow):
         self.setWindowIcon(QIcon(str(RESOURCES / "app.png")))
         self.resize(1140, 740)
         self.setMinimumSize(700, 490)
-        self.layout_row = QHBoxLayout()
-        self.layout_row.setContentsMargins(0, 0, 0, 0)
-        self.layout_row.setSpacing(0)
-        central = QWidget()
-        central.setObjectName("main")
-        central.setLayout(self.layout_row)
-        self.setCentralWidget(central)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setObjectName("panes")
+        self.splitter.setHandleWidth(5)
+        self.splitter.setChildrenCollapsible(False)
+        self.setCentralWidget(self.splitter)
         self.make_sidebar()
         self.make_chat()
         self.make_inspector()
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([int(settings.value("sidebar_width", 256)), 860, int(settings.value("inspector_width", 280))])
         self.make_menus()
         self.set_theme(str(settings.value("theme", "light")))
         geometry = settings.value("geometry")
@@ -87,7 +87,8 @@ class Window(QMainWindow):
     def make_sidebar(self):
         self.sidebar = QFrame()
         self.sidebar.setObjectName("sidebar")
-        self.sidebar.setFixedWidth(254)
+        self.sidebar.setMinimumWidth(200)
+        self.sidebar.setMaximumWidth(440)
         col = QVBoxLayout(self.sidebar)
         col.setContentsMargins(13, 14, 13, 13)
         col.setSpacing(3)
@@ -151,7 +152,7 @@ class Window(QMainWindow):
         self.theme_button = button("切换主题", self.toggle_theme, "moon", icon_only=True)
         foot.addWidget(self.theme_button)
         col.addLayout(foot)
-        self.layout_row.addWidget(self.sidebar)
+        self.splitter.addWidget(self.sidebar)
 
     def make_chat(self):
         main = QWidget()
@@ -161,6 +162,7 @@ class Window(QMainWindow):
         body.setSpacing(0)
         header = QHBoxLayout()
         header.setContentsMargins(17, 10, 16, 8)
+        header.setSpacing(6)
         self.expand_side = button("展开侧栏", self.toggle_sidebar, "sidebar", icon_only=True)
         self.expand_side.hide()
         header.addWidget(self.expand_side)
@@ -169,7 +171,7 @@ class Window(QMainWindow):
         self.title = label("新会话", "title")
         self.title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         header.addWidget(self.project_name)
-        header.addWidget(label("／", "context"))
+        header.addWidget(label("/", "context"))
         header.addWidget(self.title, 1)
         self.chat_more = button("会话操作", self.current_chat_menu, "more", icon_only=True)
         header.addWidget(self.chat_more)
@@ -177,7 +179,7 @@ class Window(QMainWindow):
         header.addWidget(self.inspect_button)
         body.addLayout(header)
         shell = QHBoxLayout()
-        shell.setContentsMargins(22, 4, 22, 14)
+        shell.setContentsMargins(30, 4, 36, 14)
         view = QWidget()
         view.setMaximumWidth(760)
         self.chat_layout = QVBoxLayout(view)
@@ -214,16 +216,16 @@ class Window(QMainWindow):
         self.editor.focus_changed.connect(self.composer_focus)
         controls.addWidget(self.editor)
         tools = QHBoxLayout()
-        tools.setSpacing(8)
+        tools.setSpacing(6)
         self.pickers = {}
         for provider, title in (("gemini", "Gemini"), ("openai", "OpenAI")):
             pick = ModelPicker(provider, title)
-            pick.setMaximumWidth(205)
+            pick.setMaximumWidth(260)
             pick.changed.connect(self.choose_model)
             pick.refresh_requested.connect(self.refresh_catalog)
             pick.usage_requested.connect(self.show_usage)
             self.pickers[provider] = pick
-            tools.addWidget(pick, 1)
+            tools.addWidget(pick)
         tools.addStretch()
         self.speed_box = QComboBox()
         self.speed_box.setAccessibleName("Codex 速度")
@@ -259,12 +261,16 @@ class Window(QMainWindow):
         col.addStretch(1)
         shell.addWidget(view)
         body.addLayout(shell, 1)
-        self.layout_row.addWidget(main, 1)
+        self.content = main
+        self.message_nav = MessageNav(self.timeline, main)
+        main.installEventFilter(self)
+        self.splitter.addWidget(main)
 
     def make_inspector(self):
         self.inspector = QFrame()
         self.inspector.setObjectName("inspector")
-        self.inspector.setFixedWidth(260)
+        self.inspector.setMinimumWidth(240)
+        self.inspector.setMaximumWidth(520)
         col = QVBoxLayout(self.inspector)
         col.setContentsMargins(12, 10, 12, 14)
         row = QHBoxLayout()
@@ -286,7 +292,7 @@ class Window(QMainWindow):
         col.addWidget(self.tabs, 1)
         self.detail_button = button("查看详情", self.open_detail)
         col.addWidget(self.detail_button)
-        self.layout_row.addWidget(self.inspector)
+        self.splitter.addWidget(self.inspector)
         self.inspector.hide()
 
     def make_menus(self):
@@ -1149,6 +1155,11 @@ class Window(QMainWindow):
         self.set_theme("dark" if self.theme == "light" else "light")
         self.settings.setValue("theme", self.theme)
 
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, "content", None) and event.type() == QEvent.Type.Resize:
+            self.message_nav.reposition()
+        return super().eventFilter(watched, event)
+
     def composer_focus(self, focused):
         self.composer.setProperty("focused", focused)
         self.composer.style().unpolish(self.composer)
@@ -1159,6 +1170,9 @@ class Window(QMainWindow):
         self.cancel_backend_change()
         self.save_draft()
         self.settings.setValue("geometry", self.saveGeometry())
+        for pane, key in ((self.sidebar, "sidebar_width"), (self.inspector, "inspector_width")):
+            if pane.isVisible():
+                self.settings.setValue(key, pane.width())
         self.settings.sync()
         super().closeEvent(event)
         self.closed.emit()
