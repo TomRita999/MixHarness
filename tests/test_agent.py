@@ -1,0 +1,167 @@
+import asyncio
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import frontmatter
+
+from mixharness.agent_settings import AgentSettings, compact_context, encode_context, shared_input, skill_catalog, tokens
+from mixharness.commands import dispatch
+from mixharness.engine import open_engine
+from mixharness.store import new_id
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class AgentTests(unittest.TestCase):
+    def setUp(self):
+        scratch = ROOT / ".work/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        directory = tempfile.TemporaryDirectory(dir=scratch)
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.home = self.root / ".mixharness"
+
+    def test_terminal_commands_resume_fork_and_persistence(self):
+        content = "请检查项目的构建命令。"
+        lines = ["/", "/new", "/permissions auto", "/effort openai high", "/context 8192", content,
+                 "/compact", "/context", "/rename 项目检查", "/fork 构建说明", "/exit"]
+        env = dict(os.environ)
+        for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY", "MIXHARNESS_WORKSPACE"):
+            env.pop(name, None)
+        command = [sys.executable, "-m", "mixharness.cli", "--library", str(self.root)]
+        terminal = subprocess.run([*command, "chat", "--backend", "api", "--standalone"], input="\n".join(lines) + "\n",
+                                  cwd=ROOT, env=env, text=True, encoding="utf-8", capture_output=True, check=True, timeout=30)
+        self.assertFalse(terminal.stderr, terminal.stderr)
+        self.assertIn("/review", terminal.stdout)
+        with open_engine(self.root, self.home) as engine:
+            sessions = {s["title"]: engine.store.session(s["id"]) for s in engine.store.sessions()}
+            original, branch = sessions["项目检查"], sessions["构建说明"]
+            self.assertEqual(original["permission"], "auto")
+            self.assertEqual(branch["permission"], "ask")
+            self.assertEqual(original["efforts"], branch["efforts"])
+            self.assertEqual(original["efforts"]["openai"], "high")
+            self.assertEqual(engine.settings.context_window, 8192)
+            self.assertIn(content, original["context_summary"])
+            self.assertEqual(engine.store.snapshot(branch["id"])["events"][0]["body"], content)
+            self.assertFalse(engine.store.snapshot(branch["id"])["tasks"])
+        output = self.root / "导出会话.md"
+        exported = "command", "/export " + str(output), "--session", branch["id"]
+        subprocess.run([*command, *exported], env=env, cwd=ROOT, check=True, capture_output=True)
+        self.assertIn(content, output.read_text(encoding="utf-8"))
+        self.assertNotEqual(subprocess.run([*command, *exported], env=env, cwd=ROOT, capture_output=True).returncode, 0)
+        restored = subprocess.run([*command, "chat", original["id"]], input="/status\n/exit\n", env=env,
+                                  cwd=ROOT, text=True, encoding="utf-8", check=True, capture_output=True)
+        self.assertIn("帮我批准", restored.stdout)
+
+    def test_context_budget_preserves_requirements_and_recent_sources(self):
+        paths = sorted((ROOT / "mixharness").glob("*.py"))
+        history = [{"path": p.name, "text": p.read_text(encoding="utf-8")[:3200]} for p in paths]
+        requirement = "根据当前源码，检查桌面程序启动时的配置读取过程。"
+        context = {"当前需求": requirement, "共享记录": history}
+        limited = compact_context(context, 4096)
+        self.assertLessEqual(tokens(limited), 4096)
+        remaining = json.loads(limited)
+        self.assertEqual(remaining["当前需求"], requirement)
+        self.assertLess(len(remaining["共享记录"]), len(history))
+        self.assertEqual(remaining["共享记录"][-1], history[-1])
+        self.assertEqual(json.loads(compact_context(context, 0)), context)
+
+    def test_project_skill_is_read_from_disk_and_scoped_to_its_folder(self):
+        installed = skill_catalog(AgentSettings(), [])
+        if not installed:
+            self.skipTest("本机未安装可用于测试的真实技能")
+        example = min(installed.values(), key=lambda s: Path(s["path"]).stat().st_size)
+        source = self.root / "source"
+        skill = source / ".agents/skills" / Path(example["path"]).parent.name / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        shutil.copy2(example["path"], skill)
+        with open_engine(self.root, self.home) as engine:
+            pid = engine.store.open_project(source)["id"]
+            session = asyncio.run(dispatch(engine, dict(command="new", backend="api", project_id=pid)))
+            sid = session["id"]
+            saved = asyncio.run(dispatch(engine, dict(command="settings", id=sid, enable_skill=[example["name"]],
+                                                     context_window="64000")))
+            self.assertIn(example["name"], saved["skills"])
+            self.assertNotIn(example["name"], engine.settings_for([self.root]).skills)
+            engine.submit(sid, "检查当前项目的说明文件。", new_id())
+            job = engine.store.one("SELECT j.*,s.backend FROM jobs j JOIN sessions s ON s.id=j.sid WHERE j.sid=?", sid)
+            request, _, payload, _ = engine.turn_input(job, engine.store.session(sid), [])
+            self.assertEqual(request["context_window"], 64000)
+            selected = json.loads(payload)["用户启用的技能"]
+            self.assertEqual(selected[0]["使用说明"], frontmatter.load(str(skill)).content)
+            self.assertEqual(selected[0]["目录"], str(skill.parent))
+        with open_engine(self.root, self.home) as engine:
+            self.assertEqual(engine.settings_for([source]).skills, [example["name"]])
+            with self.assertRaises(ValueError):
+                engine.save_settings({"context_window": 1})
+            self.assertEqual(engine.settings.context_window, 64000)
+
+    def test_tool_result_budget_preserves_the_call_and_actual_file_hash(self):
+        from mixharness.workspace import read_source
+        evidence = read_source(ROOT, {"path": "mixharness/engine.py"})
+        cid = new_id()
+        results, text = shared_input({"共享记录": [], "当前需求": "核对引擎源文件"}, [
+            {"cid": cid, "name": "read_file", "result": evidence}], 4096)
+        self.assertEqual(results[0]["cid"], cid)
+        self.assertEqual(results[0]["result"]["sha256"], evidence["sha256"])
+        self.assertLessEqual(tokens(encode_context(results[0]["result"])) + tokens(text), 4096)
+
+    def test_write_requires_scoped_one_time_approval(self):
+        docs = self.root / "source"
+        docs.mkdir()
+        path = docs / "README.md"
+        shutil.copy2(ROOT / "README.md", path)
+        original = path.read_text(encoding="utf-8")
+        from mixharness.workspace import digest
+        with open_engine(self.root, self.home) as engine:
+            store = engine.store
+            pid = store.open_project(docs)["id"]
+            session = asyncio.run(dispatch(engine, dict(command="new", backend="api", project_id=pid)))
+            other = asyncio.run(dispatch(engine, dict(command="new", backend="api", project_id=pid)))
+            sid = session["id"]
+            sources = engine.sources(session)
+            with store.db:
+                jid = store.enqueue(session, "engineering", {"task": "更新本地项目的说明标题"})
+            job = store.job(jid)
+            engine.set_status(job, "running")
+            replacement = original.replace("# MixHarness", "# MixHarness CLI", 1)
+            args = {"path": "README.md", "expected_sha256": digest(path.read_bytes()), "content": replacement}
+
+            async def exercise(allow):
+                with store.db:
+                    store.save_turn(job, new_id(), 0, "", [{"cid": new_id(), "name": "edit_file", "args": args}], backend="api")
+                current = store.job(jid)
+                call = store.calls(current)[0]
+                operation = asyncio.create_task(engine.tool(current, call, sources))
+                try:
+                    async with asyncio.timeout(4):
+                        while not store.approvals(sid):
+                            await asyncio.sleep(0.01)
+                    request = store.approvals(sid)[0]
+                    self.assertEqual(path.read_text(encoding="utf-8"), original)
+                    self.assertIn(str(path), request["detail"])
+                    with self.assertRaises(ValueError):
+                        engine.decide(other["id"], request["id"], True)
+                    directive = "/approve " if allow else "/deny "
+                    await dispatch(engine, dict(command="command", id=sid, line=directive + request["id"]))
+                    if allow:
+                        await operation
+                    else:
+                        with self.assertRaises(ValueError):
+                            await operation
+                    with self.assertRaises(ValueError):
+                        engine.decide(sid, request["id"], True)
+                finally:
+                    operation.cancel()
+                    await asyncio.gather(operation, return_exceptions=True)
+            asyncio.run(exercise(False))
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            asyncio.run(exercise(True))
+            self.assertEqual(path.read_text(encoding="utf-8"), replacement)

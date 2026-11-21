@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ffffff">
+  <title>MixHarness</title>
+  <script>
+    document.documentElement.dataset.theme = localStorage.getItem("mixharness-theme") ||
+      (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  </script>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="side" id="sidebar" aria-label="工作区侧栏">
+      <header class="side-head">
+        <div class="brand"><span class="brand-mark" aria-hidden="true"><i class="ic terminal"></i></span>MixHarness</div>
+        <button class="icon-btn" id="hide-side" aria-label="收起侧栏" title="收起侧栏"><i class="ic panel-left"></i></button>
+      </header>
+      <div class="side-actions">
+        <button id="new-session"><i class="ic square-pen"></i>新建会话<kbd id="new-shortcut"></kbd></button>
+        <button id="open-project"><i class="ic folder"></i>打开项目…</button>
+        <button id="search-toggle" aria-expanded="false" aria-controls="search"><i class="ic search"></i>搜索会话</button>
+        <input type="search" id="search" placeholder="搜索项目或会话" aria-label="搜索项目或会话" hidden>
+      </div>
+      <div class="side-label">项目</div>
+      <nav id="history" aria-label="会话记录"></nav>
+      <div class="side-bottom">
+        <button id="key-state" class="key-state"><i class="ic key"></i><b>API 连接</b></button>
+        <div class="side-foot-row">
+          <button id="settings"><i class="ic settings"></i>连接设置</button>
+          <button class="icon-btn" id="theme" aria-label="切换主题" title="切换主题"><i class="ic moon"></i></button>
+        </div>
+      </div>
+    </aside>
+    <button class="scrim" id="scrim" aria-label="关闭侧栏" hidden></button>
+    <main>
+      <header class="topbar">
+        <div class="crumb">
+          <button id="menu" class="icon-btn" aria-label="会话侧栏" title="展开会话侧栏"><i class="ic panel-left"></i></button>
+          <i class="ic folder head-folder"></i><span id="header-project"></span><b>/</b><h1 id="session-title">新会话</h1>
+        </div>
+        <div class="top-actions">
+          <button id="brief" class="icon-btn" title="当前需求" aria-label="当前需求"><i class="ic list-checks"></i></button>
+          <button id="open-inspector" class="icon-btn" aria-expanded="false" aria-controls="inspector" title="任务与成果" aria-label="任务与成果"><i class="ic panel-right"></i></button>
+        </div>
+      </header>
+      <div class="desk">
+        <section class="conversation" id="conversation" aria-label="共享会话">
+          <div class="scroll" id="content" role="region" aria-label="对话记录" tabindex="0"></div>
+          <div class="compose-wrap">
+            <div class="welcome" id="welcome">
+              <div class="hero-mark" aria-hidden="true"><i class="ic terminal"></i></div>
+              <h2>想在这个项目里做什么？</h2>
+            </div>
+            <form id="composer">
+              <textarea id="prompt" rows="2" aria-label="输入需求" placeholder="描述任务，或提出问题…" spellcheck="false"></textarea>
+              <div class="compose-tools">
+                <div class="model-grid" aria-label="协作模型">
+                  <div class="model-cell" title="Gemini 负责报告与写作">
+                    <span class="provider"><i class="ic sparkle"></i>Gemini <select id="gemini-effort" aria-label="Gemini 思考强度"></select></span>
+                    <div class="select-wrap"><select id="gemini" aria-label="Gemini 模型"></select><i class="ic chevron-down"></i></div>
+                  </div>
+                  <div class="model-cell" title="OpenAI 负责开发与验证">
+                    <span class="provider"><i class="ic aperture"></i>OpenAI <select id="openai-effort" aria-label="OpenAI 思考强度"></select></span>
+                    <div class="select-wrap"><select id="openai" aria-label="OpenAI 模型"></select><i class="ic chevron-down"></i></div>
+                  </div>
+                </div>
+                <button class="send-circle" id="send" type="submit" title="发送" aria-label="发送" disabled><i class="ic arrow-up"></i></button>
+              </div>
+            </form>
+            <div class="composer-meta"><span class="connection" id="connection"><i class="ic terminal"></i><span>正在连接本地服务</span></span><span class="keyboard-hint">Shift + Enter 换行</span></div>
+            <div class="suggestions" id="suggestions" aria-label="开始任务"></div>
+          </div>
+        </section>
+        <section id="inspector" class="inspector" aria-label="任务与成果" hidden>
+          <header class="inspector-head">
+            <div class="tabs" role="tablist" aria-label="任务与成果">
+              <button id="tab-tasks" role="tab" aria-selected="true" aria-controls="panel-content" data-tab="tasks">任务<span id="task-count" class="count">0</span></button>
+              <button id="tab-files" role="tab" aria-selected="false" aria-controls="panel-content" data-tab="files">成果<span id="file-count" class="count">0</span></button>
+            </div>
+            <button class="icon-btn" id="close-inspector" aria-label="关闭任务与成果" title="关闭面板"><i class="ic x"></i></button>
+          </header>
+          <div id="panel-content" role="tabpanel" aria-labelledby="tab-tasks" tabindex="0"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <dialog id="dialog"><header class="dialog-head"><h2 id="dialog-title"></h2><button id="close-dialog" class="icon-btn" aria-label="关闭"><i class="ic x"></i></button></header><div id="dialog-body"></div></dialog>
+  <div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

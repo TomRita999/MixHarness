@@ -1,0 +1,30 @@
+name: MixHarness
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxkbcommon-x11-0 xauth xvfb
+      - run: python -m pip install -e ".[build]"
+      - run: python -m unittest discover -s tests -v
+      - run: python packaging/build_desktop.py
+      - if: runner.os == 'Linux'
+        run: xvfb-run -a python packaging/check_desktop.py
+      - if: runner.os != 'Linux'
+        run: python packaging/check_desktop.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MixHarness-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            dist/MixHarness-*.zip
+            dist/MixHarness-*.tar.gz
+          if-no-files-found: error
