@@ -161,6 +161,33 @@ class WorkflowTests(unittest.TestCase):
         s = self.store.session(self.sid)
         self.assertEqual((s["gemini"], s["openai"]), (MODELS["gemini"][1], MODELS["openai"][1]))
 
+    def test_source_research_waits_and_retains_its_evidence(self):
+        store, sid = self.store, self.sid
+        request = "查阅 pyproject.toml 后说明项目的 CLI 入口。"
+        seq = store.message(sid, request, new_id())
+        self.requirements(engineering="只读核对 CLI 入口。", engineering_mode="inspect",
+                          report="根据 GPT 查到的入口写说明。", report_after_gpt=True)
+        research = self.start_job("engineering")
+        report = store.one("SELECT * FROM jobs WHERE sid=? AND kind='report'", sid)
+        trace = next(e for e in store.snapshot(sid)["events"] if e["kind"] == "requirements")
+        self.assertEqual(trace["meta"]["source_messages"], [seq])
+        self.assertEqual([item["job"] for item in trace["meta"]["assigned"]], [research["id"], report["id"]])
+        self.assertEqual(report["status"], "waiting")
+        self.assertTrue(research["payload"]["read_only"])
+        engine = Engine(store, self.base, self.project)
+        with self.assertRaisesRegex(ValueError, "无法使用工具"):
+            asyncio.run(engine.tool(research, {"name": "edit_file"}, self.project))
+        self.assertNotIn("edit_file", [d["name"] for d in declarations("engineering", research["payload"])])
+        with store.db:
+            value = workspace.read_source(self.project, {"path": "pyproject.toml"})
+            engine.record_reads(research, "MixHarness", ["pyproject.toml"])
+            store.finish(research, value["text"], {"sha256": value["sha256"]})
+        self.assertEqual(store.job(report["id"])["status"], "ready")
+        self.assertEqual(store.report_wait_status(sid, trace["seq"]), "ready")
+        events = store.snapshot(sid)["events"]
+        self.assertIsNone(store.report_wait_status(sid, events[-1]["seq"]))
+        self.assertIn(("本次任务实际读取", "pyproject.toml"), events[-1]["trace"])
+
     def test_snapshot_runs_an_actual_process(self):
         shutil.copytree(ROOT / "mixharness", self.project / "mixharness",
                         ignore=shutil.ignore_patterns("__pycache__"))

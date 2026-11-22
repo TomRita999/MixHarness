@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .attachments import InputLibrary
+from .conversation_trace import describe_events
 from .reasoning import LEVELS
 
 
@@ -630,11 +631,34 @@ class Store:
                     self.db.execute("UPDATE jobs SET status='obsolete' WHERE id=?", (old["id"],))
                 elif old["kind"] == "verification" and "question" in old["payload"] and "report" in changed and not s["brief"]["report"]:
                     self.db.execute("UPDATE jobs SET status='obsolete' WHERE id=?", (old["id"],))
-            for kind in ("engineering", "verification", "report"):
+            assigned = []
+            for kind in SCOPES:
                 if s["brief"][kind] and changed.intersection(DEPENDS[kind]):
-                    self.enqueue(s, kind)
-            if changed:
-                self.event(s["id"], "requirements", "system", "需求已更新", {"brief": s["brief"], "versions": s["versions"]})
+                    payload = {}
+                    if kind in ("engineering", "verification"):
+                        mode = changes.get(kind + "_mode")
+                        if mode == "inspect":
+                            payload["read_only"] = True
+                        elif mode is None and changes.get(kind) is None:
+                            previous = self.rows("SELECT payload FROM jobs WHERE sid=? AND kind=? "
+                                                 "AND json_extract(payload,'$.question') IS NULL ORDER BY rowid DESC LIMIT 1",
+                                                 s["id"], kind)
+                            if previous and previous[0]["payload"].get("read_only"):
+                                payload["read_only"] = True
+                    jid = self.enqueue(s, kind, payload)
+                    if kind == "report" and changes.get("report_after_gpt") and self.pending_work(s["id"]):
+                        self.db.execute("UPDATE jobs SET status='waiting' WHERE id=?", (jid,))
+                        payload["after_gpt"] = True
+                    assigned.append({"job": jid, "kind": kind, "model": s[PROVIDERS[kind]], **payload})
+            messages = self.rows("SELECT seq FROM events WHERE sid=? AND actor='user' "
+                                 "AND json_extract(meta,'$.revision')>? AND json_extract(meta,'$.revision')<=? "
+                                 "AND NOT COALESCE(json_extract(meta,'$.direct'),0) ORDER BY seq",
+                                 s["id"], s["planned"], s["revision"])
+            self.event(s["id"], "requirements", "gemini", "需求已更新" if changed else "已核对当前需求",
+                       {"job": job["id"], "model": job["model"], "revision": s["revision"],
+                        "source_messages": [m["seq"] for m in messages], "followup": job["payload"].get("followup"),
+                        "interpretation": changes.get("interpretation", ""), "assigned": assigned,
+                        "changed": [k for k in SCOPES if k in changed], "brief": s["brief"], "versions": s["versions"]})
             if answer:
                 self.event(s["id"], "message", "gemini", answer)
             self.db.execute("UPDATE jobs SET status='done',model=?,effort=? WHERE id=?", (job["model"], job["effort"], job["id"]))
@@ -667,11 +691,13 @@ class Store:
         for check in self.rows("SELECT * FROM jobs WHERE sid=? AND kind='verification' AND status IN ('ready','running','needs_key')", job["sid"]):
             if (check["payload"].get("question") == args["question"] and
                     check["payload"].get("evidence_needed") == args["evidence_needed"] and
+                    bool(check["payload"].get("read_only")) == (args.get("method") == "inspect") and
                     all(session["versions"][key] == version for key, version in check["basis"].items())):
                 child = check["id"]
                 break
         if child is None:
-            child = self.enqueue(session, "verification", args, args["question"][:90])
+            payload = dict(args, read_only=True) if args.get("method") == "inspect" else args
+            child = self.enqueue(session, "verification", payload, args["question"][:90])
         self.db.execute("UPDATE calls SET child=? WHERE job=? AND cursor=? AND cid=?",
                         (child, job["id"], call["cursor"], call["cid"]))
         self.event(job["sid"], "verification", "gemini", args["question"], {"job": child, "parent": job["id"]})
@@ -684,7 +710,8 @@ class Store:
             self.tool_result(call, result)
         kind = "artifact" if job["kind"] == "section" else "message"
         self.event(job["sid"], kind if success else "failure", PROVIDERS[job["kind"]], text,
-                   {"job": job["id"], "kind": job["kind"], "basis": job["basis"], **result})
+                   {"job": job["id"], "model": job["model"], "effort": job["effort"],
+                    "backend": job.get("backend"), "kind": job["kind"], "basis": job["basis"], **result})
         if not success and job["kind"] in ("plan", "goal_check"):
             blocked = self.db.execute("UPDATE sessions SET goal_status='blocked',goal_note=?,goal_next='' "
                                       "WHERE id=? AND mode='goal' AND goal_status='active'", (text, job["sid"]))
@@ -697,6 +724,16 @@ class Store:
             "SELECT 1 FROM jobs WHERE sid=? AND kind IN ('engineering','verification','section') "
             "AND status IN ('ready','running','needs_key','waiting') LIMIT 1", (sid,),
         ).fetchone() is not None
+
+    def report_wait_status(self, sid, seen):
+        if self.pending_work(sid):
+            return "waiting"
+        # GPT 可能在 Gemini 写作期间结束。这份草稿需要再读一次实际返回的正文或错误。
+        if self.db.execute("SELECT 1 FROM events WHERE sid=? AND seq>? AND actor='openai' "
+                           "AND kind IN ('message','failure') AND json_extract(meta,'$.kind') "
+                           "IN ('engineering','verification') LIMIT 1", (sid, seen)).fetchone():
+            return "ready"
+        return None
 
     def wake(self, sid):
         for job in self.rows("SELECT * FROM jobs WHERE sid=? AND status='waiting'", sid):
@@ -716,10 +753,13 @@ class Store:
         for event in events:
             if event["seq"] in inputs:
                 event["attachments"] = inputs[event["seq"]]
+        approvals = self.rows("SELECT id,source,title,decision FROM approvals WHERE sid=?", sid)
+        tasks = self.rows("SELECT id,kind,status,title,model,effort,draft,error,basis,at FROM jobs WHERE sid=? ORDER BY rowid", sid)
+        describe_events(events, tasks, approvals)
         return {
             "session": self.session(sid),
             "approvals": self.approvals(sid),
             "events": events,
-            "tasks": self.rows("SELECT id,kind,status,title,model,effort,draft,error,basis,at FROM jobs WHERE sid=? ORDER BY rowid", sid),
+            "tasks": tasks,
             "artifacts": self.rows("SELECT id,job,name,digest,meta,at FROM artifacts WHERE sid=? ORDER BY rowid", sid),
         }

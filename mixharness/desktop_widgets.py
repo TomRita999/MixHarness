@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dotenv import set_key
 from PySide6.QtCore import QBuffer, QEasingCurve, QIODevice, QPoint, QPointF, QPropertyAnimation, QSaveFile, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QImage, QPainter, QPixmap, QTextDocument
+from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QToolButton, QToolTip,
@@ -16,12 +16,12 @@ from PySide6.QtWidgets import (
 )
 
 from .desktop_style import Glyph
+from .desktop_markdown import render_markdown
 from .attachments import TYPES
 from .reasoning import LEVEL_NAMES, api_group, group_for
 
 
 ALIGN = Qt.AlignmentFlag
-MARKDOWN = QTextDocument.MarkdownFeature.MarkdownDialectGitHub | QTextDocument.MarkdownFeature.MarkdownNoHTML
 ACTORS = {"user": "你", "gemini": "Gemini", "openai": "GPT", "system": "过程"}
 
 
@@ -370,13 +370,16 @@ class Document(QTextBrowser):
     def loadResource(self, kind, url):
         return None
 
+    def show_markdown(self, text):
+        render_markdown(self.document(), text, self.font(), self.palette())
+
     def follow_link(self, url):
         if url.scheme() in ("https", "http"):
             QDesktopServices.openUrl(url)
 
 
 class MessageRow(QWidget):
-    def __init__(self, event, input_library=None):
+    def __init__(self, event, input_library=None, retry=None):
         super().__init__()
         self.user = event["actor"] == "user"
         self.text = event["body"]
@@ -393,15 +396,39 @@ class MessageRow(QWidget):
         if self.user:
             row.addStretch()
         else:
-            title = {"verification": "Gemini 请求 GPT 验证", "failure": author + " · 失败"}.get(event["kind"], author)
+            title = {"requirements": "Gemini · 需求整理", "verification": "Gemini 请求 GPT 验证",
+                     "failure": author + " · 失败"}.get(event["kind"], author)
+            model = event.get("meta", {}).get("model")
+            if model:
+                title += " · " + model
             box.addWidget(label(title, "messageAuthor"))
+        if event.get("notice"):
+            notice = label(event["notice"])
+            notice.setWordWrap(True)
+            box.addWidget(notice)
+        if event.get("trace"):
+            trace = QFrame()
+            trace.setObjectName("trace")
+            details = QVBoxLayout(trace)
+            details.setSpacing(3)
+            details.setContentsMargins(12, 8, 12, 9)
+            for i, (title, value) in enumerate(event["trace"]):
+                if i:
+                    details.addSpacing(5)
+                details.addWidget(label(title, "messageAuthor"))
+                line = label(value)
+                line.setWordWrap(True)
+                line.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+                line.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                details.addWidget(line)
+            box.addWidget(trace)
         self.body = Document()
         self.body.setObjectName("messageText")
         self.body.setReadOnly(True)
         self.body.setFrameShape(QFrame.Shape.NoFrame)
         self.body.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.body.document().setDocumentMargin(0)
         self.body.document().setIndentWidth(18)
@@ -411,13 +438,38 @@ class MessageRow(QWidget):
         if self.user or event["kind"] != "message":
             self.body.setPlainText(self.text)
         else:
-            self.body.document().setMarkdown(self.text, MARKDOWN)
+            self.body.show_markdown(self.text)
         self.body.setAccessibleName(author + "的消息")
         self.body.setAccessibleDescription(self.body.toPlainText())
         if event.get("at"):
             stamp = datetime.fromisoformat(event["at"]).astimezone().strftime("%Y-%m-%d %H:%M")
             self.block.setToolTip(author + " · " + stamp)
+        if event.get("notice"):
+            control = QToolButton()
+            control.setObjectName("activity")
+            control.setText("原始错误")
+            control.setCheckable(True)
+            control.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            control.setArrowType(Qt.ArrowType.RightArrow)
+            control.toggled.connect(self.body.setVisible)
+            control.toggled.connect(lambda opened: control.setArrowType(Qt.ArrowType.DownArrow if opened else Qt.ArrowType.RightArrow))
+            box.addWidget(control, 0, ALIGN.AlignLeft)
+            self.body.hide()
+        elif event["kind"] == "requirements" and event.get("trace"):
+            self.body.hide()
         box.addWidget(self.body)
+        self.retry_actions = None
+        jid = event.get("meta", {}).get("job")
+        if retry and jid and event["kind"] == "failure":
+            self.retry_actions = QWidget()
+            actions = QHBoxLayout(self.retry_actions)
+            actions.setContentsMargins(0, 0, 0, 0)
+            if event["meta"].get("kind") in ("engineering", "verification"):
+                actions.addWidget(button("只读重试 GPT", lambda: retry(jid, True), name="quiet"))
+            actions.addWidget(button("重试 " + author, lambda: retry(jid, False), name="quiet"))
+            actions.addStretch()
+            self.retry_actions.setVisible(bool(event.get("retryable")))
+            box.addWidget(self.retry_actions)
         inputs = event.get("attachments", [])
         if inputs and input_library:
             from .desktop_inputs import attachment_button
@@ -442,15 +494,19 @@ class MessageRow(QWidget):
         self.block.setFixedWidth(width)
         self.body.setFixedWidth(width - padding)
         self.body.document().setTextWidth(width - padding)
-        self.body.setFixedHeight(max(self.body.fontMetrics().height(), ceil(self.body.document().size().height())) + 4)
+        size = self.body.document().size()
+        bar = self.body.horizontalScrollBar().sizeHint().height() if size.width() > width - padding else 0
+        self.body.setFixedHeight(max(self.body.fontMetrics().height(), ceil(size.height())) + bar + 4)
 
 
 class Timeline(QScrollArea):
     navigation_changed = Signal()
 
-    def __init__(self, input_library=None):
+    def __init__(self, input_library=None, retry=None):
         super().__init__()
         self.input_library = input_library
+        self.retry = retry
+        self.failure_rows = {}
         self.setAccessibleName("共享会话记录")
         self.setObjectName("timeline")
         self.setWidgetResizable(True)
@@ -480,6 +536,7 @@ class Timeline(QScrollArea):
             item.widget().hide()
             item.widget().deleteLater()
         self.rows.clear()
+        self.failure_rows.clear()
         self.records.clear()
         self.group_button = self.group_body = None
         self.seen = 0
@@ -514,7 +571,7 @@ class Timeline(QScrollArea):
             row.fit(self.viewport().width() - 4)
         self.navigation_changed.emit()
 
-    def progress(self, text):
+    def progress(self, text, title=None):
         if self.group_button is None:
             group = QFrame()
             box = QVBoxLayout(group)
@@ -527,6 +584,7 @@ class Timeline(QScrollArea):
             control.setArrowType(Qt.ArrowType.RightArrow)
             details = label("", "caption")
             details.setWordWrap(True)
+            details.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             details.hide()
             control.toggled.connect(details.setVisible)
@@ -537,7 +595,7 @@ class Timeline(QScrollArea):
             self.column.insertWidget(self.column.count() - 1, group)
         prior = self.group_body.text()
         self.group_body.setText(prior + "\n" + text if prior else text)
-        self.group_button.setText("过程")
+        self.group_button.setText(title or "过程")
 
     def update_events(self, events, colors):
         bar = self.verticalScrollBar()
@@ -545,19 +603,25 @@ class Timeline(QScrollArea):
         changed = False
         for event in events:
             if event["seq"] <= self.seen:
+                actions = self.failure_rows.get(event["seq"])
+                if actions is not None:
+                    actions.setVisible(bool(event.get("retryable")))
                 continue
             self.seen = event["seq"]
             kind = event["kind"]
             if kind not in ("message", "verification", "failure", "progress", "requirements"):
                 continue
             names = [TYPES[i["kind"]] + " · " + i["name"] for i in event.get("attachments", [])]
-            self.records.append("\n".join(s for s in [event["body"], *names] if s))
+            trace = [" · ".join(part) for part in event.get("trace", ())]
+            self.records.append("\n".join(s for s in [event.get("notice"), event["body"], *trace, *names] if s))
             changed = True
-            if kind in ("progress", "requirements"):
-                self.progress(event["body"])
+            if kind == "progress":
+                self.progress(event["body"], event.get("approval_label"))
                 continue
             self.group_button = self.group_body = None
-            row = MessageRow(event, self.input_library)
+            row = MessageRow(event, self.input_library, self.retry)
+            if row.retry_actions is not None:
+                self.failure_rows[event["seq"]] = row.retry_actions
             row.fit(self.viewport().width() - 4)
             self.rows.append(row)
             self.column.insertWidget(self.column.count() - 1, row)
@@ -731,7 +795,7 @@ class ArtifactDialog(QDialog):
         layout = QVBoxLayout(self)
         text = Document()
         if asset["name"].lower().endswith(".md"):
-            text.document().setMarkdown(asset["content"], MARKDOWN)
+            text.show_markdown(asset["content"])
         else:
             text.setPlainText(asset["content"])
         layout.addWidget(text)

@@ -1,21 +1,23 @@
 import asyncio
 import os
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QSettings, Qt
-from PySide6.QtGui import QPalette
+from PySide6.QtGui import QPalette, QTextTable
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox, QPushButton
 from qasync import QEventLoop
 
+from mixharness.chat_snapshot import markdown
 from mixharness.desktop import Window
 from mixharness.desktop_agent import AgentDialog
 from mixharness.desktop_projects import ArchiveDialog, ProjectDialog
 from mixharness.desktop_style import load_icons
 from mixharness.desktop_usage import UsageDialog
-from mixharness.desktop_widgets import SettingsDialog
+from mixharness.desktop_widgets import Document, SettingsDialog
 from mixharness.engine import open_engine
 from mixharness.providers import MODELS
 
@@ -95,6 +97,24 @@ class DesktopTests(unittest.TestCase):
                     window.close()
                     await asyncio.sleep(0)
                 loop.run_until_complete(exercise())
+
+    def test_markdown_table_and_code_examples_keep_their_structure(self):
+        settings = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        table = "| 命令 | 入口 |\n|---|---|\n" + "\n".join(
+            f"| {name} | {target} |" for name, target in settings["project"]["scripts"].items())
+        wrapped = "~~~markdown\n" + table + "\n~~~"
+        view = Document()
+        self.addCleanup(view.close)
+        view.show_markdown(wrapped)
+        frame, = view.document().rootFrame().childFrames()
+        self.assertIsInstance(frame, QTextTable)
+        self.assertEqual(frame.rows(), 1 + len(settings["project"]["scripts"]))
+        self.assertIn("<table>", markdown(wrapped))
+        example = "Markdown 写法\n\n" + wrapped
+        view.show_markdown(example)
+        self.assertFalse(view.document().rootFrame().childFrames())
+        self.assertIn("|---|---|", view.toPlainText())
+        self.assertNotIn("<table>", markdown(example))
 
     def test_conversation_and_model_choices_survive_reopening(self):
         scratch = ROOT / ".work" / "tests"

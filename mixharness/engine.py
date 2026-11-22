@@ -11,8 +11,8 @@ from . import workspace
 from .attachments import MAX_IMAGE_TOTAL, MAX_ITEMS, TYPES, image_parts
 from .agent_settings import AgentSettings, PERMISSIONS, SPEEDS, available_speeds, selected_skills, shared_input, skill_catalog
 from .catalog import ModelCatalog
-from .clients import CLIENTS, ClientCatalog, private_directory, workflow_turn
-from .providers import FUNCTIONS, TOOLS, google_turn, openai_turn
+from .clients import CLIENTS, ClientCatalog, CodexTurnError, private_directory, workflow_turn
+from .providers import FUNCTIONS, tool_names, google_turn, openai_turn
 from .reasoning import api_levels, group_for, resolve_choice
 from .store import PROVIDERS, Store, Superseded, new_id, now, pack
 
@@ -233,14 +233,16 @@ class Engine:
                                             ("allow" if allow else "deny", sid, identifier)).rowcount
             if not changed:
                 raise ValueError("这项审批请求已经结束")
-            self.store.event(sid, "progress", "system", "已批准本次操作" if allow else "已拒绝本次操作", {"approval": identifier})
+            action = self.store.one("SELECT source,title FROM approvals WHERE id=?", identifier)
+            self.store.event(sid, "progress", "system", ("已批准" if allow else "已拒绝") + " · " + action["source"]
+                             + " · " + action["title"], {"approval": identifier, **action})
         future = self.approval_waiters.get(identifier)
         if future and not future.done():
             future.set_result(allow)
         self.notify(sid)
 
     async def native_approval(self, job, source, title, details):
-        if job["kind"] in ("proposal", "goal_check", "side") or job["payload"].get("review"):
+        if job["kind"] in ("proposal", "goal_check", "side") or job["payload"].get("review") or job["payload"].get("read_only"):
             return False
         if self.store.session(job["sid"])["permission"] != job["permission"]:
             return False
@@ -305,12 +307,14 @@ class Engine:
         self.store.switch_backend(sid, backend, models, efforts)
         self.notify(sid)
 
-    def retry(self, sid, jid):
+    def retry(self, sid, jid, *, read_only=False):
         job = self.store.job(jid)
         if job["sid"] != sid:
             raise KeyError("任务不存在")
         if job["status"] not in ("failed", "needs_key"):
             raise ValueError("该任务当前无需重试")
+        if read_only and job["kind"] not in ("engineering", "verification"):
+            raise ValueError("只读重试适用于调研和验证任务")
         s = self.store.session(sid)
         if (s["mode"] == "plan") != (job["kind"] == "proposal"):
             raise ValueError("当前模式无法重试这项任务")
@@ -319,11 +323,15 @@ class Engine:
         if job["kind"] == "goal_check" and (s["mode"] != "goal" or s["goal_status"] != "active"):
             raise ValueError("请先继续目标，再核对进度")
         with self.store.db:
+            if read_only and not job["payload"].get("read_only"):
+                self.store.db.execute("UPDATE jobs SET payload=?,cursor=NULL,seen=0 WHERE id=?",
+                                      (pack(dict(job["payload"], read_only=True)), jid))
             self.store.db.execute("UPDATE jobs SET status='ready',error='' WHERE id=?", (jid,))
             if job["kind"] in ("verification", "engineering") and s["brief"]["report"] and not self.store.rows(
                 "SELECT id FROM jobs WHERE sid=? AND kind='report' AND status IN ('ready','waiting','running','needs_key')", sid
             ):
-                self.store.enqueue(s, "report")
+                report = self.store.enqueue(s, "report")
+                self.store.db.execute("UPDATE jobs SET status='waiting' WHERE id=?", (report,))
             self.store.event(sid, "progress", "system", "重新执行任务", {"job": jid})
         self.notify(sid)
 
@@ -481,6 +489,14 @@ class Engine:
     def set_status(self, job, status):
         with self.store.db:
             self.store.db.execute("UPDATE jobs SET status=? WHERE id=?", (status, job["id"]))
+        self.notify(job["sid"])
+
+    def record_reads(self, job, source, paths):
+        files = list(dict.fromkeys(paths))
+        with self.store.db:
+            self.store.guard(job)
+            self.store.event(job["sid"], "progress", PROVIDERS[job["kind"]], source + " 已读取 " + "、".join(files),
+                             {"job": job["id"], "files_read": files, "source": source})
         self.notify(job["sid"])
 
     async def gate(self, job):
@@ -656,9 +672,10 @@ class Engine:
                 self.store.save_turn(job, reply.cursor, seen, reply.text, reply.calls, backend=job["backend"])
                 if reply.calls:
                     self.store.db.execute("UPDATE jobs SET status='ready' WHERE id=?", (jid,))
-                elif job["kind"] == "report" and self.store.pending_work(sid):
-                    self.store.db.execute("UPDATE jobs SET status='waiting' WHERE id=?", (jid,))
-                    self.store.event(sid, "progress", "gemini", "等待工程或验证结果", {"job": jid})
+                elif job["kind"] == "report" and (status := self.store.report_wait_status(sid, seen)):
+                    self.store.db.execute("UPDATE jobs SET status=? WHERE id=?", (status, jid))
+                    self.store.event(sid, "progress", "gemini", "等待工程或验证结果" if status == "waiting"
+                                     else "已收到 GPT 的任务结果，正在更新报告", {"job": jid})
                 else:
                     meta = {"kind": job["kind"], "basis": job["basis"], "sources": reply.sources}
                     if job["kind"] == "verification":
@@ -687,7 +704,10 @@ class Engine:
                     self.set_status(job, "ready")
                     return
                 with self.store.db:
-                    self.store.finish(job, message[:2200], {"error": message[:2200]}, success=False)
+                    result = {"error": message[:2200]}
+                    if isinstance(exc, CodexTurnError):
+                        result["diagnostic"] = exc.details
+                    self.store.finish(job, message[:2200], result, success=False)
         finally:
             self.deadlines.pop(jid, None)
             self.steering.pop(jid, None)
@@ -696,7 +716,7 @@ class Engine:
 
     async def tool(self, job, call, sources):
         name = call["name"]
-        if name not in TOOLS[job["kind"]]:
+        if name not in tool_names(job["kind"], job["payload"]):
             raise ValueError(f"当前任务无法使用工具 {name}")
         args = FUNCTIONS[name][0].model_validate(call["args"]).model_dump()
         sid, jid = job["sid"], job["id"]
@@ -772,6 +792,9 @@ class Engine:
             result.update(source=version, folder=alias)
         await self.gate(job)
         with st.db:
+            if name == "read_file":
+                st.event(sid, "progress", PROVIDERS[job["kind"]], "已读取 " + args["path"],
+                         {"job": jid, "files_read": [args["path"]], "source": "MixHarness"})
             if name in ("run_check", "save_section", "edit_file") or (name == "read_file" and job["kind"] == "verification"):
                 if name == "save_section":
                     title, content = args["title"] + ".md", args["markdown"]

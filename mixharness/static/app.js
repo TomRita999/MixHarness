@@ -274,6 +274,14 @@ function buildSuggestions() {
 }
 function chat() {
   const transcript = document.createDocumentFragment();
+  function appendTrace(parent, event) {
+    if (!event.trace?.length) return;
+    const details = el("dl", "trace");
+    for (const [label, value] of event.trace) {
+      details.append(el("dt", "", label), el("dd", "", value));
+    }
+    parent.append(details);
+  }
   for (const event of state.events) {
     if (event.kind === "message") {
       const article = el("article", "entry " + event.actor);
@@ -281,10 +289,28 @@ function chat() {
       header.append(el("span", "", roleNames[event.actor]), el("time", "", localTime(event.at)));
       const body = el("div", "body markdown");
       rich(body, event.html, event.body);
-      article.append(header, body); transcript.append(article);
+      article.append(header);
+      appendTrace(article, event);
+      article.append(body); transcript.append(article);
     } else if (["verification", "failure", "progress", "requirements"].includes(event.kind)) {
       const line = el("div", "notice" + (event.kind === "failure" ? " error" : ""));
-      line.textContent = (event.kind === "verification" ? "Gemini 请求 GPT 验证 · " : "") + event.body;
+      if (event.kind === "requirements") {
+        line.append(el("strong", "", "Gemini · 需求整理"));
+      } else if (event.notice) {
+        line.append(el("strong", "", event.notice));
+        const error = el("details");
+        error.append(el("summary", "", "原始错误"), el("p", "", event.body));
+        line.append(error);
+      } else {
+        const owner = event.kind === "failure" ? roleNames[event.actor] + " · 失败 · " : "";
+        line.append(el("span", "", (event.kind === "verification" ? "Gemini 请求 GPT 验证 · " : owner) + event.body));
+      }
+      appendTrace(line, event);
+      if (event.retryable) {
+        const url = sessionPath("/tasks/" + event.meta.job + "/retry");
+        if (["engineering", "verification"].includes(event.meta.kind)) line.append(button("只读重试 GPT", "quiet", () => api(url + "?read_only=true", "POST")));
+        line.append(button("重试", "quiet", () => api(url, "POST")));
+      }
       transcript.append(line);
     }
   }

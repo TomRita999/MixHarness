@@ -14,7 +14,7 @@ from . import antigravity_index
 from .agent_settings import codex_speeds
 from .attachments import Attachment, MAX_REFERENCE, image_parts
 from .client_rpc import ClientError, Rpc, executable
-from .providers import FUNCTIONS, PROMPTS, TOOLS, Plan, Turn, declarations
+from .providers import FUNCTIONS, PROMPTS, Plan, Turn, declarations, instructions, tool_names
 from .reasoning import antigravity_groups, model_group
 from .store import PROVIDERS, new_id, pack
 
@@ -330,12 +330,25 @@ async def client_approval(engine, job, method, params):
     return {"decision": "accept" if allowed else "decline"}
 
 
+def project_reads(engine, job, cwd, paths, client, directory=None):
+    files = []
+    root = Path(cwd).resolve()
+    for path in paths:
+        if not path:
+            continue
+        target = (root / (directory or ".") / path).resolve()
+        if target.is_relative_to(root) and target.is_file():
+            files.append(target.relative_to(root).as_posix())
+    if files:
+        engine.record_reads(job, client, files)
+
+
 async def codex_turn(engine, job, cwd, prompt, schema):
     model, effort = job["model"], job["effort"]
     mode = job["permission"]
     speed = job["speed"]
     proposal = job["kind"] == "proposal"
-    readonly = proposal or job["kind"] in ("goal_check", "side") or job["payload"].get("review")
+    readonly = proposal or job["kind"] in ("goal_check", "side") or job["payload"].get("review") or job["payload"].get("read_only")
     async with connection("codex") as rpc:
         await rpc.initialize("codex", experimental=proposal)
         tier = "default"
@@ -368,6 +381,8 @@ async def codex_turn(engine, job, cwd, prompt, schema):
         tid = started["thread"]["id"]
         if not started["thread"]["ephemeral"]:
             raise ClientError("Codex 未启用临时线程，已取消本次调用")
+        if readonly and started["sandbox"]["type"] != "readOnly":
+            raise ClientError("Codex 未确认只读权限，任务已停止")
         fragments, complete, final, plan_text = [], None, "", ""
         def event(method, params):
             nonlocal complete, final, plan_text
@@ -379,6 +394,11 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                 final = params["item"]["text"]
             elif method == "item/completed" and params["item"]["type"] == "plan":
                 plan_text = params["item"]["text"]
+            elif method == "item/completed" and params["item"]["type"] == "commandExecution":
+                item = params["item"]
+                if item.get("exitCode") == 0:
+                    project_reads(engine, job, cwd, (a["path"] for a in item["commandActions"] if a["type"] == "read"),
+                                  "Codex", item.get("cwd"))
             elif method == "turn/completed":
                 complete = params["turn"]
         params = {"threadId": tid, "model": model, "serviceTier": tier, "outputSchema": schema,
@@ -398,8 +418,18 @@ async def codex_turn(engine, job, cwd, prompt, schema):
         while complete is None:
             await rpc.dispatch(await rpc.read(), event)
         if complete["status"] != "completed":
-            raise ClientError((complete.get("error") or {}).get("message") or "Codex 任务未完成")
+            error = complete.get("error") or {}
+            raise CodexTurnError(error.get("message") or "Codex 任务未完成", started["sandbox"]["type"],
+                                 error.get("codexErrorInfo"), tid, complete["id"])
         return plan_text or final or "".join(fragments)
+
+
+class CodexTurnError(ClientError):
+    def __init__(self, message, sandbox, code, thread_id, turn_id):
+        super().__init__(message)
+        self.details = {"client": "Codex", "stage": "turn/completed", "sandbox": sandbox,
+                        "code": next(iter(code), None) if isinstance(code, dict) else code,
+                        "thread_id": thread_id, "turn_id": turn_id}
 
 
 class PlanQuestion(Exception):
@@ -433,11 +463,23 @@ async def antigravity_turn(engine, job, cwd, prompt):
             raise ClientError("当前 Antigravity 客户端未提供所选模型，请刷新模型目录")
         if available["currentModelId"] != model:
             await rpc.request("session/set_model", {"sessionId": bound, "modelId": model})
-        fragments = []
+        fragments, reading = [], {}
         def event(method, params):
+            if method != "session/update" or params.get("sessionId") != bound:
+                return
             update = params.get("update", {})
-            if method == "session/update" and params.get("sessionId") == bound and update.get("sessionUpdate") == "agent_message_chunk":
+            if update.get("sessionUpdate") == "agent_message_chunk":
                 fragments.append(update["content"].get("text", ""))
+            elif update.get("sessionUpdate") in ("tool_call", "tool_call_update"):
+                key = update["toolCallId"]
+                if update.get("kind") == "read":
+                    reading.setdefault(key, [])
+                if key in reading:
+                    reading[key].extend(loc["path"] for loc in update.get("locations") or () if loc.get("path"))
+                    if update.get("status") == "completed":
+                        project_reads(engine, job, cwd, reading.pop(key), "Antigravity")
+                    elif update.get("status") == "failed":
+                        reading.pop(key)
         parts = [{"type": "text", "text": prompt}, *image_parts(job.get("images", []), "antigravity")]
         result = await rpc.request("session/prompt", {"sessionId": bound, "prompt": parts}, event)
         if result["stopReason"] != "end_turn":
@@ -454,8 +496,8 @@ async def workflow_turn(engine, job, context, cwd):
         except PlanQuestion as question:
             return Turn(new_id(), "", [{"cid": new_id(), "name": "ask_clarification", "args": {"question": str(question)}}])
     schema = (Plan if kind == "plan" else ClientReply).model_json_schema()
-    tools = declarations(kind) if kind != "plan" else []
-    prompt = (PROMPTS[kind] + "\n请严格返回符合下方 JSON Schema 的 JSON 对象。"
+    tools = declarations(kind, job["payload"]) if kind != "plan" else []
+    prompt = (instructions(job) + "\n请严格返回符合下方 JSON Schema 的 JSON 对象。"
               "需要调用 MixHarness 工具时，在 calls 中填写工具名与 JSON 字符串 arguments，结果会在下一轮返回。"
               "\n输出格式\n" + pack(schema) + "\n可用工具\n" + pack(tools) + "\n共享会话\n" + context)
     if PROVIDERS[kind] == "openai":
@@ -472,7 +514,7 @@ async def workflow_turn(engine, job, context, cwd):
     reply = ClientReply.model_validate_json(raw)
     calls = []
     for call in reply.calls:
-        if call.name not in TOOLS[kind]:
+        if call.name not in tool_names(kind, job["payload"]):
             raise ClientError(f"任务无法使用工具 {call.name}")
         args = FUNCTIONS[call.name][0].model_validate(json.loads(call.arguments))
         calls.append({"cid": new_id(), "name": call.name, "args": args.model_dump()})

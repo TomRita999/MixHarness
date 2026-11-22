@@ -10,9 +10,24 @@ ACTORS = {"user": "你", "openai": "GPT", "gemini": "Gemini", "system": "MixHarn
 MARKDOWN = MarkdownIt("commonmark", {"html": False}).enable("table").disable("image")
 
 
+def display_markdown(text):
+    trimmed = text.strip()
+    if not trimmed.startswith(("```", "~~~")):
+        return text
+    outer = MARKDOWN.parse(trimmed)
+    if len(outer) == 1 and outer[0].type == "fence" and outer[0].info.strip().lower() in ("md", "markdown"):
+        fence = outer[0]
+        closing = trimmed.splitlines()[-1].strip()
+        if len(closing) >= len(fence.markup) and not closing.strip(fence.markup[0]):
+            inner = MARKDOWN.parse(fence.content)
+            if inner and inner[0].type == "table_open" and sum(t.level == 0 for t in inner) == 2:
+                return fence.content
+    return text
+
+
 @lru_cache(maxsize=128)
 def markdown(text):
-    return MARKDOWN.render(text)
+    return MARKDOWN.render(display_markdown(text))
 
 
 def transcript(store, sid):

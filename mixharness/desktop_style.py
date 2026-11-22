@@ -110,6 +110,7 @@ def apply_theme(app, name):
         QFrame#headerLine { background: $line; max-height: 1px; border: none; }
         QScrollArea#timeline, QWidget#timelineCanvas, QFrame#reply { background: $canvas; border: none; }
         QFrame#userBubble { background: $bubble; border-radius: 16px; }
+        QFrame#trace { background: $field; border-left: 2px solid $strong; }
         QTextBrowser#messageText { background: transparent; border: none; padding: 0; font-size: 14px; }
         QLabel#messageAuthor { font-size: 12px; color: $muted; font-weight: 600; }
         QToolButton#activity { font-size: 12px; color: $muted; padding: 2px 6px; border-radius: 6px; }

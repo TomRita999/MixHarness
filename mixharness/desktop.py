@@ -29,7 +29,7 @@ from .desktop_widgets import (
 from .providers import MODELS
 from .clients import CLIENTS
 from .reasoning import LEVEL_NAMES, group_for, resolve_choice
-from .store import GOAL_STATES, LABELS, MODES, MODE_TITLES, STATUSES, new_id
+from .store import GOAL_STATES, LABELS, MODES, MODE_TITLES, PROVIDERS, STATUSES, new_id
 
 
 USER_ROLE = Qt.ItemDataRole.UserRole
@@ -204,7 +204,7 @@ class Window(QMainWindow):
         self.heading.setAlignment(ALIGN.AlignCenter)
         col.addWidget(self.heading)
         col.addSpacing(12)
-        self.timeline = Timeline(self.engine.store.inputs)
+        self.timeline = Timeline(self.engine.store.inputs, self.retry_from_timeline)
         col.addWidget(self.timeline, 1)
         self.preview = Document()
         self.preview.setAccessibleName("正在生成的内容")
@@ -968,11 +968,12 @@ class Window(QMainWindow):
             stream = self.engine.previews.get(task["id"])
             saved = task["draft"] if task["status"] in ("waiting", "running", "ready") else ""
             if stream or saved:
-                drafts.append(task["title"] + "\n" + (stream or saved))
+                author = "GPT" if PROVIDERS[task["kind"]] == "openai" else "Gemini"
+                drafts.append(f"**{author} · {LABELS[task['kind']]}草稿**\n\n" + (stream or saved))
         text = "\n\n".join(drafts)
         if text != self.preview_text:
             self.preview_text = text
-            self.preview.setPlainText(text)
+            self.preview.show_markdown(text)
             self.preview.verticalScrollBar().setValue(self.preview.verticalScrollBar().maximum())
             self.preview.setVisible(bool(text))
 
@@ -1070,6 +1071,13 @@ class Window(QMainWindow):
             self.task_detail(self.tasks.currentItem())
         else:
             self.artifact_detail(self.assets.currentItem())
+
+    def retry_from_timeline(self, jid, read_only):
+        try:
+            self.engine.retry(self.sid, jid, read_only=read_only)
+        except (KeyError, ValueError) as exc:
+            QMessageBox.information(self, "任务状态", str(exc))
+        self.refresh(force=True)
 
     def task_detail(self, item):
         jid = item.data(USER_ROLE)
@@ -1415,6 +1423,7 @@ class Window(QMainWindow):
         self.theme_button.setToolTip("切换为浅色主题" if self.theme == "dark" else "切换为深色主题")
         if hasattr(self, "state"):
             self.timeline.reset()
+            self.preview_text = None
             self.refresh(force=True)
 
     def toggle_theme(self):

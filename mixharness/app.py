@@ -287,9 +287,9 @@ def create_app(project=None, home=None):
         return {"seq": seq}
 
     @app.post("/api/sessions/{sid}/tasks/{jid}/retry")
-    async def retry(sid: str, jid: str):
+    async def retry(sid: str, jid: str, read_only: bool = False):
         try:
-            app.state.engine.retry(sid, jid)
+            app.state.engine.retry(sid, jid, read_only=read_only)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"status": "ready"}
