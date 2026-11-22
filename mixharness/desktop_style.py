@@ -54,10 +54,10 @@ class Glyph(QIconEngine):
 THEMES = {
     "light": dict(canvas="#ffffff", side="#f8f8f7", hover="#efefed", selected="#e7e7e4", field="#ffffff",
                   line="#e6e6e3", strong="#cfcfcb", ink="#1b1b1b", secondary="#555553", muted="#8b8b88",
-                  inverse="#ffffff", bubble="#f2f2f0", shadow="#14000000"),
+                  inverse="#ffffff", bubble="#f2f2f0", link="#0969da", shadow="#14000000"),
     "dark": dict(canvas="#161616", side="#0f0f0f", hover="#222222", selected="#2b2b2b", field="#1d1d1d",
                  line="#2a2a2a", strong="#3d3d3d", ink="#ededed", secondary="#b8b8b8", muted="#7f7f7f",
-                 inverse="#161616", bubble="#262626", shadow="#66000000"),
+                 inverse="#161616", bubble="#262626", link="#58a6ff", shadow="#66000000"),
 }
 
 
@@ -92,7 +92,7 @@ def apply_theme(app, name):
     roles = {
         "Window": "canvas", "Base": "canvas", "WindowText": "ink", "Text": "ink", "ButtonText": "ink",
         "Button": "side", "AlternateBase": "side", "Highlight": "selected", "HighlightedText": "ink",
-        "Link": "ink", "LinkVisited": "secondary", "PlaceholderText": "muted", "ToolTipBase": "ink",
+        "Link": "link", "LinkVisited": "link", "PlaceholderText": "muted", "ToolTipBase": "ink",
         "ToolTipText": "inverse", "BrightText": "inverse", "Light": "side", "Midlight": "hover",
         "Mid": "line", "Dark": "muted", "Shadow": "line", "Accent": "ink",
     }

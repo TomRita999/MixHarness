@@ -48,8 +48,10 @@ def read_window(work, library):
         window.refresh(force=True)
         read("第一条消息的正文。")
         window.activateWindow()
+        # 从后台启动测试时也要让 Qt 把键盘事件交给当前窗口。
+        app.setActiveWindow(window)
         window.editor.setFocus()
-        QTest.qWait(80)
+        assert window.editor.hasFocus()
         QTest.keyClicks(window.editor, "/")
         assert window.slash_menu.isVisible(), (window.editor.toPlainText(), window.editor.hasFocus())
         read("快捷指令")

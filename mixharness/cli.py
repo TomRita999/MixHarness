@@ -25,6 +25,7 @@ def parser():
     cmd.add_argument("--session", dest="id", help="会话编号")
     cmd.add_argument("--json", action="store_true", help="以 JSON 输出结构化结果")
     for entry in (chat, cmd):
+        entry.add_argument("--daybreak", action="store_true", help="以 Codex Daybreak Blue 创建会话")
         entry.add_argument("--backend", choices=("clients", "api"), default="clients")
         entry.add_argument("--project-id", help="项目编号")
         entry.add_argument("--permission", choices=("ask", "auto", "full"), default="ask")
@@ -66,6 +67,7 @@ def parser():
             cmd.add_argument("--openai", help="OpenAI / Codex 模型 ID")
             cmd.add_argument("--permission", choices=("ask", "auto", "full"), default="ask")
             cmd.add_argument("--speed", default="standard", help="Codex 速度")
+            cmd.add_argument("--daybreak", action="store_true", help="使用当前 Codex 账户支持的 Daybreak Blue 模型")
         else:
             cmd.add_argument("id")
         if name in ("new", "run", "send"):
@@ -171,7 +173,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         return 130
     if options["command"] == "command" and not options["json"]:
-        print(result["text"])
+        from .terminal import display_command
+        display_command(result)
     elif result is not None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     if isinstance(result, dict) and options["command"] in ("wait", "send", "run"):

@@ -28,7 +28,7 @@ from .desktop_widgets import (
 )
 from .providers import MODELS
 from .clients import CLIENTS
-from .reasoning import LEVEL_NAMES, group_for, resolve_choice
+from .reasoning import LEVEL_NAMES, group_for, model_available, resolve_choice, select_daybreak_model
 from .store import GOAL_STATES, LABELS, MODES, MODE_TITLES, PROVIDERS, STATUSES, new_id
 
 
@@ -47,6 +47,7 @@ class Window(QMainWindow):
         self.backend_task = None
         self.backend_error = ""
         self.draft_permission, self.draft_speed = "ask", "standard"
+        self.draft_daybreak = False
         self.steering = set()
         self.versions = {}
         self.preview_text = ""
@@ -274,6 +275,9 @@ class Window(QMainWindow):
             self.permission_box.addItem(title, mode)
         self.permission_box.currentIndexChanged.connect(self.change_permission)
         foot.addWidget(self.permission_box)
+        self.daybreak_button = button("Daybreak", self.change_daybreak, name="quiet")
+        self.daybreak_button.setCheckable(True)
+        foot.addWidget(self.daybreak_button)
         self.connection_state = button("", self.connections, name="quiet")
         foot.addWidget(self.connection_state)
         foot.addStretch()
@@ -489,7 +493,11 @@ class Window(QMainWindow):
         for provider in self.pickers:
             pref = self.settings.value(self.model_key(provider, backend), "")
             if backend == "clients":
-                available = self.engine.client_catalogs[provider].view()["models"]
+                catalog = self.engine.client_catalogs[provider].view()
+                available = catalog["models"]
+                if provider == "openai":
+                    enabled = session.get("daybreak", self.draft_daybreak) if session.get("backend", backend) == backend else False
+                    available = [g["id"] for g in catalog["groups"] if model_available(g, enabled)]
                 options = (remembered.get(provider), pref, session.get(provider))
                 models[provider] = next((m for m in options if m in available), next(iter(available), ""))
             else:
@@ -523,6 +531,7 @@ class Window(QMainWindow):
         backend = self.backend_box.currentData()
         if not self.sid:
             self.draft_speed = "standard"
+            self.draft_daybreak = False
             self.settings.setValue("backend", backend)
             self.refresh(force=True)
             self.refresh_catalogs()
@@ -778,6 +787,7 @@ class Window(QMainWindow):
             self.save_draft()
         self.pid, self.sid = pid, sid
         self.draft_permission, self.draft_speed = "ask", "standard"
+        self.draft_daybreak = False
         self.draft_mode = self.settings.value("mode/" + self.draft_key(), "default")
         self.settings.setValue("project", pid or "")
         self.settings.setValue("session", sid or "")
@@ -804,6 +814,8 @@ class Window(QMainWindow):
             return
         catalog = self.catalogs()[provider]
         if self.backend_box.currentData() == "clients" and value not in catalog.view()["models"]:
+            return
+        if provider == "openai" and not self.pickers[provider].accepts(group_for(catalog.view()["groups"], value)):
             return
         value, effort = self.engine.model_choice(self.backend_box.currentData(), provider, value, effort)
         key = self.model_key(provider)
@@ -846,9 +858,12 @@ class Window(QMainWindow):
                 picker.loading = False
                 data = catalog.view()
                 model = picker.model
-                if not self.sid and data["source"] == "client" and model not in data["models"]:
+                if not self.sid and data["source"] == "client" and (
+                    model not in data["models"] or not picker.accepts(group_for(data["groups"], model))
+                ):
                     preferred = self.settings.value(self.model_key(provider), "")
-                    model = preferred if preferred in data["models"] else next(iter(data["models"]), "")
+                    choices = [m for m in data["models"] if picker.accepts(group_for(data["groups"], m))]
+                    model = preferred if preferred in choices else next(iter(choices), "")
                     if model:
                         self.settings.setValue(self.model_key(provider), model)
                 effort = (self.engine.store.session(self.sid)["efforts"].get(provider, "") if self.sid
@@ -862,8 +877,7 @@ class Window(QMainWindow):
         self.catalog_tasks[provider] = task
 
     def editor_changed(self):
-        ready = self.backend_box.currentData() != "clients" or all(
-            p.model in p.catalog.get("models", []) for p in self.pickers.values())
+        ready = self.models_ready()
         text = self.editor.toPlainText().strip()
         has_input = bool(text) or bool(self.inputs.items) and not self.needs_goal_text()
         self.send_button.setEnabled(has_input and (ready or (text.startswith(("/", "／")) and not self.inputs.items))
@@ -875,6 +889,11 @@ class Window(QMainWindow):
             return session["mode"] == "goal" and not session["objective"]
         return self.draft_mode == "goal"
 
+    def models_ready(self):
+        return self.backend_box.currentData() != "clients" or all(
+            p.model in p.catalog.get("models", []) and p.accepts(group_for(p.catalog["groups"], p.model))
+            for p in self.pickers.values())
+
     def send(self):
         text = self.editor.toPlainText().strip()
         if self.backend_task or not text and (not self.inputs.items or self.needs_goal_text()):
@@ -882,8 +901,7 @@ class Window(QMainWindow):
         if text.startswith(("/", "／")) and not self.inputs.items:
             self.send_command("/" + text[1:])
             return
-        if self.backend_box.currentData() == "clients" and any(
-                p.model not in p.catalog.get("models", []) for p in self.pickers.values()):
+        if not self.models_ready():
             return
         if len(text) > 120000:
             QMessageBox.information(self, "消息过长", "单条消息上限为 120,000 字符。")
@@ -894,6 +912,7 @@ class Window(QMainWindow):
             sid = self.engine.create_session(*models, project_id=self.pid, standalone=self.pid is None,
                                              backend=self.backend_box.currentData(),
                                              permission=self.draft_permission, speed=self.draft_speed, mode=self.draft_mode,
+                                             daybreak=self.draft_daybreak,
                                              efforts={p: picker.effort for p, picker in self.pickers.items()})["id"]
         seq, changed = self.engine.submit(sid, text, new_id(), draft=self.draft_key())
         if changed and self.engine.steering:
@@ -954,6 +973,7 @@ class Window(QMainWindow):
             self.timeline.setVisible(not empty)
             self.chat_layout.setStretch(0, int(empty))
             self.chat_layout.setStretch(self.chat_layout.count() - 1, int(empty))
+            self.timeline.workspace = self.preview.workspace = session.get("workspace")
             self.timeline.update_events(self.state["events"], THEMES[self.theme])
             self.fill_inspector()
             self.refresh_access()
@@ -1110,7 +1130,7 @@ class Window(QMainWindow):
 
     def artifact_detail(self, item):
         asset = self.engine.store.one("SELECT * FROM artifacts WHERE id=? AND sid=?", item.data(USER_ROLE), self.sid)
-        dialog = ArtifactDialog(self, asset)
+        dialog = ArtifactDialog(self, asset, self.state["session"]["workspace"])
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.open()
 
@@ -1132,6 +1152,22 @@ class Window(QMainWindow):
         model = self.pickers["openai"].model
         native = self.backend_box.currentData() == "clients"
         speeds = available_speeds(group_for(catalog.groups, model)) if native else {}
+        enabled = bool(session.get("daybreak", self.draft_daybreak)) and native
+        picker = self.pickers["openai"]
+        picker.daybreak = enabled
+        group = group_for(picker.catalog.get("groups", []), model)
+        compatible = picker.accepts(group)
+        if native:
+            picker.effort_control.setEnabled(bool(compatible and group and len(group["choices"]) > 1 and not self.backend_task))
+        eligible = any(model_available(g, True) for g in catalog.groups)
+        with QSignalBlocker(self.daybreak_button):
+            self.daybreak_button.setChecked(enabled)
+        self.daybreak_button.setVisible(native and (eligible or enabled))
+        self.daybreak_button.setEnabled(self.backend_task is None and (enabled or eligible))
+        self.daybreak_button.setText("Daybreak 开" if enabled else "Daybreak 关")
+        self.daybreak_button.setToolTip("使用当前账户授权的 Daybreak Blue 模型" if compatible else "请选择兼容模型或关闭 Daybreak")
+        if self.slash_menu.isVisible():
+            self.slash_menu.refresh_matches()
         speed = session.get("speed", self.draft_speed)
         if self.backend_task is None and catalog.groups and not catalog.error and speed != "standard" and speed not in speeds:
             speed = self.draft_speed = "standard"
@@ -1145,6 +1181,20 @@ class Window(QMainWindow):
         else:
             reason = catalog.error or ("Codex 速度" if speeds else "当前账户或模型未提供加速档位")
         self.speed_box.setToolTip(reason)
+
+    def change_daybreak(self, enabled):
+        try:
+            if self.sid:
+                self.engine.set_daybreak(self.sid, enabled)
+            else:
+                picker = self.pickers["openai"]
+                model = select_daybreak_model(picker.catalog["groups"], picker.model, enabled)
+                self.draft_daybreak = picker.daybreak = enabled
+                if model != picker.model:
+                    self.choose_model("openai", model)
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 6000)
+        self.refresh(force=True)
 
     def popup_choices(self, control, menu):
         menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -1328,6 +1378,7 @@ class Window(QMainWindow):
         options = dict(line=text, id=sid, project_id=pid, cwd=str(self.engine.skill_folders(sid, pid)[0]),
                        backend=self.backend_box.currentData(), permission=self.permission_box.currentData(),
                        speed=self.engine.store.session(sid)["speed"] if sid else self.draft_speed,
+                       daybreak=self.state["session"].get("daybreak", self.draft_daybreak),
                        mode=self.engine.store.session(sid)["mode"] if sid else self.draft_mode, standalone=pid is None)
         for p, picker in self.pickers.items():
             options[p] = picker.model

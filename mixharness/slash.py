@@ -8,7 +8,7 @@ from .client_rpc import executable
 from .chat_snapshot import ACTORS as ROLE_NAMES, feedback_url, snapshot_link, transcript
 from .clients import CLIENTS, codex_mcp_servers
 from .commands import default_models, new_session
-from .reasoning import api_levels, group_for
+from .reasoning import api_levels, group_for, model_available, select_daybreak_model
 from .slash_catalog import COMMANDS, command_name
 from .store import GOAL_STATES, MODES, MODE_TITLES, STATUSES, new_id
 from .usage import CODEX_BILLING, plan_usage
@@ -108,7 +108,9 @@ async def model_command(engine, cmd, arg, session):
     model = session[provider]
     if not value:
         if cmd == "model":
-            return "\n".join(f"{g['id']}  {g['name']}" for g in data["groups"])
+            return "\n".join(f"{g['id']}  {g['name']}" + (
+                "  · 当前模式不可用" if native and provider == "openai" and not model_available(g, session["daybreak"]) else ""
+            ) for g in data["groups"])
         group = group_for(data["groups"], model)
         levels = group["choices"] if group else api_levels(provider, model)
         return "可选思考强度　" + " / ".join(["default", *(v for v in levels if v)])
@@ -211,6 +213,8 @@ def status_text(engine, session):
              "权限　" + PERMISSIONS[session["permission"]], *(f"{p}　{session[p]}  ·  {session['efforts'].get(p) or '默认'}" for p in CLIENTS)]
     if session["speed"] != "standard":
         lines.append("Codex 速度　" + SPEEDS[session["speed"]])
+    if session["daybreak"]:
+        lines.append("Codex Daybreak Blue")
     lines.append(MODE_TITLES[session["mode"]])
     if session["objective"]:
         lines.append(goal_text(session))
@@ -238,8 +242,18 @@ async def execute_command(engine, args):
     session = engine.store.session(sid) if sid else None
     if cmd == "mode" and arg and arg not in MODES:
         raise ValueError("/mode " + COMMANDS["mode"].usage())
-    if not session and cmd in ("permissions", "backend", "model", "effort", "fast", "init", "plan", "review", "diff", "mode", "goal"):
+    if cmd == "daybreak" and arg.lower() not in ("", "on", "off"):
+        raise ValueError("用 /daybreak on 开启，/daybreak off 关闭")
+    if not session and cmd in ("permissions", "backend", "model", "effort", "fast", "daybreak", "init", "plan", "review", "diff", "mode", "goal"):
         options = dict(args)
+        if cmd == "daybreak" and arg:
+            options["daybreak"] = arg.lower() == "on"
+            if options.get("backend", "clients") == "clients":
+                catalog = engine.client_catalogs["openai"]
+                await catalog.refresh()
+                options["openai"] = select_daybreak_model(catalog.groups, options.get("openai", ""), options["daybreak"])
+                if options["openai"] != args.get("openai"):
+                    options.pop("openai_effort", None)
         if cmd == "backend" and arg:
             if arg != options.get("backend"):
                 for p in CLIENTS:
@@ -259,12 +273,16 @@ async def execute_command(engine, args):
         return dict(result, exit=True, text="")
     if cmd == "help":
         speeds = {}
-        if session and session["backend"] == "clients":
+        can_daybreak = False
+        if (session or args).get("backend", "clients") == "clients":
             catalog = engine.client_catalogs["openai"]
             if not catalog.groups:
                 await catalog.refresh()
-            speeds = available_speeds(group_for(catalog.groups, session["openai"]))
-        text = "\n".join("/" + name + "　" + spec.usage() for name, spec in COMMANDS.items() if name != "fast" or speeds)
+            if session:
+                speeds = available_speeds(group_for(catalog.groups, session["openai"]))
+            can_daybreak = (session or {}).get("daybreak") or any(model_available(g, True) for g in catalog.groups)
+        text = "\n".join("/" + name + "　" + spec.usage() for name, spec in COMMANDS.items()
+                         if (name != "fast" or speeds) and (name != "daybreak" or can_daybreak))
     elif cmd == "history" or (cmd == "resume" and not arg):
         text = sessions_text(engine.store, arg)
     elif cmd == "resume":
@@ -282,7 +300,7 @@ async def execute_command(engine, args):
         options = dict(args, project_id=pid, standalone=(session["project_id"] is None if session and not pid else
                                                         args.get("standalone", not args.get("cwd_project"))))
         if session:
-            options.update(backend=session["backend"], gemini=session["gemini"], openai=session["openai"],
+            options.update(backend=session["backend"], gemini=session["gemini"], openai=session["openai"], daybreak=session["daybreak"],
                            **{p + "_effort": level for p, level in session["efforts"].items()})
         created = await new_session(engine, options)
         result.update(id=created["id"], project_id=created["project_id"])
@@ -347,11 +365,25 @@ async def execute_command(engine, args):
         text = "\n".join(tools)
     elif cmd in ("model", "effort"):
         text = await model_command(engine, cmd, arg, session)
+        if cmd == "model" and arg.lower() in ("gpt", "openai", "codex") and session["backend"] == "clients":
+            result["unavailable_models"] = [g["id"] for g in engine.client_catalogs["openai"].groups
+                                            if not model_available(g, session["daybreak"])]
     elif cmd == "permissions":
         if arg:
             modes = {"default": "ask", "turbo": "full", **{name: key for key, name in PERMISSIONS.items()}}
             engine.set_access(sid, permission=modes.get(arg.lower(), arg.lower()))
         text = "操作权限　" + PERMISSIONS[engine.store.session(sid)["permission"]]
+    elif cmd == "daybreak":
+        if session["backend"] != "clients":
+            raise ValueError("Daybreak 需要本机 Codex 客户端")
+        catalog = engine.client_catalogs["openai"]
+        await catalog.refresh()
+        if arg:
+            engine.set_daybreak(sid, arg.lower() == "on")
+        session = engine.store.session(sid)
+        text = ("Daybreak Blue 已开启" if session["daybreak"] else "Daybreak 已关闭") + "　" + session["openai"]
+        if not any(model_available(g, True) for g in catalog.groups):
+            text += "　" + (catalog.error or "当前账户没有可用的 Daybreak Blue 模型")
     elif cmd == "fast":
         if session["backend"] == "clients":
             await engine.client_catalogs["openai"].refresh()
@@ -366,6 +398,10 @@ async def execute_command(engine, args):
         if arg and arg != session["backend"]:
             saved = session["backend_models"].get(arg, {})
             models = await default_models(engine, arg, saved)
+            if arg == "clients":
+                models["openai"] = select_daybreak_model(engine.client_catalogs["openai"].groups, models["openai"], False)
+                if saved.get("openai") != models["openai"]:
+                    saved = {**saved, "efforts": {k: v for k, v in saved.get("efforts", {}).items() if k != "openai"}}
             engine.switch_backend(sid, arg, models, saved.get("efforts", {}))
         text = "当前执行方式　" + engine.store.session(sid)["backend"]
     elif cmd in ("approve", "deny"):

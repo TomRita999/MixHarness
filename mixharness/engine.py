@@ -13,7 +13,7 @@ from .agent_settings import AgentSettings, PERMISSIONS, SPEEDS, available_speeds
 from .catalog import ModelCatalog
 from .clients import CLIENTS, ClientCatalog, CodexTurnError, private_directory, workflow_turn
 from .providers import FUNCTIONS, tool_names, google_turn, openai_turn
-from .reasoning import api_levels, group_for, resolve_choice
+from .reasoning import api_levels, group_for, model_available, resolve_choice, select_daybreak_model
 from .store import PROVIDERS, Store, Superseded, new_id, now, pack
 
 
@@ -122,8 +122,9 @@ class Engine:
         return {p: m for p, (m, _) in choices.items()}, {p: e for p, (_, e) in choices.items()}
 
     def create_session(self, gemini, openai, directory=None, *, project_id=None, standalone=False, backend="api",
-                       efforts=None, permission="ask", speed="standard", mode="default"):
+                       efforts=None, permission="ask", speed="standard", mode="default", daybreak=False):
         models, efforts = self.resolve_models(backend, {"gemini": gemini, "openai": openai}, efforts)
+        self.check_daybreak(backend, models["openai"], daybreak)
         self.validate_access(backend, models["openai"], permission, speed)
         sid = new_id()
         selected = directory or (None if standalone else self.workspace)
@@ -139,7 +140,26 @@ class Engine:
         else:
             root = self.home / "projects" / sid
             root.mkdir(parents=True)
-        return self.store.create(sid, root, models["gemini"], models["openai"], project_id, backend, efforts, permission, speed, mode)
+        return self.store.create(sid, root, models["gemini"], models["openai"], project_id, backend, efforts, permission, speed, mode, daybreak)
+
+    def check_daybreak(self, backend, model, enabled):
+        if backend != "clients":
+            if enabled:
+                raise ValueError("Daybreak 需要本机 Codex 客户端")
+            return
+        group = group_for(self.client_catalogs["openai"].groups, model)
+        if not model_available(group, enabled):
+            raise ValueError(f"{model} 不支持当前账户的 Daybreak Blue" if enabled else f"{model} 不支持标准模式")
+
+    def set_daybreak(self, sid, enabled):
+        session = self.store.session(sid)
+        if session["backend"] != "clients":
+            self.check_daybreak(session["backend"], session["openai"], enabled)
+            return
+        model = select_daybreak_model(self.client_catalogs["openai"].groups, session["openai"], enabled)
+        if enabled != session["daybreak"] or model != session["openai"]:
+            self.store.set_models(sid, session["gemini"], model, daybreak=enabled)
+            self.notify(sid)
 
     def validate_access(self, backend, model, permission, speed):
         if permission not in PERMISSIONS:
@@ -292,10 +312,9 @@ class Engine:
             if effort is None and model == session[p]:
                 effort = efforts.get(p, "")
             models[p], efforts[p] = self.model_choice(session["backend"], p, model, effort)
+        if "openai" in updates:
+            self.check_daybreak(session["backend"], models["openai"], session["daybreak"])
         self.store.set_models(sid, **models, efforts=efforts)
-        if session["openai"] != models["openai"]:
-            with self.store.db:
-                self.store.db.execute("UPDATE sessions SET speed='standard' WHERE id=?", (sid,))
         self.notify(sid)
 
     def switch_backend(self, sid, backend, models, efforts=None):
@@ -304,6 +323,8 @@ class Engine:
             for provider, catalog in self.client_catalogs.items():
                 if models.get(provider) not in catalog.labels:
                     raise ValueError(catalog.error or catalog.view()["client"] + " 没有提供所选模型")
+        if self.store.session(sid)["backend"] != backend:
+            self.check_daybreak(backend, models["openai"], False)
         self.store.switch_backend(sid, backend, models, efforts)
         self.notify(sid)
 
@@ -511,7 +532,8 @@ class Engine:
         resume = ((calls or (not self.settings.context_window and not session["context_after"])) and job["cursor"] is not None
                   and job["backend"] == job["cursor_backend"] == "api"
                   and job["model"] == job["cursor_model"])
-        request = dict(job, permission=session["permission"], speed=session["speed"], context_window=self.settings.context_window)
+        request = dict(job, permission=session["permission"], speed=session["speed"], daybreak=session["daybreak"],
+                       context_window=self.settings.context_window)
         if not resume:
             request.update(cursor=None, seen=0)
         sid = job["sid"]

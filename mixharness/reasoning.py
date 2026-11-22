@@ -75,6 +75,25 @@ def group_for(groups, model):
     return next((g for g in groups if model == g["id"] or model in g["choices"].values()), None)
 
 
+def model_available(group, daybreak):
+    programs = (group or {}).get("access_programs")
+    if not programs:
+        return not daybreak
+    return ("daybreakBlue" if daybreak else "standard") in programs
+
+
+def select_daybreak_model(groups, current, enabled):
+    group = group_for(groups, current)
+    if group and model_available(group, enabled):
+        return current
+    for candidate in groups:
+        if model_available(candidate, enabled):
+            return candidate["id"]
+    if not enabled and not groups:
+        return current
+    raise ValueError("当前 Codex 账户没有可用的 Daybreak Blue 模型" if enabled else "当前账户没有可用的标准模型")
+
+
 def resolve_choice(group, model, effort):
     choices = group["choices"]
     if effort and effort not in choices:

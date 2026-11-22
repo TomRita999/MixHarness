@@ -47,6 +47,8 @@ def new_id():
 
 def unpack(row):
     data = dict(row)
+    if "daybreak" in data:
+        data["daybreak"] = bool(data["daybreak"])
     for key in JSON_FIELDS & data.keys():
         if data[key] is not None:
             data[key] = json.loads(data[key])
@@ -127,6 +129,8 @@ class Store:
                     if field not in columns:
                         self.db.execute(f"ALTER TABLE {table} ADD COLUMN {field} INTEGER NOT NULL DEFAULT 0")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(sessions)")}
+            if "daybreak" not in columns:
+                self.db.execute("ALTER TABLE sessions ADD COLUMN daybreak INTEGER NOT NULL DEFAULT 0")
             if "mode" not in columns:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'default'")
             for field in ("objective", "goal_status", "goal_note", "goal_next"):
@@ -365,7 +369,7 @@ class Store:
         ).lastrowid
 
     def create(self, sid, workspace, gemini, openai, project_id=None, backend="api", efforts=None,
-               permission="ask", speed="standard", mode="default"):
+               permission="ask", speed="standard", mode="default", daybreak=False):
         if backend not in ("api", "clients"):
             raise ValueError("未知的执行方式")
         if mode not in MODES:
@@ -374,10 +378,10 @@ class Store:
             if project_id is None and workspace != self.home / "projects" / sid:
                 project_id = self._register_folder(Path(workspace))
             self.db.execute(
-                "INSERT INTO sessions(id,title,workspace,gemini,openai,brief,versions,updated,project_id,backend,efforts,permission,speed,mode) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO sessions(id,title,workspace,gemini,openai,brief,versions,updated,project_id,backend,efforts,permission,speed,mode,daybreak) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (sid, "新会话", str(workspace), gemini, openai, pack(dict.fromkeys(SCOPES, "")),
-                 pack(dict.fromkeys(SCOPES, 0)), now(), project_id, backend, pack(efforts or {}), permission, speed, mode),
+                 pack(dict.fromkeys(SCOPES, 0)), now(), project_id, backend, pack(efforts or {}), permission, speed, mode, daybreak),
             )
         return self.session(sid)
 
@@ -413,8 +417,8 @@ class Store:
             if side:
                 mode, objective, goal_status, note, speed = "side", "", "", "", original["speed"]
             self.db.execute("INSERT INTO sessions(id,title,workspace,gemini,openai,brief,versions,updated,project_id,"
-                            "backend,efforts,revision,planned,mode,objective,goal_status,goal_note,speed) "
-                            "SELECT ?,?,?,gemini,openai,brief,versions,?,?,backend,efforts,revision,revision,?,?,?,?,? "
+                            "backend,efforts,revision,planned,mode,objective,goal_status,goal_note,speed,daybreak) "
+                            "SELECT ?,?,?,gemini,openai,brief,versions,?,?,backend,efforts,revision,revision,?,?,?,?,?,daybreak "
                             "FROM sessions WHERE id=?", (branch, name, str(workspace or original["workspace"]), now(), project, mode,
                             objective, goal_status, note, speed, sid))
             for event in self.db.execute("SELECT seq,kind,actor,body,meta,at FROM events WHERE sid=? AND kind='message' ORDER BY seq", (sid,)):
@@ -562,12 +566,13 @@ class Store:
         elif verdict == "complete":
             self.db.execute("UPDATE sessions SET mode='default' WHERE id=?", (session["id"],))
 
-    def set_models(self, sid, gemini, openai, efforts=None):
+    def set_models(self, sid, gemini, openai, efforts=None, *, daybreak=None):
         with self.db:
             old = self.session(sid)
             models = {"gemini": gemini, "openai": openai}
             selected = {p: (efforts or {}).get(p, old["efforts"].get(p, "") if old[p] == m else "") for p, m in models.items()}
-            self.db.execute("UPDATE sessions SET gemini=?,openai=?,efforts=? WHERE id=?", (gemini, openai, pack(selected), sid))
+            self.db.execute("UPDATE sessions SET gemini=?,openai=?,efforts=?,daybreak=COALESCE(?,daybreak),speed=? WHERE id=?",
+                            (gemini, openai, pack(selected), daybreak, old["speed"] if openai == old["openai"] else "standard", sid))
             for p, model in models.items():
                 if old[p] == model and old["efforts"].get(p, "") == selected[p]:
                     continue
@@ -578,7 +583,8 @@ class Store:
                     [(model, selected[p], sid, kind, model, old["backend"], old["backend"])
                      for kind, provider in PROVIDERS.items() if provider == p],
                 )
-            self.event(sid, "models", "system", "已切换模型", {**models, "efforts": selected})
+            self.event(sid, "models", "system", "已更新模型设置", {**models, "efforts": selected,
+                                                            "daybreak": old["daybreak"] if daybreak is None else daybreak})
 
     def switch_backend(self, sid, backend, models, efforts=None):
         if backend not in ("api", "clients") or not all(models.get(p) for p in ("gemini", "openai")):
@@ -591,7 +597,7 @@ class Store:
             remembered[session["backend"]] = {p: session[p] for p in ("gemini", "openai")}
             remembered[session["backend"]]["efforts"] = session["efforts"]
             selected = efforts or {}
-            self.db.execute("UPDATE sessions SET backend=?,gemini=?,openai=?,backend_models=?,efforts=?,speed='standard' WHERE id=?",
+            self.db.execute("UPDATE sessions SET backend=?,gemini=?,openai=?,backend_models=?,efforts=?,speed='standard',daybreak=0 WHERE id=?",
                             (backend, models["gemini"], models["openai"], pack(remembered), pack(selected), sid))
             self.db.executemany(
                 "UPDATE jobs SET model=?,effort=?,status=CASE WHEN status='needs_key' THEN 'ready' ELSE status END "

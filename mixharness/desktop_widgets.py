@@ -8,17 +8,18 @@ from pathlib import Path
 
 from dotenv import set_key
 from PySide6.QtCore import QBuffer, QEasingCurve, QIODevice, QPoint, QPointF, QPropertyAnimation, QSaveFile, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QFontMetrics, QIcon, QImage, QPainter, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QToolButton, QToolTip,
+    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QTextEdit, QToolButton, QToolTip,
     QVBoxLayout, QWidget,
 )
 
 from .desktop_style import Glyph
-from .desktop_markdown import render_markdown
+from .desktop_markdown import link_plain_text, render_markdown
+from .markdown_links import HASH_LINE
 from .attachments import TYPES
-from .reasoning import LEVEL_NAMES, api_group, group_for
+from .reasoning import LEVEL_NAMES, api_group, group_for, model_available
 
 
 ALIGN = Qt.AlignmentFlag
@@ -126,6 +127,7 @@ class ModelPicker(QWidget):
         self.provider = provider
         self.title = title
         self.model = ""
+        self.daybreak = False
         self.effort = ""
         self.catalog = {}
         self.dialog = None
@@ -176,6 +178,9 @@ class ModelPicker(QWidget):
         if self.dialog:
             self.update_list()
 
+    def accepts(self, group):
+        return self.provider != "openai" or self.catalog.get("source") != "client" or model_available(group, self.daybreak)
+
     def selected_level(self, group):
         if not group:
             return ""
@@ -212,7 +217,7 @@ class ModelPicker(QWidget):
 
     def open_effort(self):
         group = group_for(self.catalog["groups"], self.model)
-        if group:
+        if group and self.accepts(group):
             menu = self.new_menu(self.title + " 思考强度")
             self.level_actions(menu, group)
             self.popup(menu, self.effort_control)
@@ -232,7 +237,10 @@ class ModelPicker(QWidget):
             text = group["name"]
             if level:
                 text += "    " + LEVEL_NAMES.get(level, level)
-            if len(levels) > 1:
+            if not self.accepts(group):
+                action = menu.addAction(text)
+                action.setEnabled(False)
+            elif len(levels) > 1:
                 sub = Submenu(text, menu)
                 self.level_actions(sub, group)
                 action = sub.menuAction()
@@ -323,6 +331,8 @@ class ModelPicker(QWidget):
                 text += "  · 当前"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, value)
+            if not self.accepts(group_for(data["groups"], value)):
+                item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.options.addItem(item)
             if value == selected:
                 self.options.setCurrentItem(item)
@@ -332,7 +342,7 @@ class ModelPicker(QWidget):
 
     def choose(self):
         item = self.options.currentItem()
-        if item:
+        if item and item.flags() & Qt.ItemFlag.ItemIsEnabled:
             model = item.data(Qt.ItemDataRole.UserRole)
             self.changed.emit(self.provider, model, self.effort if model == self.model else "")
             self.dialog.accept()
@@ -360,10 +370,13 @@ class ModelPicker(QWidget):
 
 
 class Document(QTextBrowser):
-    def __init__(self):
+    def __init__(self, workspace=None):
         super().__init__()
+        self.workspace = workspace
+        self.hovered_link = None
         self.setOpenLinks(False)
         self.setOpenExternalLinks(False)
+        self.viewport().setMouseTracking(True)
         self.anchorClicked.connect(self.follow_link)
         self.document().setDocumentMargin(4)
 
@@ -371,15 +384,84 @@ class Document(QTextBrowser):
         return None
 
     def show_markdown(self, text):
-        render_markdown(self.document(), text, self.font(), self.palette())
+        self.hovered_link = None
+        self.setExtraSelections([])
+        render_markdown(self.document(), text, self.font(), self.palette(), self.workspace)
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        point = event.position().toPoint()
+        href = self.anchorAt(point)
+        block = self.cursorForPosition(point).block()
+        key = (block.position(), href) if href else None
+        if self.hovered_link == key:
+            return
+        self.hovered_link = key
+        self.setToolTip(href)
+        ranges = []
+        if href:
+            frag = block.begin()
+            while not frag.atEnd():
+                span = frag.fragment()
+                if span.charFormat().anchorHref() == href:
+                    hit = QTextEdit.ExtraSelection()
+                    hit.cursor = QTextCursor(self.document())
+                    hit.cursor.setPosition(span.position())
+                    hit.cursor.setPosition(span.position() + span.length(), QTextCursor.MoveMode.KeepAnchor)
+                    accent = self.palette().link().color()
+                    hit.format.setForeground(accent)
+                    accent.setAlpha(36)
+                    hit.format.setBackground(accent)
+                    ranges.append(hit)
+                frag += 1
+        self.setExtraSelections(ranges)
+
+    def leaveEvent(self, event):
+        self.hovered_link = None
+        self.setExtraSelections([])
+        self.setToolTip("")
+        super().leaveEvent(event)
 
     def follow_link(self, url):
-        if url.scheme() in ("https", "http"):
+        if url.scheme() in ("https", "http", "mailto"):
             QDesktopServices.openUrl(url)
+        elif url.isLocalFile() and not url.host():
+            file = Path(url.toLocalFile())
+            try:
+                if not file.is_file():
+                    raise ValueError("文件不存在：" + str(file))
+                with file.open("rb") as stream:
+                    data = stream.read(4 * 1024 * 1024 + 1)
+                if len(data) > 4 * 1024 * 1024 or b"\0" in data:
+                    raise ValueError("此文件无法作为文本预览：" + str(file))
+                text = data.decode("utf-8-sig")
+            except (OSError, ValueError) as exc:
+                QMessageBox.information(self, "打开文件", str(exc))
+                return
+            dialog = QDialog(self)
+            dialog.setWindowTitle(file.name)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            dialog.resize(780, 540)
+            view = QPlainTextEdit()
+            view.setReadOnly(True)
+            view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+            view.setPlainText(text)
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(view)
+            dialog.open()
+            location = HASH_LINE.fullmatch(url.fragment())
+            if location:
+                block = view.document().findBlockByNumber(min(int(location[1]), view.blockCount()) - 1)
+                cursor = QTextCursor(block)
+                cursor.setPosition(block.position() + min(int(location[2] or 1) - 1, block.length() - 1))
+                view.setTextCursor(cursor)
+                view.centerCursor()
+        elif not url.scheme() and url.fragment():
+            self.scrollToAnchor(url.fragment())
 
 
 class MessageRow(QWidget):
-    def __init__(self, event, input_library=None, retry=None):
+    def __init__(self, event, input_library=None, retry=None, workspace=None):
         super().__init__()
         self.user = event["actor"] == "user"
         self.text = event["body"]
@@ -422,7 +504,7 @@ class MessageRow(QWidget):
                 line.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
                 details.addWidget(line)
             box.addWidget(trace)
-        self.body = Document()
+        self.body = Document(workspace)
         self.body.setObjectName("messageText")
         self.body.setReadOnly(True)
         self.body.setFrameShape(QFrame.Shape.NoFrame)
@@ -437,6 +519,8 @@ class MessageRow(QWidget):
         self.body.document().setDefaultFont(self.body.font())
         if self.user or event["kind"] != "message":
             self.body.setPlainText(self.text)
+            if self.user:
+                link_plain_text(self.body.document(), self.body.palette())
         else:
             self.body.show_markdown(self.text)
         self.body.setAccessibleName(author + "的消息")
@@ -505,6 +589,7 @@ class Timeline(QScrollArea):
     def __init__(self, input_library=None, retry=None):
         super().__init__()
         self.input_library = input_library
+        self.workspace = None
         self.retry = retry
         self.failure_rows = {}
         self.setAccessibleName("共享会话记录")
@@ -619,7 +704,7 @@ class Timeline(QScrollArea):
                 self.progress(event["body"], event.get("approval_label"))
                 continue
             self.group_button = self.group_body = None
-            row = MessageRow(event, self.input_library, self.retry)
+            row = MessageRow(event, self.input_library, self.retry, self.workspace)
             if row.retry_actions is not None:
                 self.failure_rows[event["seq"]] = row.retry_actions
             row.fit(self.viewport().width() - 4)
@@ -787,13 +872,13 @@ class SettingsDialog(QDialog):
 
 
 class ArtifactDialog(QDialog):
-    def __init__(self, parent, asset):
+    def __init__(self, parent, asset, workspace=None):
         super().__init__(parent)
         self.asset = asset
         self.setWindowTitle(asset["name"])
         self.resize(700, 530)
         layout = QVBoxLayout(self)
-        text = Document()
+        text = Document(workspace)
         if asset["name"].lower().endswith(".md"):
             text.show_markdown(asset["content"])
         else:

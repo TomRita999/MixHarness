@@ -23,6 +23,7 @@ COMMANDS = {
     "feedback": Command("反馈", "向 MixHarness 项目反馈问题或建议", "[反馈内容]"),
     "archive": Command("归档聊天", "将当前会话移到归档管理"),
     "fast": Command("快速模式", "查看或切换 Codex Fast 加速档位", "[off|fast|ultrafast]"),
+    "daybreak": Command("Daybreak", "切换当前账户授权的 Daybreak Blue 模型", "[on|off]"),
     "plan": Command("计划模式", "制定或修订只读计划", "[要求]"),
     "goal": Command("目标模式", "设定持续目标，查看进度、暂停或继续", "[目标|status|pause|resume|clear]"),
     "implement": Command("执行计划", "开始实施当前已制定的计划"),

@@ -15,7 +15,7 @@ from .agent_settings import codex_speeds
 from .attachments import Attachment, MAX_REFERENCE, image_parts
 from .client_rpc import ClientError, Rpc, executable
 from .providers import FUNCTIONS, PROMPTS, Plan, Turn, declarations, instructions, tool_names
-from .reasoning import antigravity_groups, model_group
+from .reasoning import antigravity_groups, model_available, model_group
 from .store import PROVIDERS, new_id, pack
 
 
@@ -74,7 +74,7 @@ async def model_directory(client):
             groups = antigravity_groups(catalog)
         else:
             async with connection(client) as rpc:
-                await rpc.initialize(client)
+                await rpc.initialize(client, experimental=True)
                 account = (await rpc.request("account/read", {"refreshToken": False})).get("account") or {}
                 catalog, groups, cursor = {}, [], None
                 while True:
@@ -85,7 +85,8 @@ async def model_directory(client):
                             group = model_group(m["model"], m["displayName"],
                                                 [opt["reasoningEffort"] for opt in m["supportedReasoningEfforts"]],
                                                 m["defaultReasoningEffort"])
-                            groups.append(dict(group, speeds=codex_speeds(account, m)))
+                            groups.append(dict(group, speeds=codex_speeds(account, m),
+                                               access_programs=(m.get("availableAccessPrograms") or {}).get("cyber")))
                     cursor = page.get("nextCursor")
                     if not cursor:
                         break
@@ -350,17 +351,21 @@ async def codex_turn(engine, job, cwd, prompt, schema):
     proposal = job["kind"] == "proposal"
     readonly = proposal or job["kind"] in ("goal_check", "side") or job["payload"].get("review") or job["payload"].get("read_only")
     async with connection("codex") as rpc:
-        await rpc.initialize("codex", experimental=proposal)
+        await rpc.initialize("codex", experimental=True)
         tier = "default"
+        cursor = None
+        while True:
+            page = await rpc.request("model/list", {"cursor": cursor, "includeHidden": False})
+            record = next((m for m in page["data"] if m["model"] == model and not m["hidden"]), None)
+            cursor = page.get("nextCursor")
+            if record or not cursor:
+                break
+        programs = ((record or {}).get("availableAccessPrograms") or {}).get("cyber")
+        daybreak = bool(job.get("daybreak"))
+        if not model_available({"access_programs": programs}, daybreak):
+            raise ClientError("当前账户或模型不支持所选 Codex 模式，请刷新模型目录后选择兼容模型")
         if speed != "standard":
             account = (await rpc.request("account/read", {})).get("account") or {}
-            cursor = None
-            while True:
-                page = await rpc.request("model/list", {"cursor": cursor, "includeHidden": False})
-                record = next((m for m in page["data"] if m["model"] == model and not m["hidden"]), None)
-                cursor = page.get("nextCursor")
-                if record or not cursor:
-                    break
             tier = codex_speeds(account, record or {}).get(speed)
             if not tier:
                 raise ClientError("当前 Codex 账户或模型不支持所选速度，请改用标准速度")
@@ -403,6 +408,8 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                 complete = params["turn"]
         params = {"threadId": tid, "model": model, "serviceTier": tier, "outputSchema": schema,
                   "input": [{"type": "text", "text": prompt}, *image_parts(job.get("images", []), "codex")]}
+        if programs:
+            params["cyberAccessProgram"] = "daybreakBlue" if daybreak else "standard"
         if effort:
             params["effort"] = effort
         if proposal:

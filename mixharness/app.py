@@ -41,6 +41,7 @@ class NewSession(Models):
     backend: Literal["api", "clients"] = "api"
     permission: Literal["ask", "auto", "full"] = "ask"
     speed: Literal["standard", "fast", "ultrafast"] = "standard"
+    daybreak: bool = False
     mode: Literal["default", "plan", "goal"] = "default"
 
 
@@ -180,7 +181,7 @@ def create_app(project=None, home=None):
             if models.backend == "clients":
                 await asyncio.gather(*(c.refresh() for c in engine.client_catalogs.values()))
             return engine.create_session(models.gemini, models.openai, project_id=models.project_id, standalone=models.standalone,
-                                         permission=models.permission, speed=models.speed, mode=models.mode,
+                                         permission=models.permission, speed=models.speed, mode=models.mode, daybreak=models.daybreak,
                                          backend=models.backend, efforts={"gemini": models.gemini_effort, "openai": models.openai_effort})
         except (OSError, ValueError) as exc:
             raise HTTPException(400, str(exc)) from exc

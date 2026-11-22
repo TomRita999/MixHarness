@@ -103,6 +103,7 @@ class ClientHistory(QWidget):
         dialog.resize(760, 575)
         layout = QVBoxLayout(dialog)
         transcript = Timeline()
+        transcript.workspace = row.get("cwd") or row.get("workspace")
         layout.addWidget(transcript, 1)
         status = label("加载中…", "caption")
         layout.addWidget(status)

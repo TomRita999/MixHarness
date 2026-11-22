@@ -10,6 +10,8 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from .slash import ROLE_NAMES
 from .slash_catalog import COMMANDS, matches
 from .store import PROVIDERS
+from .reasoning import model_available
+from .terminal_markdown import print_message
 
 
 CONTROL_CHARS = dict.fromkeys([*range(9), 11, 12, *range(13, 32), *range(127, 160)], "")
@@ -19,9 +21,22 @@ def display(value, *, file=None):
     print(str(value).translate(CONTROL_CHARS), file=file, flush=True)
 
 
+def display_command(result):
+    disabled = set(result.get("unavailable_models", ()))
+    if not disabled or not sys.stdout.isatty():
+        display(result["text"])
+        return
+    from rich.console import Console
+    from rich.text import Text
+    console = Console()
+    for line in result["text"].translate(CONTROL_CHARS).splitlines():
+        model = line.partition("  ")[0]
+        console.print(Text(line, style="dim" if model in disabled else "none"))
+
+
 class CommandCompletion(Completer):
     def __init__(self):
-        self.names = set(COMMANDS) - {"fast"}
+        self.names = set(COMMANDS) - {"fast", "daybreak"}
 
     def get_completions(self, document, complete_event):
         prefix = document.text_before_cursor
@@ -35,7 +50,7 @@ class CommandCompletion(Completer):
 class Terminal:
     def __init__(self, invoke, args):
         self.invoke = invoke
-        self.options = {k: args[k] for k in ("backend", "project_id", "cwd", "permission", "mode") if args.get(k)}
+        self.options = {k: args[k] for k in ("backend", "project_id", "cwd", "permission", "mode", "daybreak") if args.get(k)}
         self.options.update(standalone=bool(args.get("standalone")), cwd_project=not args.get("standalone"))
         self.sid = args.get("id")
         self.after = 0
@@ -78,9 +93,17 @@ class Terminal:
             self.completion.names.add("fast")
         else:
             self.completion.names.discard("fast")
+        if data.get("daybreak_available"):
+            self.completion.names.add("daybreak")
+        else:
+            self.completion.names.discard("daybreak")
         for event in data["events"]:
             if event["seq"] > self.after and event["kind"] in ("message", "verification", "failure", "progress", "artifact"):
-                display(ROLE_NAMES.get(event["actor"], event["actor"]) + "　" + event["body"])
+                author = ROLE_NAMES.get(event["actor"], event["actor"])
+                if sys.stdout.isatty() and event["kind"] == "message" and event["actor"] in ("openai", "gemini"):
+                    print_message(author, event["body"].translate(CONTROL_CHARS), data.get("workspace"))
+                else:
+                    display(author + "　" + event["body"])
             self.after = max(self.after, event["seq"])
         for item in data["approvals"]:
             if item["id"] not in self.pending:
@@ -98,6 +121,13 @@ class Terminal:
         self.running = {j["id"] for j in data["running"]}
 
     async def monitor(self):
+        if self.prompt and not self.sid and self.options.get("backend", "clients") == "clients":
+            try:
+                catalog = await self.invoke({"command": "models", "source": "codex"})
+            except (OSError, ValueError, RuntimeError):
+                catalog = {}
+            if not self.sid and any(model_available(g, True) for g in catalog.get("groups", [])):
+                self.completion.names.add("daybreak")
         while True:
             await self.update()
             await asyncio.sleep(0.4)
@@ -118,7 +148,7 @@ class Terminal:
             session = (await self.invoke(dict(command="status", id=self.sid)))["session"]
             self.options.update(project_id=session["project_id"], backend=session["backend"])
         print("MixHarness · 输入消息开始协作，/help 查看指令", flush=True)
-        with patch_stdout() if self.prompt else nullcontext():
+        with patch_stdout(raw=True) if self.prompt else nullcontext():
             monitor = asyncio.create_task(self.monitor())
             try:
                 while True:
@@ -145,7 +175,7 @@ class Terminal:
                                 self.select(result["id"])
                             self.options["project_id"] = result["project_id"]
                             if result["text"]:
-                                display(result["text"])
+                                display_command(result)
                         else:
                             if not self.sid:
                                 session = await self.invoke(dict(self.options, command="new"))

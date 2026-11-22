@@ -100,10 +100,11 @@ class SlashMenu(QListWidget):
             self.prefix = None
             self.hide()
             return
-        key = (text, self.host.sid)
+        show_daybreak = not self.host.daybreak_button.isHidden()
+        key = (text, self.host.sid, show_daybreak)
         if key != self.prefix:
             self.prefix = key
-            self.names = [name for name in matches(text[1:]) if name != "exit"]
+            self.names = [name for name in matches(text[1:]) if name != "exit" and (name != "daybreak" or show_daybreak)]
             self.available = []
             self.selectionModel().clear()
             for row, name in enumerate(self.names):

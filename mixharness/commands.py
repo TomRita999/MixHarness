@@ -10,7 +10,7 @@ from . import clients
 from .attachments import Attachment, MAX_ITEMS
 from .agent_settings import available_speeds, skill_catalog
 from .catalog import MODELS
-from .reasoning import group_for
+from .reasoning import group_for, model_available, select_daybreak_model
 from .store import new_id
 from .usage import plan_usage
 
@@ -39,7 +39,7 @@ async def settled(engine, sid, seconds, *, return_on_approval=False, keep_native
             await asyncio.sleep(0.15)
 
 
-async def default_models(engine, backend, preferred):
+async def default_models(engine, backend, preferred, *, daybreak=False):
     if backend == "api":
         return {p: preferred.get(p) or models[0] for p, models in MODELS.items()}
     if backend != "clients":
@@ -50,17 +50,20 @@ async def default_models(engine, backend, preferred):
         if not catalog.labels:
             raise ValueError(catalog.error or "客户端模型目录为空")
         models[p] = preferred.get(p) or next(iter(catalog.labels))
+        if p == "openai" and not preferred.get(p):
+            models[p] = select_daybreak_model(catalog.groups, models[p], daybreak)
     return models
 
 
 async def new_session(engine, args):
     backend = args.get("backend", "clients")
-    selected = await default_models(engine, backend, args)
+    daybreak = args.get("daybreak", False)
+    selected = await default_models(engine, backend, args, daybreak=daybreak)
     efforts = {p: args[p + "_effort"] for p in clients.CLIENTS if args.get(p + "_effort") is not None}
     directory = Path(args["cwd"]) if args.get("cwd_project") and not args.get("standalone") and not args.get("project_id") else None
     session = engine.create_session(**selected, directory=directory, project_id=args.get("project_id"), backend=backend, efforts=efforts,
                                     standalone=args.get("standalone", False), permission=args.get("permission", "ask"),
-                                    speed=args.get("speed", "standard"), mode=args.get("mode", "default"))
+                                    speed=args.get("speed", "standard"), mode=args.get("mode", "default"), daybreak=daybreak)
     engine.notify(session["id"])
     return session
 
@@ -80,12 +83,18 @@ async def dispatch(engine, args):
         version = engine.changes.get(sid, 0)
         if args.get("version") == version:
             return {"version": version}
+        catalog = engine.client_catalogs["openai"]
+        native = session["backend"] == "clients"
+        if native and args.get("version") is None and not catalog.groups and not catalog.error:
+            await catalog.refresh()
         events = engine.store.rows("SELECT seq,actor,kind,body FROM events WHERE sid=? AND seq>? ORDER BY seq", sid, args.get("after", 0))
         jobs = engine.store.rows("SELECT id,kind,status FROM jobs WHERE sid=? AND status='needs_key'", sid)
         running = engine.store.rows("SELECT id,title,model FROM jobs WHERE sid=? AND status='running'", sid)
-        options = available_speeds(group_for(engine.client_catalogs["openai"].groups, session["openai"])) if session["backend"] == "clients" else {}
+        options = available_speeds(group_for(catalog.groups, session["openai"])) if native else {}
+        daybreak_options = native and any(model_available(g, True) for g in catalog.groups)
         return {"version": version, "events": events, "approvals": engine.store.approvals(sid), "needs_key": jobs,
-                "running": running, "speed_options": list(options)}
+                "running": running, "speed_options": list(options), "daybreak_available": daybreak_options or session["daybreak"],
+                "workspace": session["workspace"]}
     if cmd == "settings":
         sid, pid, directory = args.get("id"), args.get("project_id"), args.get("cwd")
         folders = engine.skill_folders(sid, pid, directory)
