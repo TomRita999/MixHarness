@@ -8,6 +8,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from .slash import ALIASES, COMMANDS, ROLE_NAMES
+from .store import PROVIDERS
 
 
 CONTROL_CHARS = dict.fromkeys([*range(9), 11, 12, *range(13, 32), *range(127, 160)], "")
@@ -34,7 +35,7 @@ class CommandCompletion(Completer):
 class Terminal:
     def __init__(self, invoke, args):
         self.invoke = invoke
-        self.options = {k: args[k] for k in ("backend", "project_id", "cwd", "permission") if args.get(k)}
+        self.options = {k: args[k] for k in ("backend", "project_id", "cwd", "permission", "mode") if args.get(k)}
         self.options.update(standalone=bool(args.get("standalone")), cwd_project=not args.get("standalone"))
         self.sid = args.get("id")
         self.after = 0
@@ -88,7 +89,7 @@ class Terminal:
         self.pending = {a["id"] for a in data["approvals"]}
         for job in data["needs_key"]:
             if job["id"] not in self.missing:
-                provider = "OpenAI" if job["kind"] in ("engineering", "verification") else "Gemini"
+                provider = "OpenAI" if PROVIDERS[job["kind"]] == "openai" else "Gemini"
                 print(f"等待 {provider} API Key", flush=True)
         self.missing = {j["id"] for j in data["needs_key"]}
         for job in data["running"]:

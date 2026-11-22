@@ -412,6 +412,8 @@ class MessageRow(QWidget):
             self.body.setPlainText(self.text)
         else:
             self.body.document().setMarkdown(self.text, MARKDOWN)
+        self.body.setAccessibleName(author + "的消息")
+        self.body.setAccessibleDescription(self.body.toPlainText())
         if event.get("at"):
             stamp = datetime.fromisoformat(event["at"]).astimezone().strftime("%Y-%m-%d %H:%M")
             self.block.setToolTip(author + " · " + stamp)

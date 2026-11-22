@@ -50,6 +50,12 @@ class NewSession(Models):
     backend: Literal["api", "clients"] = "api"
     permission: Literal["ask", "auto", "full"] = "ask"
     speed: Literal["standard", "fast", "ultrafast"] = "standard"
+    mode: Literal["default", "plan", "goal"] = "default"
+
+
+class ModeChange(BaseModel):
+    mode: Literal["default", "plan", "goal"]
+    objective: str | None = Field(default=None, min_length=1, max_length=120000)
 
 
 class Access(BaseModel):
@@ -183,7 +189,7 @@ def create_app(project=None, home=None):
             if models.backend == "clients":
                 await asyncio.gather(*(c.refresh() for c in engine.client_catalogs.values()))
             return engine.create_session(models.gemini, models.openai, project_id=models.project_id, standalone=models.standalone,
-                                         permission=models.permission, speed=models.speed,
+                                         permission=models.permission, speed=models.speed, mode=models.mode,
                                          backend=models.backend, efforts={"gemini": models.gemini_effort, "openai": models.openai_effort})
         except (OSError, ValueError) as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -191,6 +197,29 @@ def create_app(project=None, home=None):
     @app.get("/api/sessions/{sid}")
     async def session(sid: str):
         return view_state(app.state.engine.store, sid)
+
+    @app.put("/api/sessions/{sid}/mode")
+    async def change_mode(sid: str, data: ModeChange):
+        e = app.state.engine
+        try:
+            e.store.change_mode(sid, data.mode, objective=data.objective)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        e.notify(sid)
+        return e.store.session(sid)
+
+    @app.post("/api/sessions/{sid}/mode/{action}")
+    async def mode_action(sid: str, action: Literal["implement", "pause", "resume", "clear"]):
+        e = app.state.engine
+        try:
+            if action == "implement":
+                e.store.implement_plan(sid)
+            else:
+                e.store.goal_action(sid, action)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        e.notify(sid)
+        return e.store.session(sid)
 
     @app.patch("/api/sessions/{sid}/access")
     async def access(sid: str, data: Access):

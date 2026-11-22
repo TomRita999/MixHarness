@@ -7,7 +7,7 @@ from .client_rpc import executable
 from .clients import CLIENTS
 from .commands import default_models, new_session
 from .reasoning import api_levels, group_for
-from .store import STATUSES, new_id
+from .store import GOAL_STATES, MODES, STATUSES, new_id
 from .usage import plan_usage
 
 
@@ -24,7 +24,9 @@ COMMANDS = {
     "status": "查看会话状态", "usage": "[codex|antigravity|openai|gemini]　查看用量",
     "skills": "[on 名称|off 名称|add 目录|remove 目录]　配置技能",
     "context": "[auto|token 数]　设置上下文窗口", "compact": "压缩会话历史",
-    "settings": "查看技能与上下文设置", "plan": "[要求]　查看或制定方案",
+    "settings": "查看技能与上下文设置", "plan": "[要求]　进入只读计划模式或修订计划",
+    "mode": "[default|plan|goal]　查看或切换会话模式", "implement": "执行当前已制定的计划",
+    "goal": "[目标|status|pause|resume|clear]　设置、查看或管理持续目标",
     "review": "[关注点]　让 GPT 审查项目", "diff": "查看 Git 改动",
     "init": "阅读项目并更新 AGENTS.md", "mcp": "[codex|antigravity]　查看 MCP 服务",
     "approvals": "查看待批准操作", "approve": "审批编号　允许", "deny": "审批编号　拒绝",
@@ -189,10 +191,20 @@ def status_text(engine, session):
              "权限　" + PERMISSIONS[session["permission"]], *(f"{p}　{session[p]}  ·  {session['efforts'].get(p) or '默认'}" for p in CLIENTS)]
     if session["speed"] != "standard":
         lines.append("Codex 速度　" + SPEEDS[session["speed"]])
+    lines.append(MODES[session["mode"]])
+    if session["objective"]:
+        lines.append(goal_text(session))
     for row in engine.store.snapshot(session["id"])["tasks"]:
         if row["status"] != "obsolete":
             lines.append(f"{row['id']}  {row['title']}  {STATUSES[row['status']]}" + ("　" + row["error"] if row["error"] else ""))
     return "\n".join(lines)
+
+
+def goal_text(session):
+    if not session["objective"]:
+        return "尚未设置目标，用 /goal 加上希望达成的结果即可开始。"
+    return "\n".join(filter(None, [GOAL_STATES[session["goal_status"]] + " · " + session["objective"], session["goal_note"],
+                                      "下一步：" + session["goal_next"] if session["goal_next"] else ""]))
 
 
 async def execute_command(engine, args):
@@ -204,7 +216,9 @@ async def execute_command(engine, args):
         raise ValueError("未知指令 " + first + "，输入 /help 查看可用指令")
     sid, pid = args.get("id"), args.get("project_id")
     session = engine.store.session(sid) if sid else None
-    if not session and cmd in ("permissions", "backend", "model", "effort", "fast", "init", "plan", "review", "diff"):
+    if cmd == "mode" and arg and arg not in MODES:
+        raise ValueError("/mode " + COMMANDS["mode"])
+    if not session and cmd in ("permissions", "backend", "model", "effort", "fast", "init", "plan", "review", "diff", "mode", "goal"):
         options = dict(args)
         if cmd == "backend" and arg:
             if arg != options.get("backend"):
@@ -339,10 +353,10 @@ async def execute_command(engine, args):
         text = await diff(engine, session)
     elif cmd == "stop":
         with engine.store.db:
-            count = engine.store.db.execute("UPDATE jobs SET status='obsolete' WHERE sid=? AND status IN "
-                                            "('ready','running','waiting','needs_key')", (sid,)).rowcount
+            count = engine.store.stop_jobs(sid)
+            if session["goal_status"] == "active":
+                engine.store.db.execute("UPDATE sessions SET goal_status='paused',mode='default' WHERE id=?", (sid,))
             if count:
-                engine.store.db.execute("UPDATE sessions SET planned=revision WHERE id=?", (sid,))
                 engine.store.event(sid, "progress", "system", f"用户停止了 {count} 项任务")
         engine.notify(sid)
         text = f"已停止 {count} 项任务"
@@ -355,19 +369,34 @@ async def execute_command(engine, args):
             with path.open("x", encoding="utf-8") as f:
                 f.write(text + "\n")
             text = "会话已导出至 " + str(path)
-    elif cmd == "plan" and not arg:
-        text = "\n".join(name + "　" + session["brief"][k] for k, name in (
-            ("engineering", "开发与研究"), ("verification", "验证"), ("report", "报告")) if session["brief"].get(k)) or "当前尚未制定计划"
+    elif cmd in ("mode", "plan"):
+        target = "plan" if cmd == "plan" else arg
+        if target:
+            engine.store.change_mode(sid, target)
+            if cmd == "plan" and arg:
+                engine.submit(sid, arg, new_id())
+            engine.notify(sid)
+        text = MODES[engine.store.session(sid)["mode"]]
+    elif cmd == "implement":
+        engine.store.implement_plan(sid)
+        engine.notify(sid)
+        text = "已开始执行当前计划"
+    elif cmd == "goal":
+        if arg in ("pause", "resume", "clear"):
+            engine.store.goal_action(sid, arg)
+        elif arg and arg != "status":
+            engine.store.change_mode(sid, "goal", objective=arg)
+        engine.notify(sid)
+        text = goal_text(engine.store.session(sid))
     elif cmd == "init":
         request = "阅读项目文件，按构建方式、测试命令与已有约定在根目录创建或更新 AGENTS.md，保留现有规则。"
         engine.submit(sid, request, new_id())
         await engine.steer(sid, request)
         text = "已提交项目说明任务"
-    elif cmd in ("plan", "review"):
-        question = ("制定实施方案并列出验证点：" + arg if cmd == "plan"
-                    else "审查项目代码，指出具体文件、问题与依据。" + arg)
+    elif cmd == "review":
+        question = "审查项目代码，指出具体文件、问题与依据。" + arg
         with engine.store.db:
-            title = "制定方案" if cmd == "plan" else "代码审查"
+            title = "代码审查"
             jid = engine.store.enqueue(session, "verification", {"question": question, "direct": True}, title)
             engine.store.event(sid, "message", "user", (first + " " + arg).strip(),
                                {"job": jid, "direct": True, "revision": session["revision"]})

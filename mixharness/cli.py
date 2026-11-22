@@ -19,6 +19,7 @@ def parser():
     chat = sub.add_parser("chat", help="启动交互式命令行")
     chat.add_argument("id", nargs="?", help="继续已有会话")
     chat.add_argument("--standalone", action="store_true", help="使用独立工作目录")
+    chat.add_argument("--mode", choices=("default", "plan", "goal"), help="新会话的初始模式")
     cmd = sub.add_parser("command", help="执行单条斜杠指令")
     cmd.add_argument("line", help="例如 /help 或 '/context 32000'")
     cmd.add_argument("--session", dest="id", help="会话编号")
@@ -58,6 +59,7 @@ def parser():
                               ("status", "查看任务与成果"), ("wait", "等待任务完成")):
         cmd = sub.add_parser(name, help=description)
         if name in ("new", "run"):
+            cmd.add_argument("--mode", choices=("default", "plan", "goal"), default="default", help="会话模式")
             cmd.add_argument("--project-id", help="项目编号")
             cmd.add_argument("--backend", choices=("clients", "api"), default="clients")
             cmd.add_argument("--gemini", help="Gemini / Antigravity 模型 ID")

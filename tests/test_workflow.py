@@ -57,6 +57,78 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.store.session(self.sid)["revision"], 2)
         self.assertEqual(len(self.store.snapshot(self.sid)["events"]), 2)
 
+    def test_plan_revision_requires_explicit_implementation(self):
+        store = self.store
+        store.change_mode(self.sid, "plan")
+        store.message(self.sid, "为发布流程制定计划。", new_id())
+        first = self.start_job("proposal")
+        with self.assertRaises(ValueError):
+            asyncio.run(Engine(store, self.base, self.project).tool(first, {"name": "edit_file"}, None))
+        with store.db:
+            store.finish(first, "编译项目。", {})
+        self.assertEqual([j["kind"] for j in store.snapshot(self.sid)["tasks"]], ["proposal"])
+        store.message(self.sid, "加上测试步骤。", new_id())
+        with self.assertRaises(ValueError):
+            store.implement_plan(self.sid)
+        updated = self.start_job("proposal")
+        with store.db:
+            store.finish(updated, "编译项目，运行单元测试。", {})
+        branch = store.fork_session(self.sid, "发布方案的分支")
+        self.assertEqual(store.current_proposal(branch["id"]), store.current_proposal(self.sid))
+        store.implement_plan(self.sid)
+        with self.assertRaises(ValueError):
+            store.implement_plan(self.sid)
+        state = store.snapshot(self.sid)
+        self.assertEqual(state["session"]["mode"], "default")
+        self.assertEqual([j["kind"] for j in state["tasks"]], ["proposal", "proposal", "plan"])
+        self.assertIn("运行单元测试", state["events"][-1]["body"])
+
+    def test_goal_persists_and_ignores_review_after_pause(self):
+        store = self.store
+        objective = "核对项目声明的 Python 版本并给出文件依据。"
+        store.change_mode(self.sid, "goal", objective=objective)
+        self.requirements()
+        review = self.start_job("goal_check")
+        store.goal_action(self.sid, "pause")
+        with self.assertRaises(Superseded):
+            store.assess_goal(review, "complete", "过期结果", "")
+        store.db.close()
+        self.store = store = Store(self.dbpath)
+        self.assertEqual(store.session(self.sid)["goal_status"], "paused")
+        store.goal_action(self.sid, "resume")
+        self.requirements()
+        with store.db:
+            store.assess_goal(self.start_job("goal_check"), "continue", "缺少版本信息", "读取 pyproject.toml")
+        next_plan = self.start_job("plan")
+        self.assertEqual(next_plan["payload"]["followup"], "读取 pyproject.toml")
+        store.apply_plan(next_plan, {"engineering": objective}, "")
+        evidence = workspace.read_source(self.project, {"path": "pyproject.toml"})["text"]
+        version = next(line for line in evidence.splitlines() if line.startswith("requires-python"))
+        with store.db:
+            store.finish(self.start_job("engineering"), version, {})
+            store.assess_goal(self.start_job("goal_check"), "complete", version, "")
+            store.wake(self.sid)
+        state = store.session(self.sid)
+        self.assertEqual((state["mode"], state["goal_status"], state["objective"]), ("default", "complete", objective))
+        self.assertEqual(state["goal_note"], version)
+        self.assertFalse(store.rows("SELECT 1 FROM jobs WHERE status='ready'"))
+
+    def test_goal_stops_after_no_progress_or_planning_failure(self):
+        store = self.store
+        store.change_mode(self.sid, "goal", objective="确认发行包可用。")
+        self.requirements()
+        with store.db:
+            store.assess_goal(self.start_job("goal_check"), "continue", "没有构建记录", "构建发行包")
+        self.requirements()
+        with store.db:
+            store.assess_goal(self.start_job("goal_check"), "continue", "仍缺少产物", "生成新的发行包")
+        self.assertEqual(store.session(self.sid)["goal_status"], "blocked")
+        store.goal_action(self.sid, "resume")
+        with store.db:
+            store.finish(self.start_job("plan"), "客户端不可用", {}, success=False)
+        self.assertEqual(store.session(self.sid)["goal_note"], "客户端不可用")
+        self.assertFalse(store.rows("SELECT 1 FROM jobs WHERE status='ready'"))
+
     def test_scope_change_and_persistent_wait(self):
         engineering = "查看 pyproject.toml 中的依赖声明。"
         report = "将依赖整理为中文说明。"

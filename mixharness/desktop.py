@@ -2,10 +2,10 @@ import asyncio
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QProcess, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QPoint, QProcess, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QHeaderView, QInputDialog,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QHeaderView, QInputDialog,
     QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QSizePolicy, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 from .desktop_projects import ArchiveDialog, ProjectDialog
 from .desktop_agent import AgentDialog, ApprovalDialog
 from .agent_settings import PERMISSIONS, SPEEDS, available_speeds
-from .slash import execute_command
+from .slash import execute_command, goal_text
 from .desktop_clients import ClientHistory
 from .desktop_inputs import ComposerInputs
 from .desktop_usage import UsageDialog
@@ -24,7 +24,7 @@ from .desktop_widgets import (
 from .providers import MODELS
 from .clients import CLIENTS
 from .reasoning import LEVEL_NAMES, group_for, resolve_choice
-from .store import LABELS, STATUSES, new_id
+from .store import GOAL_STATES, LABELS, MODES, STATUSES, new_id
 
 
 USER_ROLE = Qt.ItemDataRole.UserRole
@@ -46,6 +46,7 @@ class Window(QMainWindow):
         self.versions = {}
         self.preview_text = ""
         self.history_key = None
+        self.inspector_rows = {}
         self.config_revision = engine.config_revision
         self.setWindowTitle("MixHarness")
         self.setWindowIcon(QIcon(str(RESOURCES / "app.png")))
@@ -133,6 +134,8 @@ class Window(QMainWindow):
         self.history = QTreeWidget()
         self.history.setAccessibleName("项目与会话")
         self.history.setColumnCount(2)
+        # 第二列仅承载操作按钮。辅助功能选择和键盘焦点都跟随标题单元格。
+        self.history.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self.history.header().setStretchLastSection(False)
         self.history.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.history.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
@@ -236,11 +239,7 @@ class Window(QMainWindow):
             pick.usage_requested.connect(self.show_usage)
             self.pickers[provider] = pick
             tools.addWidget(pick)
-        self.speed_box = QComboBox()
-        self.speed_box.setAccessibleName("GPT Fast 速度")
-        self.speed_box.setObjectName("flat")
-        self.speed_box.setToolTip("Codex 速度")
-        self.speed_box.currentIndexChanged.connect(self.change_speed)
+        self.speed_box = button("GPT Fast 速度", self.speed_menu, name="quiet")
         tools.addWidget(self.speed_box, 0, ALIGN.AlignBottom)
         tools.addStretch()
         self.backend_box = QComboBox()
@@ -261,6 +260,8 @@ class Window(QMainWindow):
         controls.addLayout(tools)
         col.addWidget(self.composer)
         foot = QHBoxLayout()
+        self.mode_button = button("会话模式", self.mode_menu, name="quiet")
+        foot.addWidget(self.mode_button)
         self.permission_box = QComboBox()
         self.permission_box.setAccessibleName("操作权限")
         self.permission_box.setToolTip("对应 Antigravity 的 Default / Auto / Turbo")
@@ -345,6 +346,7 @@ class Window(QMainWindow):
     def remember_expanded(self, item, expanded):
         if item.parent() is None and not self.filter.text().strip():
             self.settings.setValue("collapsed/" + (item.data(0, USER_ROLE) or "local"), not expanded)
+            self.select_history_row()
 
     def fill_history(self):
         query = self.filter.text().strip()
@@ -354,13 +356,15 @@ class Window(QMainWindow):
         chats = self.session_list(query)
         for chat in chats:
             by_project.setdefault(chat["project_id"], []).append(chat)
-        signature = (self.sid, self.pid, query, groups, chats,
-                     [self.settings.value("collapsed/" + (p["id"] or "local"), False, type=bool) for p in groups])
+        signature = (query, groups, [(s["id"], s["title"], s["project_id"], s["pinned"]) for s in chats])
         if signature == self.history_key:
+            self.select_history_row()
             return
         self.history_key = signature
         scroll = self.history.verticalScrollBar().value()
         with QSignalBlocker(self.history):
+            self.history.selectionModel().clear()
+            self.history_rows = {}
             self.history.clear()
             for project in groups:
                 pid, title = project["id"], project["name"]
@@ -371,21 +375,30 @@ class Window(QMainWindow):
                 group.setIcon(0, icon("pin" if project["pinned"] else ("folder" if pid else "chat")))
                 group.setToolTip(0, "\n".join(f["path"] for f in project["folders"]) or title)
                 group.setData(0, USER_ROLE, pid)
+                self.history_rows[("project", pid)] = group
                 self.add_row_actions(group, pid, project=True)
-                if self.sid is None and pid == self.pid:
-                    self.history.setCurrentItem(group)
                 for session in visible:
                     item = QTreeWidgetItem(group, [session["title"]])
                     item.setToolTip(0, session["title"])
                     item.setData(0, USER_ROLE, session["id"])
+                    self.history_rows[("chat", session["id"])] = item
                     if session["pinned"]:
                         item.setIcon(0, icon("pin"))
                     self.add_row_actions(item, session["id"], project=False)
-                    if session["id"] == self.sid:
-                        self.history.setCurrentItem(item)
                 collapsed = self.settings.value("collapsed/" + (pid or "local"), False, type=bool)
                 group.setExpanded(bool(query) or not collapsed)
+            self.history.doItemsLayout()
+            self.select_history_row()
         self.history.verticalScrollBar().setValue(scroll)
+
+    def select_history_row(self):
+        key = ("chat", self.sid) if self.sid else ("project", self.pid)
+        item = self.history_rows.get(key)
+        if item is not None and item.parent() is not None and not item.parent().isExpanded():
+            item = item.parent()
+        if item is not None and item != self.history.currentItem():
+            with QSignalBlocker(self.history):
+                self.history.setCurrentItem(item, 0)
 
     def add_row_actions(self, item, identifier, *, project):
         row = QWidget()
@@ -757,6 +770,7 @@ class Window(QMainWindow):
             self.save_draft()
         self.pid, self.sid = pid, sid
         self.draft_permission, self.draft_speed = "ask", "standard"
+        self.draft_mode = self.settings.value("mode/" + self.draft_key(), "default")
         self.settings.setValue("project", pid or "")
         self.settings.setValue("session", sid or "")
         self.settings.setValue("recent/" + (pid or "local"), sid or "")
@@ -825,8 +839,10 @@ class Window(QMainWindow):
                 data = catalog.view()
                 model = picker.model
                 if not self.sid and data["source"] == "client" and model not in data["models"]:
-                    model = next(iter(data["models"]), "")
-                    self.settings.setValue(self.model_key(provider), model)
+                    preferred = self.settings.value(self.model_key(provider), "")
+                    model = preferred if preferred in data["models"] else next(iter(data["models"]), "")
+                    if model:
+                        self.settings.setValue(self.model_key(provider), model)
                 effort = (self.engine.store.session(self.sid)["efforts"].get(provider, "") if self.sid
                           else self.preferred_efforts(self.backend_box.currentData(), {}, {provider: model})[provider])
                 picker.select(model, data, effort)
@@ -841,12 +857,19 @@ class Window(QMainWindow):
         ready = self.backend_box.currentData() != "clients" or all(
             p.model in p.catalog.get("models", []) for p in self.pickers.values())
         text = self.editor.toPlainText().strip()
-        self.send_button.setEnabled(bool(text or self.inputs.items) and (ready or (text.startswith("/") and not self.inputs.items))
+        has_input = bool(text) or bool(self.inputs.items) and not self.needs_goal_text()
+        self.send_button.setEnabled(has_input and (ready or (text.startswith("/") and not self.inputs.items))
                                     and self.backend_task is None)
+
+    def needs_goal_text(self):
+        if self.sid:
+            session = self.engine.store.session(self.sid)
+            return session["mode"] == "goal" and not session["objective"]
+        return self.draft_mode == "goal"
 
     def send(self):
         text = self.editor.toPlainText().strip()
-        if not (text or self.inputs.items) or self.backend_task:
+        if self.backend_task or not text and (not self.inputs.items or self.needs_goal_text()):
             return
         if text.startswith("/") and not self.inputs.items:
             self.send_command(text)
@@ -862,7 +885,7 @@ class Window(QMainWindow):
             models = [self.pickers[provider].model for provider in ("gemini", "openai")]
             sid = self.engine.create_session(*models, project_id=self.pid, standalone=self.pid is None,
                                              backend=self.backend_box.currentData(),
-                                             permission=self.draft_permission, speed=self.draft_speed,
+                                             permission=self.draft_permission, speed=self.draft_speed, mode=self.draft_mode,
                                              efforts={p: picker.effort for p, picker in self.pickers.items()})["id"]
         seq, changed = self.engine.submit(sid, text, new_id(), draft=self.draft_key())
         if changed and self.engine.steering:
@@ -875,6 +898,7 @@ class Window(QMainWindow):
             self.save_draft()
             self.refresh()
         else:
+            self.settings.remove("mode/" + self.draft_key())
             self.select_session(sid)
 
     def refresh(self, force=False):
@@ -922,6 +946,7 @@ class Window(QMainWindow):
             self.timeline.update_events(self.state["events"], THEMES[self.theme])
             self.fill_inspector()
             self.refresh_access()
+            self.refresh_mode()
             self.update_status()
             self.editor_changed()
             if changed_backend and self.isVisible():
@@ -986,23 +1011,33 @@ class Window(QMainWindow):
 
     def fill_inspector(self):
         for widget, key in ((self.tasks, "tasks"), (self.assets, "artifacts")):
+            rows = [(r["id"], r["title"], r["status"], r["model"], r["effort"]) if key == "tasks"
+                    else (r["id"], r["name"]) for r in self.state[key]]
+            if rows == self.inspector_rows.get(key):
+                continue
+            self.inspector_rows[key] = rows
             current = widget.currentItem()
             selected = current.data(USER_ROLE) if current else None
+            entries = list(reversed(self.state[key]))
+            same_items = [widget.item(i).data(USER_ROLE) for i in range(widget.count())] == [r["id"] for r in entries]
             with QSignalBlocker(widget):
-                widget.clear()
-                for entry in reversed(self.state[key]):
+                if not same_items:
+                    widget.selectionModel().clear()
+                    widget.clear()
+                for index, entry in enumerate(entries):
                     if key == "tasks":
                         title = entry["title"] + "\n" + STATUSES[entry["status"]] + " · " + entry["model"]
                         if entry["effort"]:
                             title += " · " + LEVEL_NAMES.get(entry["effort"], entry["effort"])
                     else:
                         title = entry["name"]
-                    item = QListWidgetItem(title)
-                    item.setData(USER_ROLE, entry["id"])
+                    item = widget.item(index) if same_items else QListWidgetItem(widget)
+                    item.setText(title)
                     item.setToolTip(title)
-                    widget.addItem(item)
-                    if entry["id"] == selected:
-                        widget.setCurrentItem(item)
+                    if not same_items:
+                        item.setData(USER_ROLE, entry["id"])
+                        if entry["id"] == selected:
+                            widget.setCurrentItem(item)
                 if widget.count() == 0:
                     item = QListWidgetItem("暂无任务" if key == "tasks" else "暂无成果")
                     item.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -1083,12 +1118,7 @@ class Window(QMainWindow):
             speed = self.draft_speed = "standard"
             if self.sid:
                 self.engine.set_access(self.sid, speed=speed)
-        with QSignalBlocker(self.speed_box):
-            self.speed_box.clear()
-            for key in ("standard", *speeds):
-                self.speed_box.addItem({"standard": "Fast 关", "fast": "Fast 开"}.get(key, SPEEDS[key]), key)
-            self.speed_box.setCurrentIndex(max(0, self.speed_box.findData(speed)))
-        self.speed_box.setEnabled(bool(speeds) and self.backend_task is None)
+        self.speed_box.setText({"standard": "Fast 关", "fast": "Fast 开", "ultrafast": "Ultrafast"}[speed] + " ▾")
         if not native:
             reason = "切换到本机客户端即可查看 Codex 加速档位"
         elif self.backend_task or self.pickers["openai"].loading:
@@ -1097,6 +1127,60 @@ class Window(QMainWindow):
             reason = catalog.error or ("Codex 速度" if speeds else "当前账户或模型未提供加速档位")
         self.speed_box.setToolTip(reason)
 
+    def popup_choices(self, control, menu):
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        menu.popup(control.mapToGlobal(QPoint(0, -menu.sizeHint().height() - 3)))
+
+    def speed_menu(self):
+        menu = QMenu(self)
+        menu.setAccessibleName("Codex 速度")
+        native = self.backend_box.currentData() == "clients"
+        if self.backend_task:
+            menu.addAction("正在读取本机客户端…").setEnabled(False)
+        elif not native:
+            menu.addAction("切换到本机客户端并开启 Fast", self.enable_native_fast)
+        else:
+            catalog = self.engine.client_catalogs["openai"]
+            speeds = available_speeds(group_for(catalog.groups, self.pickers["openai"].model))
+            current = self.engine.store.session(self.sid)["speed"] if self.sid else self.draft_speed
+            for key in ("standard", *speeds):
+                action = menu.addAction("关闭 Fast" if key == "standard" else "开启 " + SPEEDS[key])
+                action.setCheckable(True)
+                action.setChecked(key == current)
+                action.triggered.connect(lambda _, tier=key: self.change_speed(tier))
+            if not speeds:
+                menu.addSeparator()
+                menu.addAction(catalog.error or ("当前模型未提供加速档位" if catalog.groups else "正在读取模型目录")).setEnabled(False)
+                menu.addAction("选择 GPT 模型…", self.pickers["openai"].open_models)
+                menu.addAction("刷新 Codex 模型", lambda: self.refresh_catalog("openai"))
+        self.popup_choices(self.speed_box, menu)
+
+    def enable_native_fast(self):
+        sid = self.sid
+        async def enable():
+            try:
+                await asyncio.gather(*(c.refresh() for c in self.engine.client_catalogs.values()))
+                session = self.engine.store.session(sid) if sid else {}
+                models = self.preferred_models("clients", session)
+                for p, catalog in self.engine.client_catalogs.items():
+                    if not models[p]:
+                        raise ValueError(catalog.error or "客户端模型目录为空")
+                self.engine.validate_access("clients", models["openai"], self.permission_box.currentData(), "fast")
+                if sid:
+                    self.engine.switch_backend(sid, "clients", models, self.preferred_efforts("clients", session, models))
+                    self.engine.set_access(sid, speed="fast")
+                else:
+                    self.settings.setValue("backend", "clients")
+                    self.draft_speed = "fast"
+            except (OSError, ValueError, RuntimeError) as exc:
+                self.command_detail("无法开启 Fast", str(exc))
+            finally:
+                if self.backend_task is asyncio.current_task():
+                    self.backend_task = None
+                    self.refresh(force=True)
+        self.backend_task = self.run_task(enable())
+        self.refresh(force=True)
+
     def change_permission(self):
         mode = self.permission_box.currentData()
         if self.sid:
@@ -1104,12 +1188,70 @@ class Window(QMainWindow):
         else:
             self.draft_permission = mode
 
-    def change_speed(self):
-        speed = self.speed_box.currentData()
+    def change_speed(self, speed):
         if self.sid:
             self.engine.set_access(self.sid, speed=speed)
         else:
             self.draft_speed = speed
+        self.refresh_access()
+
+    def refresh_mode(self):
+        session = self.state["session"]
+        mode = session["mode"] if self.sid else self.draft_mode
+        text = MODES[mode]
+        if mode == "goal" and session.get("goal_status"):
+            text = "目标 · " + GOAL_STATES[session["goal_status"]]
+        self.mode_button.setText(text + " ▾")
+        self.mode_button.setToolTip((session.get("objective") if mode == "goal" else "") or text)
+        self.editor.setPlaceholderText({"plan": "描述想解决的问题，或补充计划要求…", "goal": "输入要达成的目标，或补充验收条件…",
+                                        "default": "输入消息，或用 / 调用指令…"}[mode])
+
+    def mode_menu(self):
+        session = self.state["session"]
+        mode = session["mode"] if self.sid else self.draft_mode
+        menu = QMenu(self)
+        menu.setAccessibleName("会话模式")
+        for key, title in MODES.items():
+            action = menu.addAction(title)
+            action.setCheckable(True)
+            action.setChecked(key == mode)
+            action.triggered.connect(lambda _, value=key: self.select_mode(value))
+        if self.sid and mode == "plan":
+            menu.addSeparator()
+            action = menu.addAction("执行当前计划", lambda: self.mode_action("implement"))
+            action.setEnabled(bool(self.engine.store.current_proposal(self.sid)))
+        if self.sid and session["objective"]:
+            menu.addSeparator()
+            menu.addAction("查看目标", lambda: self.command_detail("当前目标", goal_text(session)))
+            status = session["goal_status"]
+            if status in ("active", "paused", "blocked"):
+                verb = "pause" if status == "active" else "resume"
+                menu.addAction("暂停目标" if verb == "pause" else "继续目标", lambda: self.mode_action(verb))
+            menu.addAction("清除目标", lambda: self.mode_action("clear"))
+        self.popup_choices(self.mode_button, menu)
+
+    def select_mode(self, mode):
+        if self.sid:
+            self.engine.store.change_mode(self.sid, mode)
+            self.engine.notify(self.sid)
+            self.refresh()
+        else:
+            self.draft_mode = mode
+            self.settings.setValue("mode/" + self.draft_key(), mode)
+            self.refresh_mode()
+            self.editor_changed()
+        self.editor.setFocus()
+
+    def mode_action(self, action):
+        try:
+            if action == "implement":
+                self.engine.store.implement_plan(self.sid)
+            else:
+                self.engine.store.goal_action(self.sid, action)
+        except ValueError as exc:
+            self.command_detail("会话模式", str(exc))
+        self.engine.notify(self.sid)
+        self.refresh()
 
     def send_command(self, text):
         sid, pid = self.sid, self.pid
@@ -1120,7 +1262,8 @@ class Window(QMainWindow):
             return
         options = dict(line=text, id=sid, project_id=pid, cwd=str(self.engine.skill_folders(sid, pid)[0]),
                        backend=self.backend_box.currentData(), permission=self.permission_box.currentData(),
-                       speed=self.speed_box.currentData() or "standard", standalone=pid is None)
+                       speed=self.engine.store.session(sid)["speed"] if sid else self.draft_speed,
+                       mode=self.engine.store.session(sid)["mode"] if sid else self.draft_mode, standalone=pid is None)
         for p, picker in self.pickers.items():
             options[p] = picker.model
             options[p + "_effort"] = picker.effort

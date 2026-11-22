@@ -122,7 +122,7 @@ class Engine:
         return {p: m for p, (m, _) in choices.items()}, {p: e for p, (_, e) in choices.items()}
 
     def create_session(self, gemini, openai, directory=None, *, project_id=None, standalone=False, backend="api",
-                       efforts=None, permission="ask", speed="standard"):
+                       efforts=None, permission="ask", speed="standard", mode="default"):
         models, efforts = self.resolve_models(backend, {"gemini": gemini, "openai": openai}, efforts)
         self.validate_access(backend, models["openai"], permission, speed)
         sid = new_id()
@@ -139,7 +139,7 @@ class Engine:
         else:
             root = self.home / "projects" / sid
             root.mkdir(parents=True)
-        return self.store.create(sid, root, models["gemini"], models["openai"], project_id, backend, efforts, permission, speed)
+        return self.store.create(sid, root, models["gemini"], models["openai"], project_id, backend, efforts, permission, speed, mode)
 
     def validate_access(self, backend, model, permission, speed):
         if permission not in PERMISSIONS:
@@ -240,6 +240,8 @@ class Engine:
         self.notify(sid)
 
     async def native_approval(self, job, source, title, details):
+        if job["kind"] in ("proposal", "goal_check"):
+            return False
         if self.store.session(job["sid"])["permission"] != job["permission"]:
             return False
         if job["permission"] == "full":
@@ -309,9 +311,13 @@ class Engine:
             raise KeyError("任务不存在")
         if job["status"] not in ("failed", "needs_key"):
             raise ValueError("该任务当前无需重试")
+        s = self.store.session(sid)
+        if (s["mode"] == "plan") != (job["kind"] == "proposal"):
+            raise ValueError("当前模式无法重试这项任务")
+        if job["kind"] == "goal_check" and (s["mode"] != "goal" or s["goal_status"] != "active"):
+            raise ValueError("请先继续目标，再核对进度")
         with self.store.db:
             self.store.db.execute("UPDATE jobs SET status='ready',error='' WHERE id=?", (jid,))
-            s = self.store.session(sid)
             if job["kind"] in ("verification", "engineering") and s["brief"]["report"] and not self.store.rows(
                 "SELECT id FROM jobs WHERE sid=? AND kind='report' AND status IN ('ready','waiting','running','needs_key')", sid
             ):
@@ -440,7 +446,7 @@ class Engine:
                         task.cancel()
                 ready = self.store.rows(
                     "SELECT j.*,s.backend FROM jobs j JOIN sessions s ON s.id=j.sid "
-                    "WHERE j.status IN ('ready','needs_key') AND (j.kind='plan' OR s.planned=s.revision) "
+                    "WHERE j.status IN ('ready','needs_key') AND (j.kind IN ('plan','goal_check') OR s.planned=s.revision) "
                     "ORDER BY (j.kind='plan') DESC,j.rowid"
                 )
                 for job in ready:
@@ -478,7 +484,7 @@ class Engine:
     async def gate(self, job):
         while True:
             session = self.store.guard(job)
-            if job["kind"] == "plan" or session["revision"] == session["planned"]:
+            if job["kind"] in ("plan", "goal_check") or session["revision"] == session["planned"]:
                 return session
             await asyncio.sleep(0.1)
 
@@ -504,6 +510,9 @@ class Engine:
         context = {"当前需求": session["brief"], "需求版本": session["versions"], "本次任务": job["payload"],
                    "共享记录": history, "任务": works, "可读取的成果": assets,
                    "各来源文件夹的验证命令": self.checks(self.sources(session))}
+        if session["mode"] == "goal" and session["objective"]:
+            context["持续目标"] = session["objective"]
+            context["上次目标核对"] = session["goal_note"]
         attached = self.store.inputs.for_session(sid, max(request["seen"], session["context_after"]))
         latest = next((e["seq"] for e in reversed(history) if e["from"] == "user"), None)
         if attached:
@@ -621,6 +630,8 @@ class Engine:
             if job["kind"] == "plan":
                 self.store.apply_plan(job, reply.model_dump(), reply.reply)
                 return
+            if job["kind"] == "goal_check" and not reply.calls:
+                raise ValueError("目标核对没有返回完成依据或下一步，请恢复目标以重新核对")
             if not reply.calls and not reply.text.strip():
                 raise ValueError("模型没有返回正文或工具调用")
             if job["kind"] == "report" and not reply.calls:
@@ -686,6 +697,18 @@ class Engine:
         sid, jid = job["sid"], job["id"]
         st = self.store
         originals = self.sources(st.session(sid))
+        if name == "assess_goal":
+            with st.db:
+                st.tool_result(call, args)
+                st.assess_goal(job, args["status"], args["evidence"], args["next_step"])
+            raise Superseded()
+        if name == "ask_clarification":
+            with st.db:
+                st.guard(job)
+                st.tool_result(call, args)
+                st.db.execute("UPDATE jobs SET payload=? WHERE id=?", (pack(dict(job["payload"], needs_input=True)), jid))
+                st.finish(job, args["question"], {"needs_input": True})
+            raise Superseded()
         if name == "request_verification":
             with st.db:
                 st.request_verification(job, call)

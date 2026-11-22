@@ -96,9 +96,10 @@ class Rpc:
                 return message["result"]
             await self.dispatch(message, notify)
 
-    async def initialize(self, client):
+    async def initialize(self, client, *, experimental=False):
         if client == "codex":
-            result = await self.request("initialize", {"clientInfo": {"name": "mixharness", "version": "0.7.0"}})
+            result = await self.request("initialize", {"clientInfo": {"name": "mixharness", "version": "0.7.0"},
+                                                       "capabilities": {"experimentalApi": experimental}})
             await self.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
             return result
         return await self.request("initialize", {"protocolVersion": 1, "clientCapabilities": {},

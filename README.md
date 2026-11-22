@@ -29,7 +29,9 @@ MixHarness 就是为了解决这两个问题设计的：
 - **文件安全与快照隔离**：
   - 工程修改文件前会核对读取时的 SHA256，防止覆盖你在编辑期间手动改过的代码；
   - 验证命令都在 `.mixharness/snapshots` 的独立文件副本里执行，不会在原代码目录留下临时缓存或测试垃圾；如果验证期间你又改了源码，引擎会自动作废旧结果并按新文件重测；
-  - 输入框下方支持三档权限（**请求批准** / **帮我批准** / **完全访问**，对应 Antigravity 的 Default / Auto / Turbo）。使用本机客户端时，GPT 模型旁可以切换 **Fast**。可选档位来自 Codex；**Ultrafast** 还需要 Pro 200 或以上套餐。
+  - 输入框下方支持三档权限（**请求批准** / **帮我批准** / **完全访问**，对应 Antigravity 的 Default / Auto / Turbo）。点 GPT 模型旁的 **Fast 关** 可查看 Codex 提供的档位。在 API 会话里，菜单提供「切换到本机客户端并开启 Fast」。**Ultrafast** 还需要 Pro 200 或以上套餐。
+  - 在输入框下方选择**计划模式**，GPT 会只读检查项目，提出步骤和验收条件。你可以发消息修订方案，确认后点「执行当前计划」。本机客户端使用 Codex 原生计划模式。
+  - 选择**目标模式**后，第一条消息就是当前会话要达成的目标。每轮工作结束时，GPT 会核对交付结果，记录依据，继续未完成的步骤，或说明还需要你补充什么。模式菜单里可以查看、暂停和继续目标，进度保存在会话库中。
   - 点发送键旁的 **＋** 可以添加图片、引用 MixHarness / Codex / Antigravity 会话、指定工具或使用本次消息的技能。会话引用保存最近 32 条可读取消息的文字节选，最多 24,000 字。点附件可以预览，点 × 可以移除。
   - 图片也可以直接粘贴或拖进输入框，支持 PNG、JPEG、WebP。命令行使用 `mixharness run --image 截图.png "请分析这张图"`，也可以用 `mixharness send 会话编号 --image 截图.png` 给已有会话补图。
 
@@ -70,7 +72,8 @@ python start.py
 | --- | --- |
 | 会话与项目 | `/new`、`/resume`、`/history 关键词`、`/rename 名称`、`/fork 名称`、`/project 目录`、`/add-dir 目录` |
 | 模型与权限 | `/model gemini`、`/effort openai high`、`/permissions auto`、`/backend clients`、`/usage codex` |
-| 开发与审查 | `/init`（维护 `AGENTS.md`）、`/plan 要求`、`/review 关注点`、`/diff` |
+| 开发与审查 | `/init`（维护 `AGENTS.md`）、`/plan 要求`、`/implement`、`/review 关注点`、`/diff` |
+| 模式与目标 | `/mode default`、`/goal 目标描述`、`/goal status`、`/goal pause`、`/goal resume`、`/goal clear` |
 | 任务与控制 | `/status`、`/approvals`、`/approve 编号`、`/deny 编号`、`/stop`、`/retry 任务编号`、`/export 路径` |
 | 技能与上下文 | `/settings`、`/skills`、`/context 64000`、`/compact`、`/tools`、`/mcp antigravity` |
 

@@ -60,7 +60,19 @@ class WritingTask(Arguments):
     instructions: str = Field(min_length=1)
 
 
+class GoalAssessment(Arguments):
+    status: Literal["complete", "continue", "blocked"]
+    evidence: str = Field(min_length=1, description="核对依据，受阻时写明还需要用户提供什么。")
+    next_step: str = Field(default="", description="继续时填写可执行的下一步。")
+
+
+class Clarification(Arguments):
+    question: str = Field(min_length=1)
+
+
 FUNCTIONS = {
+    "assess_goal": (GoalAssessment, "根据本轮实际交付与验证记录更新目标进度。"),
+    "ask_clarification": (Clarification, "向用户提出制定计划前必须回答的问题。"),
     "list_files": (Arguments, "列出项目文件与已注册的验证命令。"),
     "read_file": (ReadFile, "读取 UTF-8 文件内容与 SHA256 摘要。"),
     "edit_file": (EditFile, "编辑 UTF-8 文件，传入读取时的摘要与完整新内容（新建文件摘要传空字符串）。"),
@@ -71,6 +83,8 @@ FUNCTIONS = {
     "draft_section": (WritingTask, "并行起草已有足够资料的独立章节。"),
 }
 TOOLS = {
+    "proposal": ["list_files", "read_file", "read_artifact", "ask_clarification"],
+    "goal_check": ["list_files", "read_file", "read_artifact", "assess_goal"],
     "engineering": ["list_files", "read_file", "edit_file", "run_check", "read_artifact"],
     "verification": ["list_files", "read_file", "run_check", "read_artifact"],
     "report": ["read_artifact", "save_section", "draft_section", "request_verification"],
@@ -78,13 +92,19 @@ TOOLS = {
 }
 
 PROMPTS = {
+    "proposal": "你正在计划模式中。只读检查项目，和用户讨论可执行的步骤、验收条件和必要的取舍。"
+                "先了解项目再写计划。遇到决定方案的关键信息缺口时用 ask_clarification 提问。用中文给出计划，等待用户选择执行。",
+    "goal_check": "核对共享会话里的持续目标与最新补充。检查当前结果、工程记录和相关验证。"
+                  "所有条件均有实际依据时调用 assess_goal 标为 complete，并写明依据。"
+                  "还有可做的工作时标为 continue 并写明具体下一步。确实需要外部信息或用户决定时标为 blocked 并说明需求。"
+                  "每次核对以 assess_goal 结束。",
     "plan": """解析共享会话中的最新用户消息，按当前需求输出变更：
 engineering 为 GPT 负责的开发或研究任务，verification 为需要单独执行的验证条件，report 为 Gemini 负责的写作或汇总要求。
 未变化的字段返回 null；有修改时返回完整的新要求；明确取消时返回空字符串。
 首次提问按需填写对应字段；需要输出说明、报告或解释工程结果时填写 report。
 若用户让写作者在缺数据时自行发起验证，将该要求放入 report，verification 保持不变；仅调整读者或篇幅时只更新 report。
 纯状态询问在 reply 中简短作答，各任务字段返回 null。
-用户要求重跑或已手动改过文件时，将对应任务类型填入 rerun。reply 可留空。""",
+用户要求重跑或已手动改过文件时，将对应任务类型填入 rerun。若本次任务含 followup，安排完成该目标步骤所需的工作，已有要求需要再执行时填写 rerun。reply 可留空。""",
     "engineering": """你负责会话中的工程开发与技术研究。用工具先读文件再修改，运行验证命令检查改动。
 研究与推导需写明前提和依据。完成后用简洁自然的中文说明改动内容与验证结果，避免套话和防御性免责声明。""",
     "verification": """你负责针对具体问题做验证。检查项目快照、运行验证命令或核对资料来源，如实给出方法、结果与结论。

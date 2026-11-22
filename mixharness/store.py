@@ -12,13 +12,19 @@ from .reasoning import LEVELS
 SCOPES = ("engineering", "verification", "report")
 DEPENDS = {
     "plan": (),
+    "proposal": (),
+    "goal_check": (),
     "engineering": ("engineering",),
     "verification": ("engineering", "verification"),
     "report": SCOPES,
     "section": SCOPES,
 }
-PROVIDERS = {"plan": "gemini", "report": "gemini", "section": "gemini", "engineering": "openai", "verification": "openai"}
-LABELS = {"plan": "解析需求", "engineering": "开发与研究", "verification": "验证", "report": "撰写报告", "section": "撰写章节"}
+PROVIDERS = {"plan": "gemini", "report": "gemini", "section": "gemini", "engineering": "openai",
+             "verification": "openai", "proposal": "openai", "goal_check": "openai"}
+LABELS = {"plan": "解析需求", "engineering": "开发与研究", "verification": "验证", "report": "撰写报告",
+          "section": "撰写章节", "proposal": "制定计划", "goal_check": "核对目标"}
+MODES = {"default": "默认模式", "plan": "计划模式", "goal": "目标模式"}
+GOAL_STATES = {"": "待设置", "active": "进行中", "paused": "已暂停", "blocked": "需要补充", "complete": "已完成"}
 STATUSES = {"ready": "待执行", "running": "进行中", "needs_key": "等待密钥", "waiting": "等待中",
             "done": "已完成", "failed": "失败", "obsolete": "已跳过"}
 JSON_FIELDS = {"brief", "versions", "basis", "payload", "args", "result", "meta", "backend_models", "efforts"}
@@ -118,6 +124,11 @@ class Store:
                     if field not in columns:
                         self.db.execute(f"ALTER TABLE {table} ADD COLUMN {field} INTEGER NOT NULL DEFAULT 0")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(sessions)")}
+            if "mode" not in columns:
+                self.db.execute("ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'default'")
+            for field in ("objective", "goal_status", "goal_note", "goal_next"):
+                if field not in columns:
+                    self.db.execute(f"ALTER TABLE sessions ADD COLUMN {field} TEXT NOT NULL DEFAULT ''")
             if "backend" not in columns:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN backend TEXT NOT NULL DEFAULT 'api'")
             if "antigravity_session" not in columns:
@@ -350,21 +361,26 @@ class Store:
             (sid, kind, actor, body, pack(meta or {}), stamp, client_id),
         ).lastrowid
 
-    def create(self, sid, workspace, gemini, openai, project_id=None, backend="api", efforts=None, permission="ask", speed="standard"):
+    def create(self, sid, workspace, gemini, openai, project_id=None, backend="api", efforts=None,
+               permission="ask", speed="standard", mode="default"):
         if backend not in ("api", "clients"):
             raise ValueError("未知的执行方式")
+        if mode not in MODES:
+            raise ValueError("请选择默认、计划或目标模式")
         with self.db:
             if project_id is None and workspace != self.home / "projects" / sid:
                 project_id = self._register_folder(Path(workspace))
             self.db.execute(
-                "INSERT INTO sessions(id,title,workspace,gemini,openai,brief,versions,updated,project_id,backend,efforts,permission,speed) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO sessions(id,title,workspace,gemini,openai,brief,versions,updated,project_id,backend,efforts,permission,speed,mode) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (sid, "新会话", str(workspace), gemini, openai, pack(dict.fromkeys(SCOPES, "")),
-                 pack(dict.fromkeys(SCOPES, 0)), now(), project_id, backend, pack(efforts or {}), permission, speed),
+                 pack(dict.fromkeys(SCOPES, 0)), now(), project_id, backend, pack(efforts or {}), permission, speed, mode),
             )
         return self.session(sid)
 
     def enqueue(self, session, kind, payload=None, title=None):
+        if session["mode"] == "plan" and kind != "proposal":
+            raise ValueError("请先退出计划模式或选择执行计划")
         jid = new_id()
         basis = {key: session["versions"][key] for key in DEPENDS[kind]}
         provider = PROVIDERS[kind]
@@ -385,37 +401,154 @@ class Store:
         branch = new_id()
         with self.db:
             self.db.execute("INSERT INTO sessions(id,title,workspace,gemini,openai,brief,versions,updated,project_id,"
-                            "backend,efforts,revision,planned) SELECT ?,?,workspace,gemini,openai,brief,versions,?,"
-                            "project_id,backend,efforts,revision,planned FROM sessions WHERE id=?", (branch, name, now(), sid))
+                            "backend,efforts,revision,planned,mode,objective,goal_status,goal_note) "
+                            "SELECT ?,?,workspace,gemini,openai,brief,versions,?,project_id,backend,efforts,revision,revision,"
+                            "CASE WHEN mode='goal' THEN 'default' ELSE mode END,objective,"
+                            "CASE WHEN goal_status='active' THEN 'paused' ELSE goal_status END,goal_note FROM sessions WHERE id=?",
+                            (branch, name, now(), sid))
             for event in self.db.execute("SELECT seq,kind,actor,body,meta,at FROM events WHERE sid=? AND kind='message' ORDER BY seq", (sid,)):
                 seq = self.db.execute("INSERT INTO events(sid,kind,actor,body,meta,at) VALUES(?,?,?,?,?,?)",
                                       (branch, event["kind"], event["actor"], event["body"],
                                        event["meta"] if event["actor"] == "user" else "{}", event["at"])).lastrowid
                 self.db.execute("INSERT INTO message_inputs SELECT ?,item FROM message_inputs WHERE seq=? ORDER BY rowid",
                                 (seq, event["seq"]))
+            if self.current_proposal(sid):
+                self.db.execute("INSERT INTO jobs(id,sid,kind,title,model,effort,basis,payload,status,draft,at) "
+                                "SELECT ?,?,kind,title,model,effort,basis,payload,status,draft,at FROM jobs "
+                                "WHERE sid=? AND kind='proposal' ORDER BY rowid DESC LIMIT 1", (new_id(), branch, sid))
             self.event(branch, "progress", "system", "从原会话创建分支", {"source_session": sid})
         return self.session(branch)
 
     def message(self, sid, body, client_id, *, draft=None, attachments=()):
         with self.db:
-            session = self.session(sid)
-            sent = self.rows("SELECT seq FROM events WHERE sid=? AND client_id=?", sid, client_id)
-            if sent:
-                return sent[0]["seq"]
-            staged = self.inputs.metadata(draft) if draft else []
-            if not body.strip() and not attachments and not staged:
-                raise ValueError("请输入消息或添加附件")
-            rev = session["revision"] + 1
-            seq = self.event(sid, "message", "user", body, {"revision": rev}, client_id)
-            self.inputs.commit_message(seq, draft, attachments)
-            title = session["title"]
-            if rev == 1 and title == "新会话":
-                title = (body.strip().splitlines()[0] if body.strip() else
-                         (staged[0]["name"] if staged else attachments[0].name))[:36]
-            self.db.execute("UPDATE sessions SET revision=?,title=? WHERE id=?", (rev, title, sid))
-            self.db.execute("UPDATE jobs SET status='obsolete' WHERE sid=? AND kind='plan' AND status!='done'", (sid,))
+            return self._message(sid, body, client_id, draft, attachments)
+
+    def _message(self, sid, body, client_id, draft=None, attachments=()):
+        session = self.session(sid)
+        sent = self.rows("SELECT seq FROM events WHERE sid=? AND client_id=?", sid, client_id)
+        if sent:
+            return sent[0]["seq"]
+        staged = self.inputs.metadata(draft) if draft else []
+        if not body.strip() and not attachments and not staged:
+            raise ValueError("请输入消息或添加附件")
+        rev = session["revision"] + 1
+        seq = self.event(sid, "message", "user", body, {"revision": rev}, client_id)
+        self.inputs.commit_message(seq, draft, attachments)
+        title = session["title"]
+        if rev == 1 and title == "新会话":
+            title = (body.strip().splitlines()[0] if body.strip() else
+                     (staged[0]["name"] if staged else attachments[0].name))[:36]
+        self.db.execute("UPDATE sessions SET revision=?,title=? WHERE id=?", (rev, title, sid))
+        self.db.execute("UPDATE jobs SET status='obsolete' WHERE sid=? AND kind IN ('plan','proposal','goal_check') "
+                        "AND status NOT IN ('done','obsolete')", (sid,))
+        if session["mode"] == "plan":
+            self.db.execute("UPDATE sessions SET planned=revision WHERE id=?", (sid,))
+            self.enqueue(session, "proposal", {"revision": rev})
+        else:
+            if session["mode"] == "goal":
+                if not session["objective"] and not body.strip():
+                    raise ValueError("请用文字说明要达成的目标")
+                self.db.execute("UPDATE sessions SET objective=CASE WHEN objective='' THEN ? ELSE objective END,"
+                                "goal_status='active',goal_next='' WHERE id=?", (body.strip(), sid))
             self.enqueue(session, "plan", {"revision": rev})
-            return seq
+        return seq
+
+    def stop_jobs(self, sid):
+        count = self.db.execute("UPDATE jobs SET status='obsolete' WHERE sid=? AND status IN "
+                                "('ready','running','waiting','needs_key')", (sid,)).rowcount
+        self.db.execute("UPDATE approvals SET decision='expired' WHERE sid=? AND decision='pending'", (sid,))
+        self.db.execute("UPDATE sessions SET planned=revision WHERE id=?", (sid,))
+        return count
+
+    def change_mode(self, sid, mode, *, objective=None):
+        if mode not in MODES:
+            raise ValueError("请选择默认、计划或目标模式")
+        if objective is not None and (mode != "goal" or not objective.strip() or len(objective) > 120000):
+            raise ValueError("请在目标模式中填写 1 至 120,000 字的目标")
+        with self.db:
+            session = self.session(sid)
+            if mode == session["mode"] and objective is None:
+                return
+            self.stop_jobs(sid)
+            self.db.execute("UPDATE sessions SET mode=?,goal_status=CASE WHEN goal_status='active' THEN 'paused' "
+                            "ELSE goal_status END WHERE id=?", (mode, sid))
+            self.event(sid, "progress", "system", "已切换至" + MODES[mode])
+            if mode == "goal":
+                goal = objective if objective is not None else session["objective"]
+                if objective is not None or session["goal_status"] == "complete":
+                    goal = (objective or "").strip()
+                    self.db.execute("UPDATE sessions SET objective=?,goal_status='',goal_note='',goal_next='' WHERE id=?", (goal, sid))
+                if goal:
+                    self._message(sid, goal if objective is not None else "继续当前目标", new_id())
+
+    def goal_action(self, sid, action):
+        with self.db:
+            session = self.session(sid)
+            if not session["objective"]:
+                raise ValueError("请先设置目标")
+            if action == "resume":
+                if session["goal_status"] not in ("paused", "blocked"):
+                    raise ValueError("只有暂停或需要补充的目标可以继续")
+                self.stop_jobs(sid)
+                self.db.execute("UPDATE sessions SET mode='goal' WHERE id=?", (sid,))
+                self._message(sid, "继续当前目标", new_id())
+            elif action in ("pause", "clear"):
+                if action == "pause" and session["goal_status"] != "active":
+                    raise ValueError("当前目标没有运行")
+                if session["mode"] == "goal":
+                    self.stop_jobs(sid)
+                    self.db.execute("UPDATE sessions SET mode='default' WHERE id=?", (sid,))
+                if action == "clear":
+                    self.db.execute("UPDATE sessions SET objective='',goal_status='',goal_note='',goal_next='' WHERE id=?", (sid,))
+                else:
+                    self.db.execute("UPDATE sessions SET goal_status='paused' WHERE id=?", (sid,))
+                self.event(sid, "progress", "system", "目标已暂停" if action == "pause" else "目标已清除")
+            else:
+                raise ValueError("未知的目标操作")
+
+    def current_proposal(self, sid):
+        session = self.session(sid)
+        rows = self.rows("SELECT draft,payload,status FROM jobs WHERE sid=? AND kind='proposal' ORDER BY rowid DESC LIMIT 1", sid)
+        if session["mode"] == "plan" and rows:
+            plan = rows[0]
+            if plan["status"] == "done" and plan["payload"]["revision"] == session["revision"] and not plan["payload"].get("needs_input"):
+                return plan["draft"]
+        return None
+
+    def implement_plan(self, sid):
+        with self.db:
+            plan = self.current_proposal(sid)
+            if not plan:
+                raise ValueError("请先在计划模式下完成当前计划")
+            self.stop_jobs(sid)
+            self.db.execute("UPDATE sessions SET mode='default' WHERE id=?", (sid,))
+            self._message(sid, "请执行已确认的计划。\n" + plan, new_id())
+
+    def assess_goal(self, job, verdict, note, step):
+        session = self.guard(job)
+        if session["mode"] != "goal" or session["goal_status"] != "active":
+            raise Superseded()
+        if verdict == "continue" and not step.strip():
+            raise ValueError("请说明下一步要做什么")
+        if verdict == "continue" and step.strip() == session["goal_next"]:
+            verdict, note = "blocked", note + "\n上轮已尝试同一步骤，请补充要求或输入。"
+        if verdict == "continue" and session["goal_next"]:
+            last = self.db.execute("SELECT rowid FROM jobs WHERE sid=? AND kind='goal_check' AND status='done' "
+                                   "ORDER BY rowid DESC LIMIT 1", (session["id"],)).fetchone()
+            if last and not self.db.execute("SELECT 1 FROM jobs WHERE sid=? AND rowid>? AND kind IN "
+                                            "('engineering','report','section','verification') AND status='done' LIMIT 1",
+                                            (session["id"], last[0])).fetchone():
+                verdict, note = "blocked", note + "\n上轮没有完成新的工作，请补充信息后继续。"
+        status = "active" if verdict == "continue" else verdict
+        self.db.execute("UPDATE sessions SET goal_status=?,goal_note=?,goal_next=? WHERE id=?",
+                        (status, note, step.strip() if status == "active" else "", session["id"]))
+        self.db.execute("UPDATE jobs SET status='done',draft=? WHERE id=?", (note, job["id"]))
+        self.event(session["id"], "message", "openai", GOAL_STATES[status] + " · " + note + ("\n下一步：" + step if verdict == "continue" else ""),
+                   {"job": job["id"], "kind": "goal_check"})
+        if verdict == "continue":
+            self.enqueue(session, "plan", {"revision": session["revision"], "followup": step})
+        elif verdict == "complete":
+            self.db.execute("UPDATE sessions SET mode='default' WHERE id=?", (session["id"],))
 
     def set_models(self, sid, gemini, openai, efforts=None):
         with self.db:
@@ -541,6 +674,11 @@ class Store:
         kind = "artifact" if job["kind"] == "section" else "message"
         self.event(job["sid"], kind if success else "failure", PROVIDERS[job["kind"]], text,
                    {"job": job["id"], "kind": job["kind"], "basis": job["basis"], **result})
+        if not success and job["kind"] in ("plan", "goal_check"):
+            blocked = self.db.execute("UPDATE sessions SET goal_status='blocked',goal_note=?,goal_next='' "
+                                      "WHERE id=? AND mode='goal' AND goal_status='active'", (text, job["sid"]))
+            if blocked.rowcount:
+                self.stop_jobs(job["sid"])
         self.wake(job["sid"])
 
     def pending_work(self, sid):
@@ -556,6 +694,10 @@ class Store:
                 continue
             if calls or not self.pending_work(sid):
                 self.db.execute("UPDATE jobs SET status='ready' WHERE id=?", (job["id"],))
+        session = self.session(sid)
+        if session["mode"] == "goal" and session["goal_status"] == "active" and not self.db.execute(
+                "SELECT 1 FROM jobs WHERE sid=? AND status IN ('ready','running','needs_key','waiting') LIMIT 1", (sid,)).fetchone():
+            self.enqueue(session, "goal_check", {"revision": session["revision"]})
 
     def snapshot(self, sid):
         events = self.rows("SELECT * FROM events WHERE sid=? ORDER BY seq", sid)

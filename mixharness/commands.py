@@ -60,7 +60,7 @@ async def new_session(engine, args):
     directory = Path(args["cwd"]) if args.get("cwd_project") and not args.get("standalone") and not args.get("project_id") else None
     session = engine.create_session(**selected, directory=directory, project_id=args.get("project_id"), backend=backend, efforts=efforts,
                                     standalone=args.get("standalone", False), permission=args.get("permission", "ask"),
-                                    speed=args.get("speed", "standard"))
+                                    speed=args.get("speed", "standard"), mode=args.get("mode", "default"))
     engine.notify(session["id"])
     return session
 
@@ -136,6 +136,8 @@ async def dispatch(engine, args):
         paths = args.get("image") or []
         if not message and not paths or len(message) > 120000:
             raise ValueError("请输入消息或添加图片，消息最多 120,000 个字符")
+        if cmd == "run" and args.get("mode") == "goal" and not message:
+            raise ValueError("请用文字说明要达成的目标")
         if len(paths) > MAX_ITEMS:
             raise ValueError(f"每次最多添加 {MAX_ITEMS} 项")
         attachments = [Attachment.from_file(path) for path in paths]
