@@ -14,16 +14,18 @@ DEPENDS = {
     "plan": (),
     "proposal": (),
     "goal_check": (),
+    "side": (),
     "engineering": ("engineering",),
     "verification": ("engineering", "verification"),
     "report": SCOPES,
     "section": SCOPES,
 }
 PROVIDERS = {"plan": "gemini", "report": "gemini", "section": "gemini", "engineering": "openai",
-             "verification": "openai", "proposal": "openai", "goal_check": "openai"}
+             "verification": "openai", "proposal": "openai", "goal_check": "openai", "side": "openai"}
 LABELS = {"plan": "解析需求", "engineering": "开发与研究", "verification": "验证", "report": "撰写报告",
-          "section": "撰写章节", "proposal": "制定计划", "goal_check": "核对目标"}
+          "section": "撰写章节", "proposal": "制定计划", "goal_check": "核对目标", "side": "侧边问答"}
 MODES = {"default": "默认模式", "plan": "计划模式", "goal": "目标模式"}
+MODE_TITLES = {**MODES, "side": "侧边问答"}
 GOAL_STATES = {"": "待设置", "active": "进行中", "paused": "已暂停", "blocked": "需要补充", "complete": "已完成"}
 STATUSES = {"ready": "待执行", "running": "进行中", "needs_key": "等待密钥", "waiting": "等待中",
             "done": "已完成", "failed": "失败", "obsolete": "已跳过"}
@@ -381,6 +383,8 @@ class Store:
     def enqueue(self, session, kind, payload=None, title=None):
         if session["mode"] == "plan" and kind != "proposal":
             raise ValueError("请先退出计划模式或选择执行计划")
+        if session["mode"] == "side" and kind != "side":
+            raise ValueError("侧边聊天只支持问答，切换到默认模式即可执行任务")
         jid = new_id()
         basis = {key: session["versions"][key] for key in DEPENDS[kind]}
         provider = PROVIDERS[kind]
@@ -391,28 +395,34 @@ class Store:
         )
         return jid
 
-    def fork_session(self, sid, title):
+    def fork_session(self, sid, title, *, workspace=None, side=False):
         original = self.session(sid)
         if original["archived"]:
             raise ValueError("请先恢复要分支的会话")
-        name = title.strip() or original["title"] + "（分支）"
+        suffix = "（侧边）" if side else "（分支）"
+        name = title.strip() or original["title"][:200 - len(suffix)] + suffix
         if len(name) > 200:
             raise ValueError("会话名称最多 200 个字符")
         branch = new_id()
         with self.db:
+            project = self._register_folder(workspace) if workspace else original["project_id"]
+            mode = "plan" if original["mode"] == "plan" else "default"
+            goal_status = "paused" if original["goal_status"] == "active" else original["goal_status"]
+            objective, note, speed = original["objective"], original["goal_note"], "standard"
+            if side:
+                mode, objective, goal_status, note, speed = "side", "", "", "", original["speed"]
             self.db.execute("INSERT INTO sessions(id,title,workspace,gemini,openai,brief,versions,updated,project_id,"
-                            "backend,efforts,revision,planned,mode,objective,goal_status,goal_note) "
-                            "SELECT ?,?,workspace,gemini,openai,brief,versions,?,project_id,backend,efforts,revision,revision,"
-                            "CASE WHEN mode='goal' THEN 'default' ELSE mode END,objective,"
-                            "CASE WHEN goal_status='active' THEN 'paused' ELSE goal_status END,goal_note FROM sessions WHERE id=?",
-                            (branch, name, now(), sid))
+                            "backend,efforts,revision,planned,mode,objective,goal_status,goal_note,speed) "
+                            "SELECT ?,?,?,gemini,openai,brief,versions,?,?,backend,efforts,revision,revision,?,?,?,?,? "
+                            "FROM sessions WHERE id=?", (branch, name, str(workspace or original["workspace"]), now(), project, mode,
+                            objective, goal_status, note, speed, sid))
             for event in self.db.execute("SELECT seq,kind,actor,body,meta,at FROM events WHERE sid=? AND kind='message' ORDER BY seq", (sid,)):
                 seq = self.db.execute("INSERT INTO events(sid,kind,actor,body,meta,at) VALUES(?,?,?,?,?,?)",
                                       (branch, event["kind"], event["actor"], event["body"],
                                        event["meta"] if event["actor"] == "user" else "{}", event["at"])).lastrowid
                 self.db.execute("INSERT INTO message_inputs SELECT ?,item FROM message_inputs WHERE seq=? ORDER BY rowid",
                                 (seq, event["seq"]))
-            if self.current_proposal(sid):
+            if not side and self.current_proposal(sid):
                 self.db.execute("INSERT INTO jobs(id,sid,kind,title,model,effort,basis,payload,status,draft,at) "
                                 "SELECT ?,?,kind,title,model,effort,basis,payload,status,draft,at FROM jobs "
                                 "WHERE sid=? AND kind='proposal' ORDER BY rowid DESC LIMIT 1", (new_id(), branch, sid))
@@ -439,11 +449,12 @@ class Store:
             title = (body.strip().splitlines()[0] if body.strip() else
                      (staged[0]["name"] if staged else attachments[0].name))[:36]
         self.db.execute("UPDATE sessions SET revision=?,title=? WHERE id=?", (rev, title, sid))
-        self.db.execute("UPDATE jobs SET status='obsolete' WHERE sid=? AND kind IN ('plan','proposal','goal_check') "
+        self.db.execute("UPDATE jobs SET status='obsolete' WHERE sid=? AND kind IN ('plan','proposal','goal_check','side') "
                         "AND status NOT IN ('done','obsolete')", (sid,))
-        if session["mode"] == "plan":
+        if session["mode"] in ("plan", "side"):
             self.db.execute("UPDATE sessions SET planned=revision WHERE id=?", (sid,))
-            self.enqueue(session, "proposal", {"revision": rev})
+            kind = "proposal" if session["mode"] == "plan" else "side"
+            self.enqueue(session, kind, {"revision": rev})
         else:
             if session["mode"] == "goal":
                 if not session["objective"] and not body.strip():

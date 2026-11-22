@@ -16,6 +16,7 @@ from .clients import connection
 
 
 API_DASHBOARDS = {"gemini": "https://aistudio.google.com/usage", "openai": "https://platform.openai.com/usage"}
+CODEX_BILLING = "https://chatgpt.com/#settings/Billing"
 
 
 @asynccontextmanager

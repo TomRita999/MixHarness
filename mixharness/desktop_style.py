@@ -164,6 +164,7 @@ def apply_theme(app, name):
         QTextBrowser { selection-background-color: $selected; }
 
         QListWidget, QTreeWidget { background: transparent; outline: none; }
+        QListWidget#slashMenu { background: $field; border: 1px solid $strong; border-radius: 10px; padding: 4px; }
         QTreeWidget::item { height: 30px; padding-left: 2px; color: $secondary; }
         QTreeWidget::item:hover { background: $hover; color: $ink; }
         QTreeWidget::item:selected { background: $selected; color: $ink; }

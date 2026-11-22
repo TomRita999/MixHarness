@@ -7,7 +7,8 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from .slash import ALIASES, COMMANDS, ROLE_NAMES
+from .slash import ROLE_NAMES
+from .slash_catalog import COMMANDS, matches
 from .store import PROVIDERS
 
 
@@ -24,12 +25,11 @@ class CommandCompletion(Completer):
 
     def get_completions(self, document, complete_event):
         prefix = document.text_before_cursor
-        if not prefix.startswith("/") or " " in prefix:
+        if not prefix.startswith("/") or any(c.isspace() for c in prefix):
             return
-        for name in sorted(self.names | set(ALIASES)):
-            value = "/" + name
-            if value.startswith(prefix):
-                yield Completion(value, start_position=-len(prefix), display_meta=COMMANDS[ALIASES.get(name, name)])
+        for name in matches(prefix[1:]):
+            if name in self.names:
+                yield Completion("/" + name, start_position=-len(prefix), display_meta=COMMANDS[name].title)
 
 
 class Terminal:

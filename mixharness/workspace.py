@@ -69,6 +69,54 @@ def read_source(root, args):
             "text": "\n".join(lines[start - 1:start + 199])[:24000]}
 
 
+def review_changes(sources, exclude):
+    """Collect changed paths and bounded Git hunks alongside the review snapshot."""
+    sections = []
+    if not shutil.which("git"):
+        return "本机未安装 Git，可按关注点审查项目文件。"
+    remaining = 32000
+    for name, folder in sources.folders.items():
+        git = ["git", "--literal-pathspecs", "-C", str(folder)]
+        top = subprocess.run([*git, "rev-parse", "--show-toplevel"], capture_output=True)
+        if top.returncode:
+            sections.append(name + " · 普通目录，可按关注点审查项目文件。")
+            continue
+        root = Path(os.fsdecode(top.stdout).rstrip("\r\n"))
+        status = subprocess.run([*git, "status", "--porcelain=v1", "-z", "--no-renames", "-uall", "--", "."],
+                                capture_output=True, check=True)
+        files = []
+        for entry in status.stdout.split(b"\0"):
+            if not entry:
+                continue
+            path = root / os.fsdecode(entry[3:])
+            relative = path.relative_to(folder)
+            if path.is_relative_to(exclude) or not all(map(visible, relative.parts)):
+                continue
+            files.append((entry[:2].decode("ascii"), relative.as_posix()))
+        sections.append(name + (" · Git 改动" if files else " · 工作区没有可审查的改动"))
+        sections.extend(code + " " + path for code, path in files[:100])
+        if len(files) > 100:
+            sections.append(f"另有 {len(files) - 100} 个改动文件")
+        tracked = [path for code, path in files[:100] if code != "??"]
+        if not tracked:
+            continue
+        for label, flags in (("暂存区", ["--cached"]), ("工作区", [])):
+            if remaining <= 0:
+                break
+            args = [*git, "diff", "--relative", "--no-ext-diff", "--no-textconv", "--no-renames", *flags, "--", *tracked]
+            with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+                data = process.stdout.read(remaining + 1)
+                if len(data) > remaining:
+                    process.kill()
+                if data:
+                    sections.extend((label, data[:remaining].decode("utf-8", errors="replace")))
+                    remaining -= len(data)
+        if remaining < 0:
+            sections.append("差异节选已达到上限，可按路径读取快照中的文件。")
+            remaining = 0
+    return "\n".join(sections)
+
+
 def edit_source(root, args):
     target = project_path(root, args["path"])
     data = args["content"].encode("utf-8")

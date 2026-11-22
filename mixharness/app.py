@@ -1,7 +1,6 @@
 import asyncio
 import base64
 from contextlib import asynccontextmanager
-from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlsplit
@@ -9,24 +8,16 @@ from urllib.parse import quote, urlsplit
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .attachments import Attachment, MAX_IMAGE, MAX_ITEMS
+from .chat_snapshot import markdown
 from .engine import open_engine
 from .commands import control_server
 from .providers import MODELS
 from .store import pack
 from .usage import plan_usage
-
-
-MARKDOWN = MarkdownIt("commonmark", {"html": False}).enable("table").disable("image")
-
-
-@lru_cache(maxsize=128)
-def markdown(text):
-    return MARKDOWN.render(text)
 
 
 def view_state(store, sid):

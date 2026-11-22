@@ -240,7 +240,7 @@ class Engine:
         self.notify(sid)
 
     async def native_approval(self, job, source, title, details):
-        if job["kind"] in ("proposal", "goal_check"):
+        if job["kind"] in ("proposal", "goal_check", "side") or job["payload"].get("review"):
             return False
         if self.store.session(job["sid"])["permission"] != job["permission"]:
             return False
@@ -313,6 +313,8 @@ class Engine:
             raise ValueError("该任务当前无需重试")
         s = self.store.session(sid)
         if (s["mode"] == "plan") != (job["kind"] == "proposal"):
+            raise ValueError("当前模式无法重试这项任务")
+        if (s["mode"] == "side") != (job["kind"] == "side"):
             raise ValueError("当前模式无法重试这项任务")
         if job["kind"] == "goal_check" and (s["mode"] != "goal" or s["goal_status"] != "active"):
             raise ValueError("请先继续目标，再核对进度")
@@ -562,6 +564,9 @@ class Engine:
                 workspace.snapshot, sources, self.home / "snapshots" / job["sid"], self.home))
             await self.gate(job)
             payload["source"] = version
+            if payload.get("review"):
+                payload["git_changes"] = await asyncio.to_thread(workspace.review_changes, sources, self.home)
+                await self.gate(job)
             with self.store.db:
                 self.store.db.execute("UPDATE jobs SET payload=? WHERE id=?", (pack(job["payload"]), job["id"]))
         return self.home / "snapshots" / job["sid"] / job["payload"]["source"]

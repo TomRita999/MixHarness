@@ -12,11 +12,16 @@ from PySide6.QtWidgets import (
 
 from .desktop_projects import ArchiveDialog, ProjectDialog
 from .desktop_agent import AgentDialog, ApprovalDialog
+from .desktop_slash import SlashMenu
+from .desktop_chat_actions import McpDialog, ShareDialog, SideChat, save_transcript
+from .chat_snapshot import feedback_url, transcript
 from .agent_settings import PERMISSIONS, SPEEDS, available_speeds
-from .slash import execute_command, goal_text
+from .slash import execute_command, goal_text, split
+from .slash_catalog import COMMANDS, command_name
 from .desktop_clients import ClientHistory
 from .desktop_inputs import ComposerInputs
 from .desktop_usage import UsageDialog
+from .usage import API_DASHBOARDS
 from .desktop_style import RESOURCES, THEMES, apply_theme
 from .desktop_widgets import (
     ALIGN, ArtifactDialog, Document, Editor, MessageNav, ModelPicker, SettingsDialog, Submenu, Timeline, button, icon, label,
@@ -24,7 +29,7 @@ from .desktop_widgets import (
 from .providers import MODELS
 from .clients import CLIENTS
 from .reasoning import LEVEL_NAMES, group_for, resolve_choice
-from .store import GOAL_STATES, LABELS, MODES, STATUSES, new_id
+from .store import GOAL_STATES, LABELS, MODES, MODE_TITLES, STATUSES, new_id
 
 
 USER_ROLE = Qt.ItemDataRole.UserRole
@@ -278,6 +283,8 @@ class Window(QMainWindow):
         body.addLayout(shell, 1)
         self.content = main
         self.message_nav = MessageNav(self.timeline, main)
+        self.slash_menu = SlashMenu(self)
+        self.slash_menu.chosen.connect(lambda name: self.send_command("/" + name))
         main.installEventFilter(self)
         self.splitter.addWidget(main)
 
@@ -690,6 +697,7 @@ class Window(QMainWindow):
 
     def archive_chat(self, sid):
         self.engine.store.archive_session(sid)
+        self.engine.notify(sid)
         self.after_removal(sid)
 
     def confirm_delete(self, sid, archive=None):
@@ -858,7 +866,7 @@ class Window(QMainWindow):
             p.model in p.catalog.get("models", []) for p in self.pickers.values())
         text = self.editor.toPlainText().strip()
         has_input = bool(text) or bool(self.inputs.items) and not self.needs_goal_text()
-        self.send_button.setEnabled(has_input and (ready or (text.startswith("/") and not self.inputs.items))
+        self.send_button.setEnabled(has_input and (ready or (text.startswith(("/", "／")) and not self.inputs.items))
                                     and self.backend_task is None)
 
     def needs_goal_text(self):
@@ -871,8 +879,8 @@ class Window(QMainWindow):
         text = self.editor.toPlainText().strip()
         if self.backend_task or not text and (not self.inputs.items or self.needs_goal_text()):
             return
-        if text.startswith("/") and not self.inputs.items:
-            self.send_command(text)
+        if text.startswith(("/", "／")) and not self.inputs.items:
+            self.send_command("/" + text[1:])
             return
         if self.backend_box.currentData() == "clients" and any(
                 p.model not in p.catalog.get("models", []) for p in self.pickers.values()):
@@ -911,6 +919,9 @@ class Window(QMainWindow):
         if force or self.versions.get(self.sid, 0) != self.engine.changes.get(self.sid, 0):
             if self.sid:
                 self.state = self.engine.store.snapshot(self.sid)
+                if self.state["session"]["archived"]:
+                    self.after_removal(self.sid)
+                    return
             else:
                 session = {"backend": self.settings.value("backend", "api"), "title": "新会话", "revision": 0, "brief": {}}
                 models = self.preferred_models(session["backend"], session)
@@ -1198,12 +1209,13 @@ class Window(QMainWindow):
     def refresh_mode(self):
         session = self.state["session"]
         mode = session["mode"] if self.sid else self.draft_mode
-        text = MODES[mode]
+        text = MODE_TITLES[mode]
         if mode == "goal" and session.get("goal_status"):
             text = "目标 · " + GOAL_STATES[session["goal_status"]]
         self.mode_button.setText(text + " ▾")
         self.mode_button.setToolTip((session.get("objective") if mode == "goal" else "") or text)
-        self.editor.setPlaceholderText({"plan": "描述想解决的问题，或补充计划要求…", "goal": "输入要达成的目标，或补充验收条件…",
+        self.editor.setPlaceholderText({"side": "继续向 GPT 提问…", "plan": "描述想解决的问题，或补充计划要求…",
+                                        "goal": "输入要达成的目标，或补充验收条件…",
                                         "default": "输入消息，或用 / 调用指令…"}[mode])
 
     def mode_menu(self):
@@ -1257,9 +1269,54 @@ class Window(QMainWindow):
         sid, pid = self.sid, self.pid
         self.editor.clear()
         self.save_draft()
-        if text in ("/settings", "/config"):
-            self.agent_settings()
+        word, argument = split(text)
+        name = command_name(word[1:])
+        if name == "feedback":
+            url = feedback_url(argument)
+            if not QDesktopServices.openUrl(QUrl(url)):
+                self.command_detail("反馈", url)
             return
+        if name == "btw" and sid:
+            self.open_side_chat(sid, argument)
+            return
+        if name == "history" or (name == "resume" and not argument):
+            if name == "resume":
+                self.sources_box.setCurrentIndex(0)
+            self.search()
+            self.filter.setText(argument)
+            return
+        if name == "usage" and argument in ("", "codex", "antigravity"):
+            UsageDialog(self, argument or "codex").open()
+            return
+        if name == "usage" and argument in API_DASHBOARDS:
+            if not QDesktopServices.openUrl(QUrl(API_DASHBOARDS[argument])):
+                self.command_detail("API 用量", API_DASHBOARDS[argument])
+            return
+        if name == "mcp" and argument in ("", "codex", "antigravity"):
+            McpDialog(self, argument or "codex").open()
+            return
+        if name in ("model", "effort") and argument in ("gemini", "antigravity", "openai", "codex", "gpt"):
+            picker = self.pickers["gemini" if argument in ("gemini", "antigravity") else "openai"]
+            (picker.open_models if name == "model" else picker.open_effort)()
+            return
+        if not argument:
+            actions = {"new": self.new_session, "fast": self.speed_menu, "settings": self.agent_settings,
+                       "skills": self.agent_settings, "mode": self.mode_menu, "plan": lambda: self.select_mode("plan"),
+                       "goal": self.mode_menu if sid and self.state["session"]["objective"] else lambda: self.select_mode("goal"),
+                       "model": self.pickers["openai"].open_models, "effort": self.pickers["openai"].open_effort,
+                       "permissions": self.permission_box.showPopup, "backend": self.backend_box.showPopup,
+                       "project": self.project_picker, "projects": self.project_picker, "add-dir": self.choose_source}
+            if sid:
+                actions.update(rename=lambda: self.rename_chat(sid), archive=lambda: self.archive_chat(sid),
+                               share=lambda: ShareDialog(self, sid).open(), fork=lambda: self.fork_menu(sid, pid),
+                               export=lambda: save_transcript(self, transcript(self.engine.store, sid),
+                                                              lambda message: self.statusBar().showMessage(message, 6000)))
+            if name in actions:
+                actions[name]()
+                return
+        self.run_command(text, sid, pid)
+
+    def run_command(self, text, sid, pid):
         options = dict(line=text, id=sid, project_id=pid, cwd=str(self.engine.skill_folders(sid, pid)[0]),
                        backend=self.backend_box.currentData(), permission=self.permission_box.currentData(),
                        speed=self.engine.store.session(sid)["speed"] if sid else self.draft_speed,
@@ -1283,8 +1340,43 @@ class Window(QMainWindow):
                 return
             self.refresh(force=True)
             if result["text"]:
-                self.command_detail(text.split()[0], result["text"])
+                command = COMMANDS[command_name(text.split()[0][1:])]
+                self.command_detail(command.title, result["text"])
         self.run_task(run())
+
+    def open_side_chat(self, sid, question):
+        dock = next((w for w in self.findChildren(SideChat) if w.origin == sid), None)
+        if dock is None:
+            dock = SideChat(self, sid)
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+            if self.width() < 930:
+                dock.setFloating(True)
+                dock.resize(330, 420)
+        dock.show()
+        dock.raise_()
+        dock.editor.setFocus()
+        if question:
+            dock.editor.setPlainText(question)
+            dock.send()
+
+    def fork_menu(self, sid, pid):
+        menu = QMenu(self)
+        menu.setAccessibleName("创建聊天分支")
+        menu.addAction("在当前工作区继续", lambda: self.run_command("/fork", sid, pid))
+        root = Path(self.engine.store.session(sid)["workspace"])
+        repository = next((path for path in (root, *root.parents) if (path / ".git").exists()), None)
+        def choose_path():
+            dialog = QInputDialog(self)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            dialog.setWindowTitle("在新 Git 工作树中继续")
+            dialog.setLabelText("新目录（以当前提交 HEAD 为起点）")
+            if repository and repository.name:
+                dialog.setTextValue(str(repository.with_name(repository.name + "-worktree")))
+            dialog.textValueSelected.connect(lambda path: self.run_command("/fork --worktree " + path, sid, pid))
+            dialog.open()
+        worktree = menu.addAction("在新 Git 工作树中继续…", choose_path)
+        worktree.setEnabled(len(self.engine.skill_folders(sid, pid)) == 1 and repository is not None)
+        self.popup_choices(self.composer, menu)
 
     def command_detail(self, title, text):
         dialog = QDialog(self)

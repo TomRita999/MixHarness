@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def read_window(work, library):
-    from PySide6.QtCore import QSettings
+    from PySide6.QtCore import QSettings, Qt
     from PySide6.QtGui import QAccessible
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
@@ -46,6 +46,18 @@ def read_window(work, library):
         read("第一条消息的正文。")
         window.history.expandAll()
         window.refresh(force=True)
+        read("第一条消息的正文。")
+        window.activateWindow()
+        window.editor.setFocus()
+        QTest.qWait(80)
+        QTest.keyClicks(window.editor, "/")
+        assert window.slash_menu.isVisible(), (window.editor.toPlainText(), window.editor.hasFocus())
+        read("快捷指令")
+        QTest.keyClick(window.editor, Qt.Key.Key_Down)
+        QTest.keyClick(window.editor, Qt.Key.Key_Down)
+        QTest.keyClicks(window.editor, "rev")
+        read("代码审查")
+        QTest.keyClick(window.editor, Qt.Key.Key_Escape)
         read("第一条消息的正文。")
         window.close()
 

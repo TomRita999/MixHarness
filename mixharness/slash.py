@@ -1,42 +1,17 @@
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 
 from .agent_settings import PERMISSIONS, SPEEDS, available_speeds, encode_context, skill_catalog, tokens
 from .client_rpc import executable
-from .clients import CLIENTS
+from .chat_snapshot import ACTORS as ROLE_NAMES, feedback_url, snapshot_link, transcript
+from .clients import CLIENTS, codex_mcp_servers
 from .commands import default_models, new_session
 from .reasoning import api_levels, group_for
-from .store import GOAL_STATES, MODES, STATUSES, new_id
-from .usage import plan_usage
-
-
-COMMANDS = {
-    "help": "查看指令和参数",
-    "new": "在当前项目开始新会话", "resume": "[会话编号]　列出或继续会话",
-    "history": "[关键词]　搜索会话", "rename": "名称　重命名当前会话", "fork": "[名称]　从当前对话创建分支",
-    "projects": "列出项目", "project": "项目编号或目录　切换项目",
-    "add-dir": "文件夹　加入当前项目", "tools": "查看工具与项目验证命令",
-    "model": "[gemini|openai] [模型 ID]　查看或切换模型",
-    "effort": "gemini|openai [档位|default]　设置思考强度",
-    "backend": "[clients|api]　切换执行方式", "permissions": "[ask|auto|full]　查看或设置权限",
-    "fast": "[off|fast|ultrafast]　设置 Codex 速度",
-    "status": "查看会话状态", "usage": "[codex|antigravity|openai|gemini]　查看用量",
-    "skills": "[on 名称|off 名称|add 目录|remove 目录]　配置技能",
-    "context": "[auto|token 数]　设置上下文窗口", "compact": "压缩会话历史",
-    "settings": "查看技能与上下文设置", "plan": "[要求]　进入只读计划模式或修订计划",
-    "mode": "[default|plan|goal]　查看或切换会话模式", "implement": "执行当前已制定的计划",
-    "goal": "[目标|status|pause|resume|clear]　设置、查看或管理持续目标",
-    "review": "[关注点]　让 GPT 审查项目", "diff": "查看 Git 改动",
-    "init": "阅读项目并更新 AGENTS.md", "mcp": "[codex|antigravity]　查看 MCP 服务",
-    "approvals": "查看待批准操作", "approve": "审批编号　允许", "deny": "审批编号　拒绝",
-    "stop": "停止当前任务", "retry": "任务编号　重试失败任务",
-    "export": "[文件路径]　导出为 Markdown", "exit": "退出命令行",
-}
-ALIASES = {"": "help", "?": "help", "quit": "exit", "clear": "new", "chats": "history", "models": "model",
-           "config": "settings", "approvals-mode": "permissions", "sandbox": "permissions",
-           "stats": "usage", "stop-agent": "stop"}
-ROLE_NAMES = {"user": "你", "openai": "GPT", "gemini": "Gemini", "system": "MixHarness"}
+from .slash_catalog import COMMANDS, command_name
+from .store import GOAL_STATES, MODES, MODE_TITLES, STATUSES, new_id
+from .usage import CODEX_BILLING, plan_usage
 
 
 def split(text):
@@ -64,7 +39,7 @@ def skill_command(engine, argument, args):
         return "\n".join(f"{'已启用' if name in settings.skills else '未启用'}  {name}  {s['path']}"
                          for name, s in catalog.items()) or "当前目录中没有找到技能，可用 /skills add 添加目录"
     if action not in ("on", "off", "add", "remove") or not value:
-        raise ValueError("/skills " + COMMANDS["skills"])
+        raise ValueError("/skills " + COMMANDS["skills"].usage())
     field = "skills" if action in ("on", "off") else "skill_dirs"
     item = value if field == "skills" else str(path_at(value, args))
     values = list(getattr(settings, field))
@@ -151,10 +126,10 @@ async def model_command(engine, cmd, arg, session):
     return f"{provider}　{updated[provider]}  ·  {updated['efforts'].get(provider) or '默认'}"
 
 
-async def output_of(argv, cwd):
+async def output_of(argv, cwd, *, timeout=30):
     process = await asyncio.create_subprocess_exec(*argv, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
-        async with asyncio.timeout(30):
+        async with asyncio.timeout(timeout):
             out, err = await process.communicate()
     finally:
         if process.returncode is None:
@@ -175,6 +150,24 @@ async def diff(engine, session):
     return "\n\n".join(sections)
 
 
+async def fork_worktree(engine, session, destination):
+    folders = engine.sources(session).folders
+    if len(folders) != 1:
+        raise ValueError("新工作树需要一个单目录 Git 项目")
+    source = next(iter(folders.values()))
+    prefix = await output_of(["git", "rev-parse", "--show-prefix"], source)
+    if destination.exists():
+        raise ValueError("请选择尚不存在的新工作树目录")
+    await output_of(["git", "worktree", "add", "--detach", str(destination), "HEAD"], source, timeout=None)
+    try:
+        workspace = (destination / prefix).resolve(strict=True)
+        branch = engine.store.fork_session(session["id"], "", workspace=workspace)
+    except (OSError, ValueError, KeyError, RuntimeError, sqlite3.Error):
+        await output_of(["git", "worktree", "remove", str(destination)], source)
+        raise
+    return branch
+
+
 async def usage_text(engine, source):
     data = await plan_usage(source, engine.home)
     if "dashboard" in data:
@@ -183,7 +176,34 @@ async def usage_text(engine, source):
     for bucket in data["buckets"]:
         amount = f"{bucket['remaining_percent']}%" if "remaining_percent" in bucket else str(bucket.get("remaining_amount", "未提供"))
         lines.append(bucket["name"] + "　剩余 " + amount + ("　重置 " + bucket["reset"] if bucket.get("reset") else ""))
+    if source == "codex":
+        lines.append("套餐账单　" + CODEX_BILLING)
     return "\n".join(lines)
+
+
+async def mcp_text(engine, source, sid, pid):
+    folder = engine.skill_folders(sid, pid)[0]
+    if source == "antigravity":
+        text = await output_of([executable(source), "mcp", "list"], folder)
+    elif source == "codex":
+        command = [executable(source), "mcp", "list", "--json"]
+        live, configured = await asyncio.gather(codex_mcp_servers(), output_of(command, folder), return_exceptions=True)
+        if isinstance(live, Exception) and isinstance(configured, Exception):
+            raise ValueError(str(live) or str(configured) or "读取 Codex MCP 服务超时")
+        statuses = {}
+        if not isinstance(configured, Exception):
+            statuses.update({s["name"]: "已启用" if s["enabled"] else "已停用" for s in json.loads(configured)})
+        if isinstance(live, list):
+            auth = {"bearertoken": "令牌认证", "oauth": "OAuth", "notloggedin": "待登录"}
+            for server in live:
+                info = [f"{len(server['tools'])} 个工具", auth.get((server.get("authStatus") or "").casefold())]
+                statuses[server["name"]] = " · ".join(filter(None, info))
+        text = "\n".join(name + "　" + info for name, info in statuses.items())
+        if isinstance(live, Exception):
+            text += "\n运行状态暂不可用：" + (str(live) or "读取超时")
+    else:
+        raise ValueError("请选择 codex 或 antigravity")
+    return text.strip() or "客户端没有配置 MCP 服务"
 
 
 def status_text(engine, session):
@@ -191,7 +211,7 @@ def status_text(engine, session):
              "权限　" + PERMISSIONS[session["permission"]], *(f"{p}　{session[p]}  ·  {session['efforts'].get(p) or '默认'}" for p in CLIENTS)]
     if session["speed"] != "standard":
         lines.append("Codex 速度　" + SPEEDS[session["speed"]])
-    lines.append(MODES[session["mode"]])
+    lines.append(MODE_TITLES[session["mode"]])
     if session["objective"]:
         lines.append(goal_text(session))
     for row in engine.store.snapshot(session["id"])["tasks"]:
@@ -211,13 +231,13 @@ async def execute_command(engine, args):
     first, arg = split(args["line"])
     if not first.startswith("/"):
         raise ValueError("指令以 / 开头")
-    cmd = ALIASES.get(first[1:].lower(), first[1:].lower())
+    cmd = command_name(first[1:])
     if cmd not in COMMANDS:
         raise ValueError("未知指令 " + first + "，输入 /help 查看可用指令")
     sid, pid = args.get("id"), args.get("project_id")
     session = engine.store.session(sid) if sid else None
     if cmd == "mode" and arg and arg not in MODES:
-        raise ValueError("/mode " + COMMANDS["mode"])
+        raise ValueError("/mode " + COMMANDS["mode"].usage())
     if not session and cmd in ("permissions", "backend", "model", "effort", "fast", "init", "plan", "review", "diff", "mode", "goal"):
         options = dict(args)
         if cmd == "backend" and arg:
@@ -244,7 +264,7 @@ async def execute_command(engine, args):
             if not catalog.groups:
                 await catalog.refresh()
             speeds = available_speeds(group_for(catalog.groups, session["openai"]))
-        text = "\n".join("/" + name + "　" + help_text for name, help_text in COMMANDS.items() if name != "fast" or speeds)
+        text = "\n".join("/" + name + "　" + spec.usage() for name, spec in COMMANDS.items() if name != "fast" or speeds)
     elif cmd == "history" or (cmd == "resume" and not arg):
         text = sessions_text(engine.store, arg)
     elif cmd == "resume":
@@ -277,27 +297,41 @@ async def execute_command(engine, args):
                           "附加技能目录　" + ("、".join(engine.settings.skill_dirs) or "无")))
     elif cmd == "usage":
         text = await usage_text(engine, arg or "codex")
+    elif cmd == "feedback":
+        text = feedback_url(arg)
     elif cmd == "mcp":
-        source = arg or "codex"
-        if source not in ("codex", "antigravity"):
-            raise ValueError("请选择 codex 或 antigravity")
-        cwd = engine.skill_folders(sid, pid)[0]
-        command = [executable(source), "mcp", "list"]
-        if source == "codex":
-            servers = json.loads(await output_of([*command, "--json"], cwd))
-            text = "\n".join(s["name"] + ("　已启用" if s["enabled"] else "　已停用") for s in servers)
-        else:
-            text = await output_of(command, cwd)
-        text = text or "客户端没有配置 MCP 服务"
+        text = await mcp_text(engine, arg or "codex", sid, pid)
     elif not session:
         raise ValueError("请先输入 /new 创建会话，或输入 /resume 选择已有会话")
     elif cmd == "status":
         text = status_text(engine, session)
     elif cmd == "fork":
-        branch = engine.store.fork_session(sid, arg)
+        option, value = split(arg)
+        if option == "--worktree":
+            if not value:
+                raise ValueError("请输入 /fork --worktree 新目录")
+            branch = await fork_worktree(engine, session, path_at(value, args))
+        else:
+            branch = engine.store.fork_session(sid, arg)
         engine.notify(branch["id"])
         result.update(id=branch["id"], project_id=branch["project_id"])
         text = "已创建分支：" + branch["title"] + "　" + branch["id"]
+    elif cmd == "btw":
+        if len(arg) > 120000:
+            raise ValueError("问题最多可包含 120,000 个字符")
+        side = engine.store.fork_session(sid, "", side=True)
+        if arg:
+            engine.submit(side["id"], arg, new_id())
+        engine.notify(side["id"])
+        result.update(id=side["id"], project_id=side["project_id"])
+        text = "已打开侧边聊天。返回原会话可输入 /resume " + sid
+    elif cmd == "archive":
+        engine.store.archive_session(sid)
+        engine.notify(sid)
+        result.update(id=None)
+        text = "已归档　" + session["title"]
+    elif cmd == "share":
+        text = snapshot_link(session["title"], transcript(engine.store, sid))
     elif cmd == "add-dir":
         if not pid or not arg:
             raise ValueError("请在项目会话中输入 /add-dir 文件夹路径")
@@ -361,9 +395,7 @@ async def execute_command(engine, args):
         engine.notify(sid)
         text = f"已停止 {count} 项任务"
     elif cmd == "export":
-        state = engine.store.snapshot(sid)
-        text = "# " + session["title"] + "\n\n" + "\n\n".join(
-            "## " + ROLE_NAMES.get(e["actor"], e["actor"]) + "\n\n" + e["body"] for e in state["events"] if e["kind"] == "message")
+        text = transcript(engine.store, sid)
         if arg:
             path = path_at(arg, args)
             with path.open("x", encoding="utf-8") as f:
@@ -376,7 +408,7 @@ async def execute_command(engine, args):
             if cmd == "plan" and arg:
                 engine.submit(sid, arg, new_id())
             engine.notify(sid)
-        text = MODES[engine.store.session(sid)["mode"]]
+        text = MODE_TITLES[engine.store.session(sid)["mode"]]
     elif cmd == "implement":
         engine.store.implement_plan(sid)
         engine.notify(sid)
@@ -394,10 +426,11 @@ async def execute_command(engine, args):
         await engine.steer(sid, request)
         text = "已提交项目说明任务"
     elif cmd == "review":
-        question = "审查项目代码，指出具体文件、问题与依据。" + arg
+        question = ("审查任务所列的 Git 暂存区、工作区和新增文件。用快照核对改动，给出具体问题、位置和依据。"
+                    "普通目录按关注点审查项目文件。" + arg)
         with engine.store.db:
             title = "代码审查"
-            jid = engine.store.enqueue(session, "verification", {"question": question, "direct": True}, title)
+            jid = engine.store.enqueue(session, "verification", {"question": question, "direct": True, "review": True}, title)
             engine.store.event(sid, "message", "user", (first + " " + arg).strip(),
                                {"job": jid, "direct": True, "revision": session["revision"]})
             if session["title"] == "新会话":

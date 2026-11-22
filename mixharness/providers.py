@@ -83,6 +83,7 @@ FUNCTIONS = {
     "draft_section": (WritingTask, "并行起草已有足够资料的独立章节。"),
 }
 TOOLS = {
+    "side": ["list_files", "read_file", "read_artifact"],
     "proposal": ["list_files", "read_file", "read_artifact", "ask_clarification"],
     "goal_check": ["list_files", "read_file", "read_artifact", "assess_goal"],
     "engineering": ["list_files", "read_file", "edit_file", "run_check", "read_artifact"],
@@ -92,6 +93,7 @@ TOOLS = {
 }
 
 PROMPTS = {
+    "side": "你在独立的侧边聊天中。将继承的对话当作背景，只回答用户最后提出的问题。需要时只读查看项目，直接用中文回答。",
     "proposal": "你正在计划模式中。只读检查项目，和用户讨论可执行的步骤、验收条件和必要的取舍。"
                 "先了解项目再写计划。遇到决定方案的关键信息缺口时用 ask_clarification 提问。用中文给出计划，等待用户选择执行。",
     "goal_check": "核对共享会话里的持续目标与最新补充。检查当前结果、工程记录和相关验证。"

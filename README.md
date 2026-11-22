@@ -66,16 +66,19 @@ python start.py
 
 ### 4. 命令行与常用指令
 
-在项目目录直接运行 `mixharness` 进入交互模式（打包版里程序名叫 `mixharness-cli`），输入 `/` 可以触发指令，支持 Tab 补全。这些斜杠指令在桌面输入框里同样可用：
+在桌面输入框开头键入 `/` 会弹出快捷指令。继续输入中文或英文可筛选，例如 `/审查` 或 `/rev`。按 ↑ ↓ 选择，Enter 或单击执行，Tab 补全后可接着填参数，Esc 收起。终端在项目目录运行 `mixharness` 即可使用同一套指令（打包版命令为 `mixharness-cli`）。
 
 | 分类 | 常用指令 |
 | --- | --- |
 | 会话与项目 | `/new`、`/resume`、`/history 关键词`、`/rename 名称`、`/fork 名称`、`/project 目录`、`/add-dir 目录` |
-| 模型与权限 | `/model gemini`、`/effort openai high`、`/permissions auto`、`/backend clients`、`/usage codex` |
+| 侧边与分享 | `/btw 问题` 打开独立的只读问答，`/share` 生成可粘贴到浏览器地址栏的文字快照链接，`/feedback` 打开项目反馈，`/archive` 归档当前会话 |
+| 模型与权限 | `/model gemini`、`/effort openai high`、`/permissions auto`、`/backend clients`、`/usage codex`、`/fast` |
 | 开发与审查 | `/init`（维护 `AGENTS.md`）、`/plan 要求`、`/implement`、`/review 关注点`、`/diff` |
 | 模式与目标 | `/mode default`、`/goal 目标描述`、`/goal status`、`/goal pause`、`/goal resume`、`/goal clear` |
 | 任务与控制 | `/status`、`/approvals`、`/approve 编号`、`/deny 编号`、`/stop`、`/retry 任务编号`、`/export 路径` |
 | 技能与上下文 | `/settings`、`/skills`、`/context 64000`、`/compact`、`/tools`、`/mcp antigravity` |
+
+单目录 Git 项目可从桌面的「创建聊天分支」选择新工作树，也可输入 `/fork --worktree 新目录`。新工作树从当前提交 HEAD 开始。分享快照保存在链接内，长对话可以保存成 Markdown 文件发送。
 
 也支持非交互式的脚本调用（加 `--library 目录` 可指定数据库路径）：
 

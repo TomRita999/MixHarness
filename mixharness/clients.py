@@ -99,22 +99,28 @@ async def models(client):
     return labels
 
 
-async def codex_tool_references():
+async def codex_mcp_servers():
     result = []
     async with asyncio.timeout(40), connection("codex") as rpc:
         await rpc.initialize("codex")
         cursor = None
         while True:
             page = await rpc.request("mcpServerStatus/list", {"detail": "toolsAndAuthOnly", "cursor": cursor})
-            for server in page["data"]:
-                for key, tool in server["tools"].items():
-                    name = tool.get("name") or key
-                    target = server["name"] + "/" + name
-                    description = tool.get("description") or name
-                    result.append(Attachment.reference("tool", target, "Codex MCP", target, description))
+            result.extend(page["data"])
             cursor = page.get("nextCursor")
             if not cursor:
                 return result
+
+
+async def codex_tool_references():
+    result = []
+    for server in await codex_mcp_servers():
+        for key, tool in server["tools"].items():
+            name = tool.get("name") or key
+            target = server["name"] + "/" + name
+            description = tool.get("description") or name
+            result.append(Attachment.reference("tool", target, "Codex MCP", target, description))
+    return result
 
 
 async def chats(client, cursor=None, query=""):
@@ -329,7 +335,7 @@ async def codex_turn(engine, job, cwd, prompt, schema):
     mode = job["permission"]
     speed = job["speed"]
     proposal = job["kind"] == "proposal"
-    readonly = proposal or job["kind"] == "goal_check"
+    readonly = proposal or job["kind"] in ("goal_check", "side") or job["payload"].get("review")
     async with connection("codex") as rpc:
         await rpc.initialize("codex", experimental=proposal)
         tier = "default"

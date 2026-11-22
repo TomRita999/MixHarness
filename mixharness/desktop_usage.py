@@ -6,7 +6,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QComboBox, QDialog, QFrame, QHBoxLayout, QProgressBar, QScrollArea, QVBoxLayout, QWidget
 
 from .desktop_widgets import button, label
-from .usage import API_DASHBOARDS, plan_usage
+from .usage import API_DASHBOARDS, CODEX_BILLING, plan_usage
 
 
 def local_time(value):
@@ -31,6 +31,8 @@ class UsageDialog(QDialog):
         self.source.setCurrentIndex(self.source.findData(source))
         header.addWidget(self.source)
         header.addStretch()
+        self.plan_billing = button("套餐账单 ↗", lambda: QDesktopServices.openUrl(QUrl(CODEX_BILLING)))
+        header.addWidget(self.plan_billing)
         self.billing = button("API 用量 ↗", self.open_billing)
         header.addWidget(self.billing)
         self.refresh_button = button("刷新", self.refresh)
@@ -64,6 +66,7 @@ class UsageDialog(QDialog):
     def refresh(self):
         self.stop()
         source = self.source.currentData()
+        self.plan_billing.setVisible(source == "codex")
         self.summary.setText("正在读取…")
         self.stamp.clear()
         self.refresh_button.setEnabled(False)
