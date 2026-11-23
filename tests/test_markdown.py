@@ -1,17 +1,17 @@
 import io
-import os
 import unittest
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QTextFormat, QTextTable
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QPlainTextEdit
+from PySide6.QtWidgets import QDialog, QPlainTextEdit
 from rich.console import Console
 
 from mixharness.desktop_style import apply_theme
 from mixharness.desktop_widgets import Document
 from mixharness.terminal_markdown import THEME, TerminalMarkdown
+from tests.qt_app import application
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,8 +22,7 @@ REPOSITORY = "https://github.com/openai/codex"
 
 class MarkdownTests(unittest.TestCase):
     def test_desktop_links_respond_to_hover_and_open_the_source_line(self):
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        app = QApplication.instance() or QApplication([])
+        app = application()
         app.setQuitOnLastWindowClosed(False)
         previous = app.palette(), app.styleSheet()
         self.addCleanup(app.setPalette, previous[0])
@@ -34,25 +33,29 @@ class MarkdownTests(unittest.TestCase):
                 view = Document(ROOT)
                 view.resize(640, 300)
                 view.show()
-                view.show_markdown(f"📄 [项目配置](./pyproject.toml:{PROJECT_LINE})\n\n{REPOSITORY}")
+                caption = f"项目配置 · {PROJECT.name}"
+                view.show_markdown(f"📄 [{caption}](./{PROJECT.name}:{PROJECT_LINE})\n\n{REPOSITORY}")
                 app.processEvents()
                 doc = view.document()
-                link = doc.find("项目配置")
+                link = doc.find(PROJECT.name)
                 style = link.charFormat()
                 self.assertEqual(style.anchorHref(), PROJECT.as_uri() + f"#L{PROJECT_LINE}")
                 self.assertEqual(style.foreground().color(), view.palette().link().color())
                 self.assertNotEqual(style.foreground().color(), view.palette().text().color())
                 self.assertTrue(style.fontUnderline())
                 self.assertEqual(doc.find(REPOSITORY).charFormat().anchorHref(), REPOSITORY)
-                link.setPosition(link.selectionStart() + 1)
-                point = view.cursorRect(link).center()
-                self.assertEqual(view.anchorAt(point), style.anchorHref())
+                end = view.cursorRect(link)
+                link.setPosition(link.selectionStart())
+                bounds = view.cursorRect(link).united(end)
+                self.assertGreater(bounds.width(), 1, f"文件名的显示范围为 {bounds}")
+                point = bounds.center()
+                self.assertEqual(view.anchorAt(point), style.anchorHref(), f"文件名的显示范围为 {bounds}")
                 # 窗口接收鼠标事件，离屏测试也能检查悬停效果。
                 window = view.windowHandle()
                 link_pos = view.viewport().mapTo(view, point)
                 QTest.mouseMove(window, QPoint(view.width() - 12, view.height() - 12))
                 QTest.mouseMove(window, link_pos)
-                self.assertEqual([s.cursor.selectedText() for s in view.extraSelections()], ["项目配置"])
+                self.assertEqual("".join(s.cursor.selectedText() for s in view.extraSelections()), caption)
                 QTest.mouseClick(window, Qt.MouseButton.LeftButton, pos=link_pos)
                 dialog = view.findChild(QDialog)
                 preview = dialog.findChild(QPlainTextEdit)
@@ -62,8 +65,7 @@ class MarkdownTests(unittest.TestCase):
                 view.close()
 
     def test_desktop_and_terminal_render_project_readme(self):
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        app = QApplication.instance() or QApplication([])
+        app = application()
         source = (ROOT / "README.md").read_text(encoding="utf-8")
         view = Document(ROOT)
         view.show_markdown(source)

@@ -1,5 +1,4 @@
 import asyncio
-import os
 import tempfile
 import tomllib
 import unittest
@@ -8,7 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtGui import QPalette, QTextTable
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox, QPushButton
+from PySide6.QtWidgets import QInputDialog, QMenu, QMessageBox, QPushButton
 from qasync import QEventLoop
 
 from mixharness.chat_snapshot import markdown
@@ -20,6 +19,7 @@ from mixharness.desktop_usage import UsageDialog
 from mixharness.desktop_widgets import Document, SettingsDialog
 from mixharness.engine import open_engine
 from mixharness.providers import MODELS
+from tests.qt_app import application
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,8 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class DesktopTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        cls.app = QApplication.instance() or QApplication(["MixHarness"])
+        cls.app = application()
         cls.app.setQuitOnLastWindowClosed(False)
         cls.app.setStyle("Fusion")
         cls.app.setProperty("iconFamily", load_icons())

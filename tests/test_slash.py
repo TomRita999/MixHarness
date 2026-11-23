@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import os
 import shutil
 import subprocess
 import tempfile
@@ -10,7 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QInputMethodEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QPushButton
 from qasync import QEventLoop
 
 from mixharness import workspace
@@ -21,6 +20,7 @@ from mixharness.desktop_style import load_icons
 from mixharness.engine import open_engine
 from mixharness.slash import execute_command
 from mixharness.store import new_id
+from tests.qt_app import application
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,8 +35,7 @@ class SlashTests(unittest.TestCase):
         self.root = Path(directory.name)
 
     def test_composer_search_keyboard_mouse_and_side_chat(self):
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        app = QApplication.instance() or QApplication([])
+        app = application()
         app.setQuitOnLastWindowClosed(False)
         app.setProperty("iconFamily", load_icons())
         with open_engine(self.root, self.root / "data") as engine, QEventLoop(app) as loop:

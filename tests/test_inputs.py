@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QListWidget, QPushButton
+from PySide6.QtWidgets import QListWidget, QPushButton
 from qasync import QEventLoop
 
 from mixharness.attachments import Attachment, image_parts
@@ -18,6 +17,7 @@ from mixharness.desktop import Window
 from mixharness.desktop_clients import ClientHistory
 from mixharness.engine import open_engine
 from mixharness.store import new_id
+from tests.qt_app import application
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,8 +65,7 @@ class InputTests(unittest.TestCase):
             self.assertEqual(store.rows("SELECT id FROM input_items"), [])
 
     def test_composer_paste_remove_restore_and_reference(self):
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        app = QApplication.instance() or QApplication([])
+        app = application()
         app.setQuitOnLastWindowClosed(False)
         settings = QSettings(str(self.root / "desktop.ini"), QSettings.Format.IniFormat)
         with open_engine(self.root, self.home) as engine, QEventLoop(app) as loop:
