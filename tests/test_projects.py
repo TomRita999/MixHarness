@@ -1,8 +1,9 @@
 import asyncio
-import re
+import hashlib
 import shutil
 import tempfile
 import unittest
+from contextlib import suppress
 from pathlib import Path
 
 from filelock import FileLock
@@ -25,33 +26,39 @@ class ProjectTests(unittest.TestCase):
             source = root / "source"
             source.mkdir()
             shutil.copy2(ROOT / "pyproject.toml", source)
+            shutil.copy2(ROOT / "tests/check_project_digest.py", source)
+            expected = hashlib.sha256((source / "pyproject.toml").read_bytes()).digest()
             runs = root / "runs"
+
             async def exercise():
-                command = ["@python", "-u", "-m", "http.server", "0", "--bind", "127.0.0.1"]
-                task = asyncio.create_task(workspace.run_check(source, runs, command, timeout=30))
-                try:
-                    async with asyncio.timeout(15):
-                        while True:
-                            if task.done():
+                connected = asyncio.get_running_loop().create_future()
+                def accept(reader, writer):
+                    connected.set_result((reader, writer))
+
+                async with await asyncio.start_server(accept, "127.0.0.1", 0) as server:
+                    port = server.sockets[0].getsockname()[1]
+                    command = ["@python", "check_project_digest.py", str(port)]
+                    task = asyncio.create_task(workspace.run_check(source, runs, command, timeout=120))
+                    try:
+                        async with asyncio.timeout(30):
+                            done, _ = await asyncio.wait((task, connected), return_when=asyncio.FIRST_COMPLETED)
+                            if task in done:
                                 self.fail(str(await task))
-                            log = next(runs.rglob("output.log"), None)
-                            match = re.search(r"port (\d+)", log.read_text(encoding="utf-8")) if log else None
-                            if match:
-                                break
-                            await asyncio.sleep(0.03)
-                    port = int(match[1])
-                    reader, writer = await asyncio.open_connection("127.0.0.1", port)
-                    writer.write(b"GET /pyproject.toml HTTP/1.0\r\n\r\n")
-                    await writer.drain()
-                    self.assertIn((source / "pyproject.toml").read_bytes(), await reader.read())
-                    writer.close()
-                    await writer.wait_closed()
-                finally:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-                self.assertTrue(task.cancelled())
-                with self.assertRaises(OSError):
-                    await asyncio.open_connection("127.0.0.1", port)
+                            reader, writer = connected.result()
+                            self.assertEqual(await reader.readexactly(len(expected)), expected)
+                            task.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await task
+                            with suppress(ConnectionResetError):
+                                self.assertEqual(await reader.read(1), b"")
+                    finally:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                        if connected.done():
+                            _, writer = connected.result()
+                            writer.close()
+                            with suppress(ConnectionResetError):
+                                await writer.wait_closed()
                 self.assertFalse(list(runs.rglob("result.json")))
             asyncio.run(exercise())
 
