@@ -58,6 +58,7 @@ class Terminal:
         self.pending = set()
         self.missing = set()
         self.running = set()
+        self.sent = set()
         self.completion = CommandCompletion()
         self.prompt = None
         if sys.stdin.isatty() and sys.stdout.isatty():
@@ -74,6 +75,7 @@ class Terminal:
         self.pending.clear()
         self.missing.clear()
         self.running.clear()
+        self.sent.clear()
 
     async def update(self):
         sid = self.sid
@@ -84,7 +86,7 @@ class Terminal:
             return
         if data.get("deleted"):
             self.select(None)
-            print("当前会话已删除，输入 /resume 可以选择其他会话。", flush=True)
+            print("会话已删除 · /resume 选择其他会话", flush=True)
             return
         self.version = data["version"]
         if "events" not in data:
@@ -98,17 +100,20 @@ class Terminal:
         else:
             self.completion.names.discard("daybreak")
         for event in data["events"]:
-            if event["seq"] > self.after and event["kind"] in ("message", "verification", "failure", "progress", "artifact"):
+            if event["seq"] > self.after and event["seq"] not in self.sent and event["kind"] in (
+                    "message", "verification", "failure", "progress", "artifact"):
                 author = ROLE_NAMES.get(event["actor"], event["actor"])
                 if sys.stdout.isatty() and event["kind"] == "message" and event["actor"] in ("openai", "gemini"):
                     print_message(author, event["body"].translate(CONTROL_CHARS), data.get("workspace"))
+                elif event["kind"] in ("progress", "artifact"):
+                    display("· " + event["body"])
                 else:
-                    display(author + "　" + event["body"])
+                    display(author + "  " + event["body"])
             self.after = max(self.after, event["seq"])
         for item in data["approvals"]:
             if item["id"] not in self.pending:
-                display(f"待批准　{item['source']} · {item['title']}\n{item['detail']}\n"
-                        f"/approve {item['id']}　或　/deny {item['id']}")
+                display(f"待批准 · {item['source']} · {item['title']}\n{item['detail']}\n"
+                        f"/approve {item['id']}  ·  /deny {item['id']}")
         self.pending = {a["id"] for a in data["approvals"]}
         for job in data["needs_key"]:
             if job["id"] not in self.missing:
@@ -117,7 +122,7 @@ class Terminal:
         self.missing = {j["id"] for j in data["needs_key"]}
         for job in data["running"]:
             if job["id"] not in self.running:
-                display(job["title"] + "中　" + job["model"])
+                display(f"… {job['title']} · {job['model']}")
         self.running = {j["id"] for j in data["running"]}
 
     async def monitor(self):
@@ -147,7 +152,7 @@ class Terminal:
         if self.sid:
             session = (await self.invoke(dict(command="status", id=self.sid)))["session"]
             self.options.update(project_id=session["project_id"], backend=session["backend"])
-        print("MixHarness · 输入消息开始协作，/help 查看指令", flush=True)
+        print("MixHarness · /help 查看指令", flush=True)
         with patch_stdout(raw=True) if self.prompt else nullcontext():
             monitor = asyncio.create_task(self.monitor())
             try:
@@ -180,8 +185,10 @@ class Terminal:
                             if not self.sid:
                                 session = await self.invoke(dict(self.options, command="new"))
                                 self.select(session["id"])
-                                print("会话　" + self.sid, flush=True)
-                            await self.invoke(dict(command="send", id=self.sid, message=line, wait=False))
+                                print("新会话 · " + self.sid, flush=True)
+                            sent = await self.invoke(dict(command="send", id=self.sid, message=line, wait=False))
+                            if isinstance(sent, dict) and sent.get("seq"):
+                                self.sent.add(sent["seq"])
                         await self.update()
                     except (OSError, ValueError, KeyError, RuntimeError) as exc:
                         display(exc, file=sys.stderr)

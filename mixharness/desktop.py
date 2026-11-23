@@ -24,7 +24,7 @@ from .desktop_usage import UsageDialog
 from .usage import API_DASHBOARDS
 from .desktop_style import RESOURCES, THEMES, apply_theme
 from .desktop_widgets import (
-    ALIGN, ArtifactDialog, Document, Editor, MessageNav, ModelPicker, SettingsDialog, Submenu, Timeline, button, icon, label,
+    ALIGN, ArtifactDialog, Document, Editor, FitCombo, menu_icon, MessageNav, ModelPicker, SettingsDialog, Submenu, Timeline, button, icon, label,
 )
 from .providers import MODELS
 from .clients import CLIENTS
@@ -235,7 +235,12 @@ class Window(QMainWindow):
         controls.addWidget(self.inputs)
         controls.addWidget(self.editor)
         tools = QHBoxLayout()
-        tools.setSpacing(6)
+        tools.setSpacing(2)
+        # 工具栏顺序：附件 · 两个模型 · 加速 ‖ 执行方式 · 发送，全部垂直居中。
+        self.add_input = button("添加附件或引用", self.inputs.menu, "plus", "round", icon_only=True)
+        self.add_input.setFixedSize(30, 30)
+        tools.addWidget(self.add_input)
+        tools.addSpacing(4)
         self.pickers = {}
         for provider, title in (("gemini", "Gemini"), ("openai", "OpenAI")):
             pick = ModelPicker(provider, title)
@@ -246,29 +251,31 @@ class Window(QMainWindow):
             self.pickers[provider] = pick
             tools.addWidget(pick)
         self.speed_box = button("GPT Fast 速度", self.speed_menu, name="quiet")
-        tools.addWidget(self.speed_box, 0, ALIGN.AlignBottom)
+        tools.addWidget(self.speed_box)
         tools.addStretch()
-        self.backend_box = QComboBox()
+        self.backend_box = FitCombo()
+        self.backend_box.setObjectName("flat")
         self.backend_box.setAccessibleName("会话执行方式")
         self.backend_box.setToolTip("执行方式")
         self.backend_box.setCursor(Qt.CursorShape.PointingHandCursor)
         self.backend_box.addItem("API", "api")
         self.backend_box.addItem("本机客户端", "clients")
         self.backend_box.currentIndexChanged.connect(self.change_backend)
-        tools.addWidget(self.backend_box, 0, ALIGN.AlignBottom)
-        self.add_input = button("添加附件或引用", self.inputs.menu, "plus", icon_only=True)
-        self.add_input.setFixedSize(30, 32)
-        tools.addWidget(self.add_input, 0, ALIGN.AlignBottom)
+        tools.addWidget(self.backend_box)
+        tools.addSpacing(4)
         self.send_button = button("发送消息", self.send, "send", "send", icon_only=True)
         self.send_button.setFixedSize(32, 32)
         self.send_button.setEnabled(False)
-        tools.addWidget(self.send_button, 0, ALIGN.AlignBottom)
+        tools.addWidget(self.send_button)
         controls.addLayout(tools)
         col.addWidget(self.composer)
         foot = QHBoxLayout()
+        foot.setContentsMargins(6, 0, 0, 0)
+        foot.setSpacing(2)
         self.mode_button = button("会话模式", self.mode_menu, name="quiet")
         foot.addWidget(self.mode_button)
-        self.permission_box = QComboBox()
+        self.permission_box = FitCombo()
+        self.permission_box.setObjectName("flat")
         self.permission_box.setAccessibleName("操作权限")
         self.permission_box.setToolTip("对应 Antigravity 的 Default / Auto / Turbo")
         for mode, title in PERMISSIONS.items():
@@ -577,13 +584,14 @@ class Window(QMainWindow):
         menu = QMenu(self)
         menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         for project in self.engine.store.projects():
-            action = menu.addAction(icon("folder"), project["name"],
-                                    lambda checked=False, pid=project["id"]: self.choose_context(pid))
+            action = menu.addAction(project["name"], lambda checked=False, pid=project["id"]: self.choose_context(pid))
             action.setCheckable(True)
             action.setChecked(self.pid == project["id"])
-        menu.addAction("独立会话", lambda: self.choose_context(None))
+        alone = menu.addAction("独立会话", lambda: self.choose_context(None))
+        alone.setCheckable(True)
+        alone.setChecked(self.pid is None)
         menu.addSeparator()
-        menu.addAction(icon("plus"), "新建项目…", self.project_dialog)
+        menu.addAction("新建项目…", self.project_dialog)
         menu.popup(self.project_name.mapToGlobal(self.project_name.rect().bottomLeft()))
 
     def choose_context(self, pid):
@@ -657,26 +665,27 @@ class Window(QMainWindow):
         menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         if not project_row:
             chat = self.engine.store.session(identifier)
-            menu.addAction(icon("pin"), "取消置顶" if chat["pinned"] else "置顶会话",
+            menu.addAction(menu_icon("pin"), "取消置顶" if chat["pinned"] else "置顶会话",
                            lambda: self.pin_row(identifier, False, not chat["pinned"]))
-            menu.addAction("重命名会话…", lambda: self.rename_chat(identifier))
-            menu.addAction(icon("archive"), "归档会话", lambda: self.archive_chat(identifier))
+            menu.addAction(menu_icon("pencil"), "重命名会话…", lambda: self.rename_chat(identifier))
+            menu.addAction(menu_icon("archive"), "归档会话", lambda: self.archive_chat(identifier))
             menu.addSeparator()
-            menu.addAction(icon("trash"), "删除会话…", lambda: self.confirm_delete(identifier))
+            menu.addAction(menu_icon("trash"), "删除会话…", lambda: self.confirm_delete(identifier))
         else:
-            menu.addAction(icon("new"), "在此新建会话", lambda: self.create_chat(identifier))
+            menu.addAction(menu_icon("new"), "在此新建会话", lambda: self.create_chat(identifier))
         if project_row and identifier:
             pid = identifier
             project = self.engine.store.project(pid)
-            menu.addAction(icon("pin"), "取消置顶" if project["pinned"] else "置顶项目",
+            menu.addAction(menu_icon("pin"), "取消置顶" if project["pinned"] else "置顶项目",
                            lambda: self.pin_row(pid, True, not project["pinned"]))
-            menu.addAction("编辑项目…", lambda: self.project_dialog(pid=pid))
+            menu.addAction(menu_icon("settings"), "编辑项目…", lambda: self.project_dialog(pid=pid))
             folders = Submenu("在文件管理器中打开", menu)
+            folders.setIcon(menu_icon("folder"))
             for folder in project["folders"]:
                 path = folder["path"]
                 folders.addAction(path, lambda checked=False, path=path: QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
             menu.addSeparator()
-            menu.addAction("移出侧栏", lambda: self.hide_project(pid))
+            menu.addAction(menu_icon("close"), "移出侧栏", lambda: self.hide_project(pid))
         menu.popup(position)
 
     def pin_row(self, identifier, project, pinned):

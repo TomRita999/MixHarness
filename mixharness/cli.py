@@ -12,7 +12,7 @@ from .engine import open_engine
 
 def parser():
     root = argparse.ArgumentParser(prog="mixharness", description="MixHarness 命令行工具")
-    root.add_argument("--library", type=Path, help="会话库目录（包含 .env 与 .mixharness），默认共用桌面端")
+    root.add_argument("--library", type=Path, help="会话库目录，默认与桌面端共用")
     root.add_argument("--data-dir", type=Path, help="指定会话数据库目录")
     root.add_argument("--version", action="version", version="MixHarness 0.7.0")
     sub = root.add_subparsers(dest="command")
@@ -165,7 +165,7 @@ def main(argv=None):
     try:
         result = asyncio.run(execute(project, home, options))
     except Timeout:
-        print("会话库已被占用，当前进程尚未提供命令行连接。", file=sys.stderr)
+        print("会话库正被其他进程占用", file=sys.stderr)
         return 1
     except (OSError, RuntimeError, ValueError, KeyError) as exc:
         print(str(exc) or type(exc).__name__, file=sys.stderr)

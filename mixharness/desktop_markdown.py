@@ -56,8 +56,13 @@ def render_markdown(document, text, font, palette, workspace=None):
                 fmt.setBorderCollapse(True)
                 fmt.setBorderStyle(QTextFrameFormat.BorderStyle.BorderStyle_Solid)
                 fmt.setBorderBrush(palette.mid())
-                fmt.setCellPadding(7)
+                fmt.setCellPadding(6)
                 frame.setFormat(fmt)
+                for column in range(frame.columns()):
+                    cell = frame.cellAt(0, column)
+                    style = cell.format()
+                    style.setBackground(palette.alternateBase())
+                    cell.setFormat(style)
     finally:
         document.setLayoutEnabled(True)
 

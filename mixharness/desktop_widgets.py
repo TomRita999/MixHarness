@@ -10,7 +10,7 @@ from dotenv import set_key
 from PySide6.QtCore import QBuffer, QEasingCurve, QIODevice, QPoint, QPointF, QPropertyAnimation, QSaveFile, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QFontMetrics, QIcon, QImage, QPainter, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QTextEdit, QToolButton, QToolTip,
     QVBoxLayout, QWidget,
 )
@@ -34,8 +34,13 @@ def label(text, name=""):
     return result
 
 
-def icon(name, inverse=False):
-    return QIcon(Glyph(QApplication.instance().property("iconFamily"), name, inverse))
+def icon(name, inverse=False, scale=1.0):
+    return QIcon(Glyph(QApplication.instance().property("iconFamily"), name, inverse, scale))
+
+
+def menu_icon(name):
+    # 菜单图标略小于文字行高，视觉上与文字对齐。
+    return icon(name, scale=0.78)
 
 
 def button(text, callback, glyph=None, name="", icon_only=False):
@@ -117,6 +122,54 @@ class Submenu(QMenu):
         parent.addMenu(self)
 
 
+class FitCombo(QComboBox):
+    """宽度跟随当前选项，避免短文字后面留出大段空白。"""
+
+    def __init__(self):
+        super().__init__()
+        self.currentIndexChanged.connect(self.updateGeometry)
+
+    def sizeHint(self):
+        self.ensurePolished()
+        text = self.fontMetrics().horizontalAdvance(self.currentText())
+        return QSize(text + 30, max(26, self.fontMetrics().height() + 10))
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.update()
+
+    def paintEvent(self, event):
+        # 和“默认模式 ▾”这类文字按钮保持一致：文字后紧跟箭头，悬停时出现浅色底。
+        palette = QApplication.palette()
+        hover = self.underMouse() and self.isEnabled()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if hover:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(palette.color(palette.ColorRole.Midlight))
+            painter.drawRoundedRect(self.rect().adjusted(0, 1, 0, -1), 7, 7)
+        color = palette.color(palette.ColorRole.Text if hover else palette.ColorRole.PlaceholderText)
+        painter.setPen(color)
+        painter.setFont(self.font())
+        rect = self.rect().adjusted(8, 0, -8, 0)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.currentText())
+        x = rect.left() + self.fontMetrics().horizontalAdvance(self.currentText()) + 5
+        y = self.height() / 2
+        pen = painter.pen()
+        pen.setWidthF(1.3)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.drawPolyline([QPointF(x, y - 1.5), QPointF(x + 3.5, y + 2), QPointF(x + 7, y - 1.5)])
+        painter.end()
+
+
 class ModelPicker(QWidget):
     changed = Signal(str, str, str)
     refresh_requested = Signal(str)
@@ -148,7 +201,7 @@ class ModelPicker(QWidget):
         self.control.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         self.control.setCursor(Qt.CursorShape.PointingHandCursor)
         self.control.clicked.connect(self.open_models)
-        row.addWidget(self.control, 1)
+        row.addWidget(self.control)
         self.effort_control = QToolButton()
         self.effort_control.setObjectName("effort")
         self.effort_control.setCursor(Qt.CursorShape.PointingHandCursor)

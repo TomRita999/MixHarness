@@ -11,7 +11,7 @@ GLYPHS = {
     "folder": 0xE0D7, "settings": 0xE154, "sun": 0xE178, "moon": 0xE11E,
     "send": 0xE04A, "chat": 0xE117, "gemini": 0xE47E, "openai": 0xE040, "close": 0xE1B2,
     "plus": 0xE13D, "more": 0xE0B6, "archive": 0xE041, "pin": 0xE259, "trash": 0xE18E,
-    "chevron-down": 0xE06D, "chevron-right": 0xE06F,
+    "chevron-down": 0xE06D, "chevron-right": 0xE06F, "pencil": 0xE12F,
 }
 
 
@@ -23,12 +23,12 @@ def load_icons():
 
 
 class Glyph(QIconEngine):
-    def __init__(self, family, name, inverse):
+    def __init__(self, family, name, inverse, scale=1.0):
         super().__init__()
-        self.family, self.name, self.inverse = family, name, inverse
+        self.family, self.name, self.inverse, self.scale = family, name, inverse, scale
 
     def clone(self):
-        return Glyph(self.family, self.name, self.inverse)
+        return Glyph(self.family, self.name, self.inverse, self.scale)
 
     def paint(self, painter, rect, mode, state):
         role = QPalette.ColorRole.Base if self.inverse else QPalette.ColorRole.Text
@@ -37,7 +37,7 @@ class Glyph(QIconEngine):
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         painter.setPen(QApplication.palette().color(group, role))
         font = QFont(self.family)
-        font.setPixelSize(min(rect.width(), rect.height()))
+        font.setPixelSize(max(1, round(min(rect.width(), rect.height()) * self.scale)))
         painter.setFont(font)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, chr(GLYPHS[self.name]))
         painter.restore()
@@ -138,23 +138,28 @@ def apply_theme(app, name):
         QDialog QPushButton { border: 1px solid $line; padding: 6px 14px; }
         QDialog QPushButton#primary, QDialog QPushButton#quiet, QDialog QPushButton#rowAction { border: none; }
         QPushButton#rowAction { padding: 2px; border-radius: 6px; }
+        QPushButton#round { border: 1px solid $line; border-radius: 15px; padding: 0; }
+        QPushButton#round:hover { border-color: $strong; }
         QPushButton#send { background: $ink; border-radius: 16px; padding: 0; }
         QPushButton#send:hover { background: $secondary; }
         QPushButton#send:disabled { background: $line; }
-        QToolButton#model { text-align: left; padding: 3px 8px 3px 6px; font-size: 13px; font-weight: 500; border-radius: 8px; }
-        QToolButton#effort { color: $muted; padding: 3px 8px; font-size: 12px; border-radius: 8px; }
+        QToolButton#model { text-align: left; padding: 3px 4px 3px 6px; font-size: 13px; font-weight: 500; border-radius: 8px; }
+        QToolButton#effort { color: $muted; padding: 3px 8px 3px 3px; font-size: 12px; border-radius: 8px; }
         QToolButton#effort:hover { color: $ink; }
         QToolButton#effort:disabled { color: $muted; }
 
-        QComboBox { background: transparent; border: 1px solid $line; border-radius: 8px;
+        QComboBox { background: transparent; border: 1px solid $line; border-radius: 8px; combobox-popup: 0;
                     padding: 4px 24px 4px 10px; font-size: 12px; color: $secondary; min-height: 18px; }
         QComboBox:hover { background: $hover; color: $ink; }
         QComboBox:disabled { color: $muted; }
         QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: center right; width: 20px; border: none; }
         QComboBox::down-arrow { image: url($chevron); width: 12px; height: 12px; }
-        QComboBox QAbstractItemView { background: $canvas; border: 1px solid $line; border-radius: 10px; padding: 4px;
+        QComboBox QAbstractItemView { background: $canvas; border: 1px solid $line; border-radius: 10px; padding: 5px;
                                       outline: none; selection-background-color: $hover; selection-color: $ink; }
-        QComboBox#flat { border: none; }
+        QComboBox QAbstractItemView::item { min-height: 28px; padding: 0 10px; border-radius: 6px; color: $ink; }
+        QComboBox QAbstractItemView::item:hover, QComboBox QAbstractItemView::item:selected { background: $hover; }
+        QComboBox#flat { border: none; color: $muted; padding: 4px 22px 4px 8px; }
+        QComboBox#flat:hover { color: $ink; }
 
         QLineEdit { border: 1px solid $line; background: $field; border-radius: 9px; padding: 7px 10px; }
         QLineEdit:focus { border-color: $strong; }
@@ -177,11 +182,14 @@ def apply_theme(app, name):
         QListWidget::item:selected { background: $selected; color: $ink; }
 
         QMenu, QMenuBar { color: $ink; background: $canvas; }
-        QMenu { border: 1px solid $line; border-radius: 10px; padding: 5px; }
-        QMenu::item { padding: 6px 18px 6px 12px; border-radius: 6px; }
+        QMenu { border: 1px solid $line; border-radius: 12px; padding: 6px; }
+        QMenu::item { padding: 7px 22px 7px 12px; border-radius: 7px; min-width: 120px; }
+        QMenu::icon { padding-left: 10px; }
+        QMenu::indicator { width: 14px; height: 14px; padding-left: 6px; }
+        QMenu::right-arrow { image: url($branch_closed); width: 12px; height: 12px; padding-right: 8px; }
         QMenu::item:selected, QMenuBar::item:selected { background: $hover; color: $ink; }
         QMenu::item:disabled { color: $muted; }
-        QMenu::separator { height: 1px; background: $line; margin: 4px 6px; }
+        QMenu::separator { height: 1px; background: $line; margin: 5px 8px; }
         QMenu::section { color: $muted; font-size: 11px; padding: 6px 12px 2px; }
 
         QSplitter#panes::handle { background: transparent; }
