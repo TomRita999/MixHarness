@@ -323,6 +323,8 @@ class DesktopTests(unittest.TestCase):
                             while window.work_status.text() != "任务已停止":
                                 await asyncio.sleep(0.03)
                         self.assertFalse(window.stop_button.isVisible())
+                        self.assertTrue(window.continue_button.isVisible())
+                        stopped_id = window.state["tasks"][-1]["id"]
                         self.assertEqual(window.editor.toPlainText(), "保留这条尚未发送的补充")
                         QTest.keyClick(window.editor, Qt.Key.Key_Return)
                         async with asyncio.timeout(5):
@@ -332,8 +334,16 @@ class DesktopTests(unittest.TestCase):
                         async with asyncio.timeout(5):
                             while window.stop_button.isVisible():
                                 await asyncio.sleep(0.03)
-                        self.assertEqual(window.state["session"]["revision"], 3)
-                        self.assertEqual([t["status"] for t in window.state["tasks"]], ["obsolete", "stopped", "stopped"])
+                        self.assertEqual(window.state["session"]["revision"], 2)
+                        self.assertEqual([t["status"] for t in window.state["tasks"]], ["obsolete", "stopped"])
+                        self.assertEqual(window.state["tasks"][-1]["id"], stopped_id)
+                        guide = next(e for e in window.state["events"] if e["meta"].get("guide"))
+                        self.assertEqual(guide["meta"]["jobs"], [stopped_id])
+                        self.assertEqual(guide["body"], "保留这条尚未发送的补充")
+                        QTest.mouseClick(window.continue_button, Qt.MouseButton.LeftButton)
+                        self.assertTrue(window.stop_button.isVisible())
+                        self.assertFalse(window.continue_button.isVisible())
+                        self.assertEqual(window.state["tasks"][-1]["id"], stopped_id)
                     finally:
                         worker.cancel()
                         await asyncio.gather(worker, return_exceptions=True)

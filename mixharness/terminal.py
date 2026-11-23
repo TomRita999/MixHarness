@@ -60,6 +60,7 @@ class Terminal:
         self.missing = set()
         self.running = set()
         self.activity = ""
+        self.can_stop = False
         self.sent = set()
         self.completion = CommandCompletion()
         self.prompt = None
@@ -68,7 +69,7 @@ class Terminal:
             @keys.add("escape", "enter")
             def newline(event):
                 event.current_buffer.insert_text("\n")
-            @keys.add("c-c", filter=Condition(lambda: bool(self.activity)))
+            @keys.add("c-c", filter=Condition(lambda: self.can_stop))
             def interrupt(event):
                 event.app.create_background_task(self.stop(self.sid))
             self.prompt = PromptSession(completer=self.completion, complete_while_typing=True,
@@ -87,6 +88,7 @@ class Terminal:
         self.missing.clear()
         self.running.clear()
         self.activity = ""
+        self.can_stop = False
         self.sent.clear()
 
     async def update(self):
@@ -135,7 +137,7 @@ class Terminal:
         for job in data["running"]:
             if job["id"] not in self.running:
                 actor = ROLE_NAMES.get(PROVIDERS.get(job.get("kind")), "模型")
-                display(f"进行中 · {actor} · {job['title']} · {job['model']}　/stop 停止")
+                display(f"进行中 · {actor} · {job['title']} · {job['model']}　输入补充要求可引导任务，/stop 停止")
         self.running = {j["id"] for j in data["running"]}
         if data.get("stopping"):
             self.activity = "正在停止任务…"
@@ -145,9 +147,14 @@ class Terminal:
             self.activity = "进行中 · " + "、".join(dict.fromkeys(j["title"] for j in data["running"]))
         elif self.missing:
             self.activity = "等待 API Key"
+        elif data.get("can_continue"):
+            self.activity = "任务已停止　/continue 继续，或直接输入补充要求"
         else:
             self.activity = "等待执行" if data.get("active_count") else ""
-        if self.activity and not data.get("stopping"):
+        self.can_stop = bool(data.get("active_count")) and not data.get("stopping")
+        if self.can_stop:
+            if self.running:
+                self.activity += "　Enter 发送引导"
             self.activity += "　Ctrl+C 停止"
         if self.prompt:
             self.prompt.app.invalidate()

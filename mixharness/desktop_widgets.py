@@ -587,6 +587,8 @@ class MessageRow(QWidget):
         author = ACTORS.get(event["actor"], event["actor"])
         if self.user:
             row.addStretch()
+            if event.get("meta", {}).get("guide"):
+                box.addWidget(label("任务引导", "messageAuthor"))
         else:
             title = {"requirements": "Gemini · 需求整理", "verification": "Gemini 请求 GPT 验证",
                      "failure": author + " · 失败"}.get(event["kind"], author)

@@ -29,7 +29,7 @@ from .desktop_widgets import (
 from .providers import MODELS
 from .clients import CLIENTS
 from .reasoning import LEVEL_NAMES, group_for, model_available, resolve_choice, select_daybreak_model
-from .store import ACTIVE_STATUSES, GOAL_STATES, LABELS, MODES, MODE_TITLES, PROVIDERS, STATUSES, new_id
+from .store import ACTIVE_STATUSES, GOAL_STATES, LABELS, MODES, MODE_TITLES, PROVIDERS, STATUSES, accepts_guidance, new_id
 
 
 USER_ROLE = Qt.ItemDataRole.UserRole
@@ -229,6 +229,10 @@ class Window(QMainWindow):
         self.stop_button.setAccessibleName("停止当前会话任务")
         self.stop_button.setToolTip("停止当前会话任务（输入框内按 Esc）")
         activity.addWidget(self.stop_button)
+        self.continue_button = button("继续", self.continue_work, name="stopWork")
+        self.continue_button.setAccessibleName("继续上次停止的任务")
+        self.continue_button.setToolTip("从上次停止处继续")
+        activity.addWidget(self.continue_button)
         col.addWidget(self.activity_row)
         self.composer = QFrame()
         self.composer.setObjectName("composer")
@@ -925,7 +929,7 @@ class Window(QMainWindow):
         self.catalog_tasks[provider] = task
 
     def editor_changed(self):
-        ready = self.models_ready()
+        ready = bool(self.sid) or self.models_ready()
         text = self.editor.toPlainText().strip()
         has_input = bool(text) or bool(self.inputs.items) and not self.needs_goal_text()
         self.send_button.setEnabled(has_input and (ready or (text.startswith(("/", "／")) and not self.inputs.items))
@@ -949,7 +953,7 @@ class Window(QMainWindow):
         if text.startswith(("/", "／")) and not self.inputs.items:
             self.send_command("/" + text[1:])
             return
-        if not self.models_ready():
+        if not self.sid and not self.models_ready():
             return
         if len(text) > 120000:
             QMessageBox.information(self, "消息过长", "单条消息上限为 120,000 字符。")
@@ -962,11 +966,7 @@ class Window(QMainWindow):
                                              permission=self.draft_permission, speed=self.draft_speed, mode=self.draft_mode,
                                              daybreak=self.draft_daybreak,
                                              efforts={p: picker.effort for p, picker in self.pickers.items()})["id"]
-        seq, changed = self.engine.submit(sid, text, new_id(), draft=self.draft_key())
-        if changed and self.engine.steering:
-            task = asyncio.create_task(self.engine.steer(sid, text, seq))
-            self.steering.add(task)
-            task.add_done_callback(self.steering.discard)
+        self.engine.submit(sid, text, new_id(), draft=self.draft_key())
         self.editor.clear()
         self.inputs.restore()
         if self.sid:
@@ -1062,6 +1062,7 @@ class Window(QMainWindow):
         running = [j for j in active if j["status"] == "running"]
         approvals = self.state.get("approvals")
         stopping = self.sid in self.engine.stopping and not active
+        paused = bool(self.state["session"].get("paused_work"))
         phases = [self.engine.activity[j["id"]] for j in running if j["id"] in self.engine.activity]
         labels = [PROVIDER_NAMES[PROVIDERS[j["kind"]]] + " · " + LABELS[j["kind"]] for j in running]
         running_text = "、".join(dict.fromkeys(labels))
@@ -1082,7 +1083,7 @@ class Window(QMainWindow):
             text = "进行中　" + running_text
         elif active:
             text = "任务已排队" if any(j["status"] == "ready" for j in active) else "正在等待前置任务"
-        elif tasks and tasks[-1]["status"] == "stopped":
+        elif paused or tasks and tasks[-1]["status"] == "stopped":
             text = "任务已停止"
         else:
             text = ""
@@ -1093,6 +1094,13 @@ class Window(QMainWindow):
         self.work_progress.setVisible(bool(stopping or self.backend_task or running and not approvals))
         self.stop_button.setVisible(bool(active or stopping))
         self.stop_button.setEnabled(bool(active))
+        self.continue_button.setVisible(paused and not stopping)
+        guiding = any(accepts_guidance(j) for j in active)
+        action = "发送引导" if guiding else "带着补充要求继续" if paused else "发送消息"
+        self.send_button.setAccessibleName(action)
+        self.send_button.setToolTip(action + "（Enter）")
+        if guiding or paused:
+            self.editor.setPlaceholderText("输入补充要求，按 Enter 引导当前任务…" if guiding else "输入补充要求后继续，或点击「继续」…")
         self.editor.can_interrupt = bool(active)
         self.activity_row.setVisible(bool(text))
         if getattr(self, "state", {}).get("session", {}).get("backend") == "clients":
@@ -1113,6 +1121,11 @@ class Window(QMainWindow):
             self.editor.can_interrupt = False
             self.work_status.setText("正在停止任务…")
             self.run_task(self.engine.stop_session(self.sid))
+
+    def continue_work(self):
+        if self.sid:
+            self.engine.continue_session(self.sid)
+            self.refresh()
 
     def status_action(self):
         if self.backend_error:

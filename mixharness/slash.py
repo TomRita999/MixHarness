@@ -235,6 +235,8 @@ def status_text(engine, session):
             *((PROVIDER_NAMES[p], f"{session[p]} · {session['efforts'].get(p) or '默认'}") for p in CLIENTS)]
     if session["speed"] != "standard":
         rows.append(("Codex 速度", SPEEDS[session["speed"]]))
+    if session["paused_work"]:
+        rows.append(("任务状态", "已停止 · /continue 继续"))
     if session["daybreak"]:
         rows.append(("Daybreak", "已开启"))
     if session["objective"]:
@@ -448,6 +450,19 @@ async def execute_command(engine, args):
     elif cmd == "stop":
         count = await engine.stop_session(sid)
         text = f"已停止 {count} 项任务" if count else "当前会话没有待停止的任务"
+    elif cmd == "continue":
+        if arg:
+            if not session["paused_work"]:
+                raise ValueError("当前会话没有已停止的任务")
+            engine.submit(sid, arg, new_id(), intent="steer")
+            text = "已按补充要求继续任务"
+        else:
+            text = "已继续任务" if engine.continue_session(sid) else "当前会话没有已停止的任务"
+    elif cmd in ("steer", "revise"):
+        if not arg:
+            raise ValueError("/" + cmd + " " + COMMANDS[cmd].usage())
+        engine.submit(sid, arg, new_id(), intent=cmd)
+        text = "已提交任务引导" if cmd == "steer" else "已提交新需求"
     elif cmd == "export":
         text = transcript(engine.store, sid)
         if arg:
@@ -476,8 +491,7 @@ async def execute_command(engine, args):
         text = goal_text(engine.store.session(sid))
     elif cmd == "init":
         request = "阅读项目文件，按构建方式、测试命令与已有约定在根目录创建或更新 AGENTS.md，保留现有规则。"
-        engine.submit(sid, request, new_id())
-        await engine.steer(sid, request)
+        engine.submit(sid, request, new_id(), intent="revise")
         text = "已提交项目说明任务"
     elif cmd == "review":
         question = ("审查任务所列的 Git 暂存区、工作区和新增文件。用快照核对改动，给出具体问题、位置和依据。"

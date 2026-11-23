@@ -11,6 +11,7 @@ from pathlib import Path
 import frontmatter
 
 from mixharness.agent_settings import AgentSettings, compact_context, encode_context, shared_input, skill_catalog, tokens
+from mixharness.catalog import MODELS
 from mixharness.commands import dispatch
 from mixharness.engine import open_engine
 from mixharness.store import new_id
@@ -27,6 +28,44 @@ class AgentTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.home = self.root / ".mixharness"
+
+    def test_stopped_goal_survives_restart_and_guidance_is_idempotent(self):
+        models = {p: names[0] for p, names in MODELS.items()}
+        with open_engine(self.root, self.home) as engine:
+            sid = engine.create_session(**models, mode="goal", directory=self.root)["id"]
+            other = engine.create_session(**models, directory=self.root)["id"]
+            engine.submit(sid, "核对 Python 项目标注的最低版本。", new_id())
+            engine.submit(other, "整理依赖项。", new_id())
+            jid = engine.store.active_jobs(sid)[0]["id"]
+            self.assertEqual(asyncio.run(engine.stop_session(sid)), 1)
+            self.assertEqual(asyncio.run(engine.stop_session(sid)), 0)
+            self.assertEqual(engine.store.job(jid)["status"], "stopped")
+        with open_engine(self.root, self.home) as engine:
+            self.assertTrue(engine.store.session(sid)["paused_work"])
+            self.assertIsNone(engine.store.session(other)["paused_work"])
+            self.assertEqual(engine.continue_session(sid), 1)
+            self.assertEqual(engine.continue_session(sid), 0)
+            session = engine.store.session(sid)
+            self.assertEqual((session["mode"], session["goal_status"], session["planned"]), ("goal", "active", 0))
+            self.assertEqual(engine.store.active_jobs(sid)[0]["id"], jid)
+            text, request = "同时核对 Windows 安装说明。", new_id()
+            seq, changed = engine.submit(sid, text, request)
+            self.assertTrue(changed)
+            self.assertEqual(engine.submit(sid, text, request), (seq, False))
+            second, _ = engine.submit(sid, "在最后列出相关文件名。", new_id())
+            self.assertEqual(engine.store.job(jid)["guide_seq"], second)
+            self.assertEqual(engine.store.active_jobs(other)[0]["guide_seq"], 0)
+            self.assertEqual(engine.store.session(sid)["revision"], 1)
+            async def stop_and_send():
+                stop = asyncio.create_task(engine.stop_session(sid))
+                await asyncio.sleep(0)
+                engine.submit(sid, "继续", new_id())
+                await stop
+            asyncio.run(stop_and_send())
+            self.assertEqual(engine.store.active_jobs(sid)[0]["id"], jid)
+            engine.submit(sid, "改为只分析依赖。", new_id(), intent="revise")
+            self.assertEqual(engine.store.job(jid)["status"], "obsolete")
+            self.assertEqual(engine.store.session(sid)["revision"], 2)
 
     def test_terminal_commands_resume_fork_and_persistence(self):
         content = "请检查项目的构建命令。"

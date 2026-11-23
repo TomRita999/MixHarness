@@ -95,6 +95,7 @@ async def dispatch(engine, args):
         return {"version": version, "events": events, "approvals": engine.store.approvals(sid),
                 "needs_key": [j for j in jobs if j["status"] == "needs_key"], "active_count": len(jobs),
                 "running": [j for j in jobs if j["status"] == "running"], "stopping": sid in engine.stopping,
+                "can_continue": bool(session["paused_work"]),
                 "speed_options": list(options), "daybreak_available": daybreak_options or session["daybreak"],
                 "workspace": session["workspace"]}
     if cmd == "settings":
@@ -167,9 +168,7 @@ async def dispatch(engine, args):
                 await asyncio.gather(*(engine.client_catalogs[p].refresh() for p in efforts))
             engine.set_choices(sid, {p: (session[p], e) for p, e in efforts.items()})
     if cmd in ("send", "run"):
-        seq, changed = engine.submit(sid, message, args.get("request_id") or new_id(), attachments=attachments)
-        if changed:
-            await engine.steer(sid, message, seq)
+        seq, _ = engine.submit(sid, message, args.get("request_id") or new_id(), attachments=attachments)
         if not args.get("wait"):
             return {"source": "mixharness", "id": sid, "seq": seq}
     elif cmd != "wait":

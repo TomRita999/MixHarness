@@ -31,7 +31,7 @@ GOAL_STATES = {"": "待设置", "active": "进行中", "paused": "已暂停", "b
 STATUSES = {"ready": "待执行", "running": "进行中", "needs_key": "等待密钥", "waiting": "等待中",
             "done": "已完成", "failed": "失败", "obsolete": "已跳过", "stopped": "已停止"}
 ACTIVE_STATUSES = {"ready", "running", "waiting", "needs_key"}
-JSON_FIELDS = {"brief", "versions", "basis", "payload", "args", "result", "meta", "backend_models", "efforts"}
+JSON_FIELDS = {"brief", "versions", "basis", "payload", "args", "result", "meta", "backend_models", "efforts", "paused_work"}
 
 
 def pack(value):
@@ -44,6 +44,11 @@ def now():
 
 def new_id():
     return uuid4().hex
+
+
+def accepts_guidance(job):
+    return job["status"] in ("running", "waiting") or (
+        job["status"] in ("ready", "needs_key") and (job["guide_seq"] > 0 or job["approval_epoch"] > 0 or job["kind"] != "plan"))
 
 
 def unpack(row):
@@ -130,6 +135,11 @@ class Store:
                     if field not in columns:
                         self.db.execute(f"ALTER TABLE {table} ADD COLUMN {field} INTEGER NOT NULL DEFAULT 0")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(sessions)")}
+            migrate_stops = "paused_work" not in columns
+            if migrate_stops:
+                self.db.execute("ALTER TABLE sessions ADD COLUMN paused_work TEXT")
+                self.db.execute("ALTER TABLE jobs ADD COLUMN guide_seq INTEGER NOT NULL DEFAULT 0")
+                self.db.execute("ALTER TABLE jobs ADD COLUMN approval_epoch INTEGER NOT NULL DEFAULT 0")
             if "daybreak" not in columns:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN daybreak INTEGER NOT NULL DEFAULT 0")
             if "mode" not in columns:
@@ -168,7 +178,35 @@ class Store:
             self.db.execute("CREATE INDEX IF NOT EXISTS project_sessions ON sessions(project_id,updated)")
             self.db.execute("UPDATE jobs SET status='ready' WHERE status='running'")
             self.db.execute("UPDATE approvals SET decision='expired' WHERE decision='pending' AND source!='MixHarness'")
+            if migrate_stops:
+                self.migrate_stopped_jobs()
         self.inputs = InputLibrary(self.db)
+
+    def migrate_stopped_jobs(self):
+        # 旧版只记录停止数量。仅恢复能从最后一条停止记录确定的那批任务。
+        stops = self.rows("SELECT e.sid,json_extract(e.meta,'$.stopped') AS count FROM events e "
+                          "WHERE e.seq=(SELECT MAX(seq) FROM events WHERE sid=e.sid) "
+                          "AND json_extract(e.meta,'$.stopped')>0")
+        for stop in stops:
+            sid = stop["sid"]
+            session = self.session(sid)
+            jobs = self.rows("SELECT id,kind,basis,payload FROM jobs WHERE sid=? AND status='stopped'", sid)
+            if len(jobs) != stop["count"] or self.active_jobs(sid):
+                continue
+            if any(j["payload"].get("revision", session["revision"]) != session["revision"] or
+                   any(session["versions"][key] != v for key, v in j["basis"].items()) for j in jobs):
+                continue
+            planned = session["planned"]
+            if any(j["kind"] == "plan" for j in jobs):
+                planned = self.one("SELECT COALESCE(MAX(json_extract(meta,'$.revision')),0) AS n FROM events "
+                                   "WHERE sid=? AND kind='requirements'", sid)["n"]
+            prior = [{"id": j["id"], "status": "ready"} for j in jobs]
+            mode, goal = session["mode"], session["goal_status"]
+            if goal == "paused" and any(j["kind"] == "goal_check" for j in jobs):
+                mode, goal = "goal", "active"
+            self.db.execute("UPDATE sessions SET paused_work=? WHERE id=?",
+                            (pack(dict(jobs=prior, mode=mode, goal_status=goal, planned=planned)), sid))
+            self.db.executemany("UPDATE jobs SET approval_epoch=1 WHERE id=?", [(j["id"],) for j in jobs])
 
     def rows(self, sql, *params):
         return [unpack(row) for row in self.db.execute(sql, params)]
@@ -400,6 +438,8 @@ class Store:
             (jid, session["id"], kind, title or LABELS[kind], session[provider], session["efforts"].get(provider, ""),
              pack(basis), pack(payload or {}), now()),
         )
+        if session.get("paused_work"):
+            self.db.execute("UPDATE sessions SET paused_work=NULL WHERE id=?", (session["id"],))
         return jid
 
     def fork_session(self, sid, title, *, workspace=None, side=False):
@@ -451,6 +491,7 @@ class Store:
         sent = self.rows("SELECT seq FROM events WHERE sid=? AND client_id=?", sid, client_id)
         if sent:
             return sent[0]["seq"]
+        self.db.execute("UPDATE sessions SET paused_work=NULL WHERE id=? AND paused_work IS NOT NULL", (sid,))
         staged = self.inputs.metadata(draft) if draft else []
         if not body.strip() and not attachments and not staged:
             raise ValueError("请输入消息或添加附件")
@@ -477,13 +518,61 @@ class Store:
             self.enqueue(session, "plan", {"revision": rev})
         return seq
 
+    def active_jobs(self, sid):
+        return self.rows("SELECT id,kind,status,guide_seq,approval_epoch FROM jobs WHERE sid=? AND status IN "
+                         "('ready','running','waiting','needs_key') ORDER BY rowid", sid)
+
+    def guide_message(self, sid, body, client_id, jobs, draft, attachments):
+        staged = self.inputs.metadata(draft) if draft else []
+        if not body.strip() and not attachments and not staged:
+            raise ValueError("请输入引导内容或添加附件")
+        session = self.session(sid)
+        seq = self.event(sid, "message", "user", body, {"guide": True, "revision": session["revision"],
+                                                      "jobs": [j["id"] for j in jobs]}, client_id)
+        self.inputs.commit_message(seq, draft, attachments)
+        withdrawn = pack({"cancelled": True, "reason": "用户补充了要求，请根据最新消息重新判断是否需要这项操作。"})
+        for job in jobs:
+            jid = job["id"]
+            self.db.execute("UPDATE jobs SET guide_seq=? WHERE id=?", (seq, jid))
+            self.db.execute("UPDATE calls SET result=? WHERE job=? AND result IS NULL AND child IS NULL "
+                            "AND cursor=(SELECT cursor FROM jobs WHERE id=?)", (withdrawn, jid, jid))
+            self.db.execute("UPDATE approvals SET decision='expired' WHERE job=? AND decision='pending'", (jid,))
+        return seq
+
     def stop_jobs(self, sid, *, user_requested=False):
+        if user_requested:
+            jobs = self.active_jobs(sid)
+            if not jobs:
+                return 0
+            session = self.session(sid)
+            checkpoint = {field: session[field] for field in ("mode", "goal_status", "planned")}
+            checkpoint["jobs"] = [{"id": j["id"], "status": j["status"]} for j in jobs]
+            self.db.execute("UPDATE sessions SET paused_work=? WHERE id=?", (pack(checkpoint), sid))
+            self.db.executemany("UPDATE jobs SET approval_epoch=approval_epoch+1 WHERE id=?", [(j["id"],) for j in jobs])
+        else:
+            self.db.execute("UPDATE sessions SET paused_work=NULL WHERE id=? AND paused_work IS NOT NULL", (sid,))
         status = "stopped" if user_requested else "obsolete"
         count = self.db.execute("UPDATE jobs SET status=? WHERE sid=? AND status IN "
                                 "('ready','running','waiting','needs_key')", (status, sid)).rowcount
         self.db.execute("UPDATE approvals SET decision='expired' WHERE sid=? AND decision='pending'", (sid,))
         self.db.execute("UPDATE sessions SET planned=revision WHERE id=?", (sid,))
         return count
+
+    def continue_jobs(self, sid):
+        session = self.session(sid)
+        checkpoint = session["paused_work"]
+        if not checkpoint:
+            return 0
+        for job in checkpoint["jobs"]:
+            status = "ready" if job["status"] == "running" else job["status"]
+            provider = PROVIDERS[self.job(job["id"])["kind"]]
+            self.db.execute("UPDATE jobs SET status=?,model=?,effort=? WHERE sid=? AND id=? AND status='stopped'",
+                            (status, session[provider], session["efforts"].get(provider, ""), sid, job["id"]))
+        self.db.execute("UPDATE sessions SET planned=?,mode=?,goal_status=?,paused_work=NULL WHERE id=?",
+                        (checkpoint["planned"], checkpoint["mode"], checkpoint["goal_status"], sid))
+        self.wake(sid)
+        self.event(sid, "progress", "system", "已继续上次停止的任务", {"continued": len(checkpoint["jobs"])})
+        return len(checkpoint["jobs"])
 
     def change_mode(self, sid, mode, *, objective=None):
         if mode not in MODES:
@@ -514,6 +603,9 @@ class Store:
             if action == "resume":
                 if session["goal_status"] not in ("paused", "blocked"):
                     raise ValueError("只有暂停或需要补充的目标可以继续")
+                if session["paused_work"] and session["paused_work"]["mode"] == "goal":
+                    self.continue_jobs(sid)
+                    return
                 self.stop_jobs(sid)
                 self.db.execute("UPDATE sessions SET mode='goal' WHERE id=?", (sid,))
                 self._message(sid, "继续当前目标", new_id())
@@ -524,7 +616,8 @@ class Store:
                     self.stop_jobs(sid)
                     self.db.execute("UPDATE sessions SET mode='default' WHERE id=?", (sid,))
                 if action == "clear":
-                    self.db.execute("UPDATE sessions SET objective='',goal_status='',goal_note='',goal_next='' WHERE id=?", (sid,))
+                    self.db.execute("UPDATE sessions SET objective='',goal_status='',goal_note='',goal_next='',paused_work=NULL "
+                                    "WHERE id=?", (sid,))
                 else:
                     self.db.execute("UPDATE sessions SET goal_status='paused' WHERE id=?", (sid,))
                 self.event(sid, "progress", "system", "目标已暂停" if action == "pause" else "目标已清除")
@@ -763,7 +856,7 @@ class Store:
             self.enqueue(session, "goal_check", {"revision": session["revision"]})
 
     def task_summaries(self, sid, *, with_output=True):
-        columns = "id,kind,status,basis,json_extract(payload,'$.direct') AS direct"
+        columns = "id,kind,status,guide_seq,approval_epoch,basis,json_extract(payload,'$.direct') AS direct"
         if with_output:
             columns += ",title,model,effort,draft,error,at"
         return self.rows(f"SELECT {columns} FROM jobs WHERE sid=? ORDER BY rowid", sid)

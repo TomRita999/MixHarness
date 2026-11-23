@@ -346,10 +346,11 @@ def project_reads(engine, job, cwd, paths, client, directory=None):
 
 
 @asynccontextmanager
-async def interruptible_turn(engine, job, client, rpc, interrupt):
+async def interruptible_turn(engine, job, client, rpc, interrupt, checkpoint):
     try:
         yield
     except asyncio.CancelledError:
+        engine.remember_interruption(job, *checkpoint())
         rpc.handle_request = None
         try:
             async with asyncio.timeout(3):
@@ -415,7 +416,7 @@ async def codex_turn(engine, job, cwd, prompt, schema):
             raise ClientError("Codex 未启用临时线程，已取消本次调用")
         if readonly and (started["sandbox"]["type"] != "readOnly" or started["approvalPolicy"] != "never"):
             raise ClientError("Codex 未确认只读权限，任务已停止")
-        fragments, complete, final, plan_text = [], None, "", ""
+        fragments, actions, complete, final, plan_text = [], [], None, "", ""
         turn_id = None
         def event(method, params):
             nonlocal complete, final, plan_text, turn_id
@@ -432,9 +433,13 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                 plan_text = params["item"]["text"]
             elif method == "item/completed" and params["item"]["type"] == "commandExecution":
                 item = params["item"]
+                actions.append({"命令": item["command"][:500], "退出码": item.get("exitCode")})
                 if item.get("exitCode") == 0:
                     project_reads(engine, job, cwd, (a["path"] for a in item["commandActions"] if a["type"] == "read"),
                                   "Codex", item.get("cwd"))
+            elif method == "item/completed" and params["item"]["type"] == "fileChange":
+                item = params["item"]
+                actions.append({"文件变更": [c["path"] for c in item["changes"]][:20], "状态": item["status"]})
             elif method == "turn/completed":
                 complete = params["turn"]
         params = {"threadId": tid, "model": model, "serviceTier": tier, "outputSchema": schema,
@@ -466,8 +471,16 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                     await rpc.dispatch(await rpc.read(), terminal_event)
             return complete["status"]
 
-        async with interruptible_turn(engine, job, "Codex", rpc, interrupt):
+        async with interruptible_turn(engine, job, "Codex", rpc, interrupt,
+                                      lambda: (plan_text or final or "".join(fragments), actions)):
             turn_id = (await rpc.request("turn/start", params, event))["turn"]["id"]
+            async def steer(text, images):
+                result = await rpc.request_during_turn("turn/steer", {
+                    "threadId": tid, "expectedTurnId": turn_id,
+                    "input": [{"type": "text", "text": text}, *image_parts(images, "codex")]})
+                if result["turnId"] != turn_id:
+                    raise ClientError("Codex 返回了其他轮次的引导回执")
+            engine.register_steering(job, steer)
             engine.set_activity(job, "Codex 已开始生成")
             while complete is None:
                 await rpc.dispatch(await rpc.read(), event)
@@ -541,7 +554,7 @@ async def antigravity_turn(engine, job, cwd, prompt):
             result = await rpc.response(rpc.counter)
             return result["stopReason"]
 
-        async with interruptible_turn(engine, job, "Antigravity", rpc, interrupt):
+        async with interruptible_turn(engine, job, "Antigravity", rpc, interrupt, lambda: ("".join(fragments), ())):
             engine.set_activity(job, "正在向 Antigravity 发送请求")
             result = await rpc.request("session/prompt", {"sessionId": bound, "prompt": parts}, event)
         if result["stopReason"] != "end_turn":

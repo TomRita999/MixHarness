@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlsplit
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -81,6 +81,7 @@ class ImageInput(BaseModel):
 
 class Message(BaseModel):
     text: str = Field(default="", max_length=120000)
+    intent: Literal["auto", "steer", "revise"] = "auto"
     images: list[ImageInput] = Field(default_factory=list, max_length=MAX_ITEMS)
     client_id: str = Field(min_length=1, max_length=100)
 
@@ -275,17 +276,23 @@ def create_app(project=None, home=None):
         return view_state(e.store, sid)
 
     @app.post("/api/sessions/{sid}/messages", status_code=202)
-    async def message(sid: str, data: Message, background: BackgroundTasks):
+    async def message(sid: str, data: Message):
         text = data.text.strip()
         e = app.state.engine
         try:
             images = [Attachment.image(i.name, base64.b64decode(i.data, validate=True)) for i in data.images]
-            seq, changed = e.submit(sid, text, data.client_id, attachments=images)
+            seq, _ = e.submit(sid, text, data.client_id, attachments=images, intent=data.intent)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
-        if changed:
-            background.add_task(e.steer, sid, text, seq)
         return {"seq": seq}
+
+    @app.post("/api/sessions/{sid}/stop")
+    async def stop_work(sid: str):
+        return {"stopped": await app.state.engine.stop_session(sid)}
+
+    @app.post("/api/sessions/{sid}/continue")
+    async def continue_work(sid: str):
+        return {"continued": app.state.engine.continue_session(sid)}
 
     @app.post("/api/sessions/{sid}/tasks/{jid}/retry")
     async def retry(sid: str, jid: str, read_only: bool = False):

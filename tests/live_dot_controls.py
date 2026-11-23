@@ -58,6 +58,41 @@ async def stop_native(engine, session, question, phase, window=None):
     assert len(receipts) == 1 and receipts[0] in ("interrupted", "cancelled"), receipts
     assert task["id"] not in engine.activity
     print(phase + "，客户端已确认中断", flush=True)
+    jid = task["id"]
+    bound = state["session"]["antigravity_session"]
+    if window:
+        QTest.mouseClick(window.continue_button, Qt.MouseButton.LeftButton)
+    else:
+        await dispatch(engine, {"command": "command", "id": sid, "line": "/continue"})
+    async with asyncio.timeout(120):
+        while engine.activity.get(jid) != phase:
+            task = engine.store.job(jid)
+            assert task["status"] not in ("failed", "done"), task["error"]
+            await asyncio.sleep(0.02)
+    if window:
+        window.refresh()
+        assert window.send_button.accessibleName() == "发送引导"
+        message = ("将计划缩短为两句话，标题用「本机续写验收」。写清如何用 mixharness --version 核对安装版本，"
+                   "以及输出什么算通过。这就是全部验收条件，可以直接给出计划。")
+        window.editor.setPlainText(message)
+        QTest.keyClick(window.editor, Qt.Key.Key_Return)
+    else:
+        message = "取消发布过程梳理。这是一个简单问候，请直接在 reply 中回复「会话可以继续」。开发、验证和报告均无须安排。"
+        await dispatch(engine, {"command": "send", "id": sid, "message": message})
+    final = await settled(engine, sid, 450, return_on_approval=True)
+    assert not final["approvals"]
+    assert engine.store.job(jid)["status"] == "done", engine.store.job(jid)["error"]
+    assert len([t for t in final["tasks"] if t["kind"] == task["kind"]]) == 1
+    guides = [e for e in final["events"] if e["meta"].get("guide")]
+    assert len(guides) == 1 and guides[0]["body"] == message and guides[0]["meta"]["jobs"] == [jid]
+    if window:
+        assert "本机续写验收" in engine.store.job(jid)["draft"]
+        ack = [e for e in final["events"] if e["meta"].get("guide_seq") == guides[0]["seq"]]
+        print("Codex 已按执行中发出的引导生成计划，" + ("原生轮次已确认接收" if ack else "已从同一任务重新生成"), flush=True)
+    else:
+        assert bound and bound == final["session"]["antigravity_session"]
+        assert any(e["actor"] == "gemini" and e["kind"] == "message" and "会话可以继续" in e["body"] for e in final["events"])
+        print("Antigravity 已在原会话和原任务接收引导并修改回复", flush=True)
 
 
 async def main():
@@ -105,12 +140,13 @@ async def main():
                 window = Window(engine, QSettings(str(work / "ui.ini"), QSettings.Format.IniFormat))
                 window.show()
                 try:
-                    await stop_native(engine, engine.create_session(**options, mode="plan"),
-                                      "逐项核对 pyproject.toml 中的依赖和命令入口，制定跨平台测试计划。", "Codex 已开始生成", window)
+                    async with asyncio.TaskGroup() as controls:
+                        controls.create_task(stop_native(engine, engine.create_session(**options, mode="plan"),
+                                             "根据 pyproject.toml 写一份简短计划，说明如何核对命令行入口。", "Codex 已开始生成", window))
+                        controls.create_task(stop_native(engine, engine.create_session(**options),
+                                             "根据项目配置梳理跨平台发布过程，先分析要执行哪些任务。", "Antigravity 正在处理请求"))
                 finally:
                     window.close()
-                await stop_native(engine, engine.create_session(**options),
-                                  "根据项目配置梳理跨平台发布过程，先分析要执行哪些任务。", "Antigravity 正在处理请求")
                 engine.submit(sid, "请 GPT 更新刚才生成的 package-name.txt，在包名后面加一个空格和 pyproject.toml "
                                    "中的版本号，再换行。只改这个文件。", new_id())
                 pending = await settled(engine, sid, 300, return_on_approval=True)
@@ -122,6 +158,18 @@ async def main():
                 assert stored["decision"] == "expired" and not engine.store.approvals(sid)
                 assert target.read_text(encoding="utf-8") == name + "\n"
                 print("等待批准时停止任务，审批已过期，文件保留上次批准的内容", flush=True)
+                engine.continue_session(sid)
+                pending = await settled(engine, sid, 120, return_on_approval=True)
+                renewed, = pending["approvals"]
+                assert renewed["id"] != approval["id"] and renewed["job"] == approval["job"]
+                assert renewed["detail"] == approval["detail"]
+                engine.submit(sid, "取消文件写入。保持文件内容原样，仅在答复中写明「已保留原文件」。", new_id())
+                final = await settled(engine, sid, 300, return_on_approval=True)
+                assert not final["approvals"] and engine.store.job(renewed["job"])["status"] == "done"
+                assert engine.store.one("SELECT decision FROM approvals WHERE id=?", renewed["id"])["decision"] == "expired"
+                assert target.read_text(encoding="utf-8") == name + "\n"
+                assert "已保留原文件" in engine.store.job(renewed["job"])["draft"]
+                print("原任务已重新请求批准，并按运行中的引导撤回写入", flush=True)
             finally:
                 worker.cancel()
                 await asyncio.gather(worker, return_exceptions=True)

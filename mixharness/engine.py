@@ -9,13 +9,13 @@ from dotenv import dotenv_values
 from filelock import FileLock
 
 from . import workspace
-from .attachments import MAX_IMAGE_TOTAL, MAX_ITEMS, TYPES, image_parts
+from .attachments import MAX_IMAGE_TOTAL, MAX_ITEMS, TYPES
 from .agent_settings import AgentSettings, PERMISSIONS, SPEEDS, available_speeds, selected_skills, shared_input, skill_catalog
 from .catalog import ModelCatalog
 from .clients import CLIENTS, ClientCatalog, CodexTurnError, private_directory, workflow_turn
 from .providers import FUNCTIONS, tool_names, google_turn, openai_turn
 from .reasoning import api_levels, group_for, model_available, resolve_choice, select_daybreak_model
-from .store import PROVIDERS, Store, Superseded, new_id, now, pack
+from .store import PROVIDERS, Store, Superseded, accepts_guidance, new_id, now, pack
 
 
 @contextmanager
@@ -38,6 +38,7 @@ class Engine:
         self.stopping = {}
         self.activity = {}
         self.steering = {}
+        self.steer_workers = {}
         self.previews = {}
         self.changes = {}
         self.file_operations = {}
@@ -269,6 +270,8 @@ class Engine:
             return False
         if self.store.session(job["sid"])["permission"] != job["permission"]:
             return False
+        if self.store.job(job["id"])["guide_seq"] > job["guide_seq"]:
+            return False
         if job["permission"] == "full":
             return True
         deadline = self.deadlines.get(job["id"])
@@ -286,7 +289,10 @@ class Engine:
         session = self.store.session(job["sid"])
         if session["permission"] == "full" or (routine and session["permission"] == "auto"):
             return
-        key = workspace.digest(pack([job["id"], call["cursor"], call["cid"], detail]).encode())
+        identity = [job["id"], call["cursor"], call["cid"], detail]
+        if job.get("approval_epoch"):
+            identity.append(job["approval_epoch"])
+        key = workspace.digest(pack(identity).encode())
         if not await self.wait_approval(job, "MixHarness", title, detail, key):
             raise ValueError("用户已拒绝这次操作：" + title)
         await self.gate(job)
@@ -301,11 +307,46 @@ class Engine:
         return {alias: workspace.check_commands(root / "mixharness.toml", self.commands)
                 for alias, root in sources.folders.items()}
 
-    def submit(self, sid, text, client_id, *, draft=None, attachments=()):
-        previous = self.store.session(sid)["revision"]
-        seq = self.store.message(sid, text, client_id, draft=draft, attachments=attachments)
+    def submit(self, sid, text, client_id, *, draft=None, attachments=(), intent="auto"):
+        if len(text) > 120000:
+            raise ValueError("单条消息上限为 120,000 字符")
+        store = self.store
+        with store.db:
+            duplicate = store.rows("SELECT seq FROM events WHERE sid=? AND client_id=?", sid, client_id)
+            if duplicate:
+                return duplicate[0]["seq"], False
+            resumed = intent != "revise" and store.continue_jobs(sid)
+            jobs = store.active_jobs(sid)
+            guide = resumed or intent == "steer" or intent == "auto" and any(accepts_guidance(j) for j in jobs)
+            if (resumed and intent == "auto" and text.strip().casefold() in ("继续", "继续任务", "continue")
+                    and not attachments and not (draft and store.inputs.metadata(draft))):
+                guide = False
+                seq = store.event(sid, "message", "user", text, {"continue": True}, client_id)
+            elif not guide:
+                seq = store._message(sid, text, client_id, draft, attachments)
+            else:
+                if not jobs:
+                    raise ValueError("当前会话没有可以引导的任务")
+                approvals = {a["job"] for a in store.approvals(sid)}
+                seq = store.guide_message(sid, text, client_id, jobs, draft, attachments)
+        if guide:
+            for job in jobs:
+                if job["status"] != "running":
+                    continue
+                jid = job["id"]
+                if jid in self.steering and jid not in approvals:
+                    self.steering[jid].put_nowait((seq, text))
+                    self.set_activity(dict(id=jid, sid=sid), "正在发送引导")
+                else:
+                    self.restart_for_guidance(sid, jid)
         self.notify(sid)
-        return seq, self.store.session(sid)["revision"] != previous
+        return seq, True
+
+    def continue_session(self, sid):
+        with self.store.db:
+            count = self.store.continue_jobs(sid)
+        self.notify(sid)
+        return count
 
     def set_choices(self, sid, updates):
         session = self.store.session(sid)
@@ -347,6 +388,7 @@ class Engine:
         if job["kind"] == "goal_check" and (s["mode"] != "goal" or s["goal_status"] != "active"):
             raise ValueError("请先继续目标，再核对进度")
         with self.store.db:
+            self.store.db.execute("UPDATE sessions SET paused_work=NULL WHERE id=? AND paused_work IS NOT NULL", (sid,))
             if read_only and not job["payload"].get("read_only"):
                 self.store.db.execute("UPDATE jobs SET payload=?,cursor=NULL,seen=0 WHERE id=?",
                                       (pack(dict(job["payload"], read_only=True)), jid))
@@ -372,9 +414,9 @@ class Engine:
         store = self.store
         with store.db:
             session = store.session(sid)
-            jobs = store.rows("SELECT id FROM jobs WHERE sid=? AND status IN ('ready','running','waiting','needs_key')", sid)
+            jobs = store.active_jobs(sid)
             count = store.stop_jobs(sid, user_requested=True)
-            if session["goal_status"] == "active":
+            if count and session["goal_status"] == "active":
                 store.db.execute("UPDATE sessions SET goal_status='paused',mode='default' WHERE id=?", (sid,))
         previous = self.stopping.get(sid)
         if not count:
@@ -394,7 +436,8 @@ class Engine:
         async def finish():
             try:
                 await asyncio.gather(*pending, return_exceptions=True)
-                if store.rows("SELECT 1 FROM sessions WHERE id=?", sid):
+                if self.stopping.get(sid) is asyncio.current_task() and store.rows(
+                        "SELECT 1 FROM sessions WHERE id=? AND paused_work IS NOT NULL", sid):
                     with store.db:
                         store.event(sid, "progress", "system", f"已停止 {count} 项任务", {"stopped": count})
             finally:
@@ -499,26 +542,56 @@ class Engine:
                 size += item["size"]
         return list(reversed(images.values()))
 
-    async def steer(self, sid, text, seq=None):
-        if not self.steering:
+    def restart_for_guidance(self, sid, jid):
+        with self.store.db:
+            changed = self.store.db.execute("UPDATE jobs SET status='ready' WHERE sid=? AND id=? AND status='running'",
+                                            (sid, jid)).rowcount
+        task = self.active.get(jid)
+        if changed and task and not task.cancelling():
+            task.cancel()
+        self.notify(sid)
+
+    def remember_interruption(self, job, text, actions=()):
+        rows = self.store.rows("SELECT payload FROM jobs WHERE id=? AND status IN ('stopped','ready','needs_key')", job["id"])
+        if not rows:
             return
-        items = self.store.inputs.for_session(sid, seq - 1).get(seq, []) if seq else []
-        message = "共享会话收到用户补充。只处理与当前任务有关的要求。\n" + text
-        if items:
-            message += "\n随消息附加的材料：" + pack(self.describe_inputs(items))
-            message = [{"type": "message", "role": "user", "content": [
-                {"type": "input_text", "text": message}, *image_parts(self.image_inputs([items]), "openai")]}]
-        for jid, send in list(self.steering.items()):
-            if self.steering.get(jid) is not send or self.store.job(jid)["sid"] != sid:
-                continue
-            try:
-                await send(message)
-            except Exception:
-                if self.steering.get(jid) is not send:
-                    continue
+        payload = rows[0]["payload"]
+        previous = payload.get("interrupted_turn", {})
+        notes = [*previous.get("已完成的客户端操作", []), *actions][-20:]
+        partial = text.strip() or previous.get("未完成的回复", "")
+        if notes or partial:
+            payload["interrupted_turn"] = {"未完成的回复": partial[-3200:], "已完成的客户端操作": notes}
+            with self.store.db:
+                self.store.db.execute("UPDATE jobs SET payload=? WHERE id=?", (pack(payload), job["id"]))
+
+    def register_steering(self, job, send):
+        jid, sid = job["id"], job["sid"]
+        queue = self.steering[jid] = asyncio.Queue()
+
+        async def deliver():
+            while True:
+                seq, text = await queue.get()
+                items = self.store.inputs.for_session(sid, seq - 1).get(seq, [])
+                message = "用户对当前任务的最新引导。请调整接下来的工作，并保留原有的回复格式。\n" + text
+                if items:
+                    message += "\n本条消息的附件：" + pack(self.describe_inputs(items))
+                try:
+                    async with asyncio.timeout(12):
+                        await send(message, self.image_inputs([items]))
+                except Exception:
+                    # 引导已持久化。客户端拒收或断线时，用原任务重新读取引导。
+                    if self.steering.get(jid) is queue:
+                        self.restart_for_guidance(sid, jid)
+                    return
+                job["guide_seq"] = seq
+                if self.steering.get(jid) is not queue:
+                    return
                 with self.store.db:
-                    self.store.event(sid, "progress", "system", "补充内容已写入会话，将在下一轮生效", {"job": jid})
-                self.notify(sid)
+                    client = "Codex" if job["backend"] == "clients" else "OpenAI"
+                    self.store.event(sid, "progress", "system", client + " 已接收本轮引导",
+                                     {"job": jid, "guide_seq": seq, "source": client})
+                self.set_activity(job, "已接收引导，正在继续任务")
+        self.steer_workers[jid] = asyncio.create_task(deliver())
 
     async def serve(self):
         cleanup = asyncio.create_task(self.clean_deleted())
@@ -539,7 +612,7 @@ class Engine:
                     "ORDER BY (j.kind='plan') DESC,j.rowid"
                 )
                 for job in ready:
-                    if job["id"] in self.active:
+                    if job["id"] in self.active or job["sid"] in self.stopping:
                         continue
                     provider = PROVIDERS[job["kind"]]
                     if job["backend"] == "api" and not self.keys[provider]:
@@ -609,6 +682,13 @@ class Engine:
         context = {"当前需求": session["brief"], "需求版本": session["versions"], "本次任务": job["payload"],
                    "共享记录": history, "任务": works, "可读取的成果": assets,
                    "各来源文件夹的验证命令": self.checks(self.sources(session))}
+        if job["guide_seq"]:
+            context["用户对本任务的引导"] = [e["body"] for e in self.store.rows(
+                "SELECT body FROM events WHERE sid=? AND seq>? AND seq<=? AND json_extract(meta,'$.guide')=1 "
+                "AND EXISTS(SELECT 1 FROM json_each(events.meta,'$.jobs') WHERE value=?) ORDER BY seq",
+                sid, request["seen"], job["guide_seq"], job["id"])]
+        if "interrupted_turn" in job["payload"]:
+            context["续写要求"] = "从中断处继续，核对当前文件和已完成的操作。未完成的回复仅供参考，按最新用户引导继续工作。"
         if session["mode"] == "goal" and session["objective"]:
             context["持续目标"] = session["objective"]
             context["上次目标核对"] = session["goal_note"]
@@ -732,9 +812,12 @@ class Engine:
                 else:
                     self.set_activity(job, "正在请求 OpenAI API")
                     reply = await openai_turn(key, request, context, results, preview,
-                                              lambda sender: self.steering.update({jid: sender}))
-                    self.steering.pop(jid, None)
+                                              lambda send: self.register_steering(request, send))
+            self.steering.pop(jid, None)
             await self.gate(job)
+            if self.store.job(jid)["guide_seq"] > request["guide_seq"]:
+                self.set_status(job, "ready")
+                return
             if job["kind"] == "plan":
                 self.store.apply_plan(job, reply.model_dump(), reply.reply)
                 return
@@ -756,6 +839,9 @@ class Engine:
                     return
             with self.store.db:
                 self.store.guard(job)
+                if self.store.job(jid)["guide_seq"] > request["guide_seq"]:
+                    self.store.db.execute("UPDATE jobs SET status='ready' WHERE id=?", (jid,))
+                    return
                 self.store.save_turn(job, reply.cursor, seen, reply.text, reply.calls, backend=job["backend"])
                 if reply.calls:
                     self.store.db.execute("UPDATE jobs SET status='ready' WHERE id=?", (jid,))
@@ -777,6 +863,8 @@ class Engine:
         except Superseded:
             return
         except asyncio.CancelledError:
+            if job["backend"] == "api":
+                self.remember_interruption(job, self.previews.get(jid, ""))
             if self.store.rows("SELECT 1 FROM jobs WHERE id=? AND status='running'", jid):
                 self.set_status(job, "ready")
             raise
@@ -787,7 +875,7 @@ class Engine:
                 if secret:
                     message = message.replace(secret, "[已隐藏]")
             if self.store.rows("SELECT 1 FROM jobs WHERE id=? AND status='running'", jid):
-                if not self.route_is_current(job):
+                if self.store.job(jid)["guide_seq"] > job["guide_seq"] or not self.route_is_current(job):
                     self.set_status(job, "ready")
                     return
                 with self.store.db:
@@ -799,6 +887,10 @@ class Engine:
             self.activity.pop(jid, None)
             self.deadlines.pop(jid, None)
             self.steering.pop(jid, None)
+            worker = self.steer_workers.pop(jid, None)
+            if worker:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
             self.previews.pop(jid, None)
             self.notify(sid)
 

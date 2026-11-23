@@ -43,6 +43,7 @@ class Rpc:
         self.argv, self.cwd = argv, cwd
         self.counter = 0
         self.handle_request = None
+        self.pending = {}
 
     async def __aenter__(self):
         self.process = await asyncio.create_subprocess_exec(
@@ -52,6 +53,9 @@ class Rpc:
         return self
 
     async def __aexit__(self, *exc):
+        for reply in self.pending.values():
+            if not reply.done():
+                reply.set_exception(ClientError("本轮客户端连接已结束"))
         self.process.stdin.close()
         if self.process.returncode is None:
             try:
@@ -91,6 +95,22 @@ class Rpc:
             await self.send({"jsonrpc": "2.0", "id": message["id"], **answer})
         elif method and notify:
             notify(method, message.get("params", {}))
+        elif not method and (reply := self.pending.get(message.get("id"))) is not None and not reply.done():
+            if "error" in message:
+                reply.set_exception(ClientError(message["error"].get("message") or str(message["error"].get("code"))))
+            else:
+                reply.set_result(message["result"])
+
+    async def request_during_turn(self, method, params):
+        # 正在执行的轮次独占 stdout，仍由它分派这条请求的回执。
+        self.counter += 1
+        number = self.counter
+        reply = self.pending[number] = asyncio.get_running_loop().create_future()
+        try:
+            await self.send({"jsonrpc": "2.0", "id": number, "method": method, "params": params})
+            return await reply
+        finally:
+            self.pending.pop(number, None)
 
     async def request(self, method, params, notify=None):
         self.counter += 1

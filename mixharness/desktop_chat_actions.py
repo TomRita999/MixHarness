@@ -7,7 +7,7 @@ from .chat_snapshot import snapshot_link, transcript
 from .desktop_style import THEMES
 from .desktop_widgets import Document, Editor, Timeline, button, label
 from .slash import mcp_text
-from .store import ACTIVE_STATUSES, new_id
+from .store import ACTIVE_STATUSES, accepts_guidance, new_id
 
 
 class McpDialog(QDialog):
@@ -127,6 +127,10 @@ class SideChat(QDockWidget):
         self.stop_button.setToolTip("停止侧边聊天任务（输入框内按 Esc）")
         activity.addWidget(self.stop_button)
         self.stop_button.hide()
+        self.continue_button = button("继续", self.continue_work, name="stopWork")
+        self.continue_button.setAccessibleName("继续侧边聊天任务")
+        activity.addWidget(self.continue_button)
+        self.continue_button.hide()
         layout.addLayout(activity)
         self.editor = Editor()
         self.editor.setAccessibleName("侧边问题")
@@ -152,6 +156,11 @@ class SideChat(QDockWidget):
             self.editor.can_interrupt = False
             self.status.setText("正在停止任务…")
             self.host.run_task(self.host.engine.stop_session(self.sid))
+
+    def continue_work(self):
+        if self.sid:
+            self.host.engine.continue_session(self.sid)
+            self.refresh()
 
     def send(self):
         question = self.editor.toPlainText().strip()
@@ -188,6 +197,7 @@ class SideChat(QDockWidget):
             self.editor.setEnabled(False)
             self.send_button.setEnabled(False)
             self.stop_button.hide()
+            self.continue_button.hide()
             return
         self.timeline.update_events(state["events"], THEMES[self.host.theme])
         latest = state["tasks"][-1] if state["tasks"] else None
@@ -200,3 +210,9 @@ class SideChat(QDockWidget):
         self.stop_button.setVisible(stopping or status in ACTIVE_STATUSES)
         self.stop_button.setEnabled(status in ACTIVE_STATUSES)
         self.editor.can_interrupt = self.stop_button.isEnabled()
+        paused = bool(state["session"]["paused_work"])
+        self.continue_button.setVisible(paused and not stopping)
+        guiding = latest and accepts_guidance(latest)
+        self.send_button.setText("发送引导" if guiding else "补充并继续" if paused else "提问")
+        self.editor.setPlaceholderText("输入补充要求，引导当前回答…" if guiding else
+                                       "输入补充要求后继续，或点击「继续」…" if paused else "基于主对话问 GPT…")

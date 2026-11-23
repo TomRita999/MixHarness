@@ -7,7 +7,7 @@ from .slash_catalog import COMMANDS, matches
 
 ROLE = Qt.ItemDataRole.UserRole
 NEEDS_CHAT = {"btw", "share", "fork", "compact", "archive", "implement", "tools", "status", "rename",
-              "export", "approvals", "approve", "deny", "stop", "retry"}
+              "export", "approvals", "approve", "deny", "stop", "continue", "steer", "revise", "retry"}
 
 
 class CommandRow(QStyledItemDelegate):
@@ -150,7 +150,7 @@ class SlashMenu(QListWidget):
         if item and item.flags() & Qt.ItemFlag.ItemIsEnabled:
             name = item.data(ROLE)
             self.hide()
-            if name in ("approve", "deny", "retry"):
+            if name in ("approve", "deny", "retry", "steer", "revise"):
                 self.complete(name)
             else:
                 self.chosen.emit(name)

@@ -114,3 +114,14 @@ class HttpTests(unittest.TestCase):
                 self.assertEqual(state["session"]["efforts"], {"gemini": "medium", "openai": "high"})
                 self.assertEqual(state["session"]["gemini"], config["models"]["gemini"][0])
                 self.assertEqual(len([e for e in state["events"] if e["actor"] == "user"]), 2)
+                jid = state["tasks"][-1]["id"]
+                self.assertEqual(request(api + path + "/stop", "POST"), {"stopped": 1})
+            with service(project) as api:
+                self.assertEqual(request(api + path + "/continue", "POST"), {"continued": 1})
+                guide = {"intent": "steer", "text": "请用中文列出验证步骤。", "client_id": uuid4().hex}
+                receipt = request(api + path + "/messages", "POST", guide)
+                self.assertEqual(request(api + path + "/messages", "POST", guide), receipt)
+                state = request(api + path)
+                self.assertEqual(state["session"]["revision"], 2)
+                self.assertEqual(state["tasks"][-1]["id"], jid)
+                self.assertEqual(state["tasks"][-1]["guide_seq"], receipt["seq"])

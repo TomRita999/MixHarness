@@ -48,7 +48,10 @@ COMMANDS = {
     "approvals": Command("待批准操作", "查看待批准请求"),
     "approve": Command("批准操作", "允许请求", "审批编号"),
     "deny": Command("拒绝操作", "拒绝请求", "审批编号"),
-    "stop": Command("停止任务", "停止当前任务"),
+    "stop": Command("停止任务", "中断任务并保留进度"),
+    "continue": Command("继续任务", "从停止处继续，可以同时补充要求", "[补充要求]"),
+    "steer": Command("引导任务", "将补充要求交给当前任务", "补充要求"),
+    "revise": Command("修改需求", "让 Gemini 按新需求重新分配工作", "新需求"),
     "retry": Command("重试任务", "重新执行失败任务", "任务编号"),
     "settings": Command("设置", "技能与上下文"),
     "help": Command("指令帮助", "查看全部指令"),
@@ -59,6 +62,7 @@ ALIASES = {
     "models": "model", "config": "settings", "approvals-mode": "permissions", "sandbox": "permissions",
     "stats": "usage", "billing": "usage", "stop-agent": "stop", "side": "btw", "sidechat": "btw",
     "branch": "fork", "speed": "fast",
+    "继续": "continue", "引导": "steer",
     "侧边": "btw", "用量": "usage", "审查": "review", "归档": "archive", "快速": "fast", "压缩": "compact",
 }
 

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Literal
@@ -227,16 +228,25 @@ async def openai_turn(key, job, context, results, preview, register_steer):
             await connection.response.create(**options)
             current = None
             awaiting_successor = set()
+            committed = None
 
-            async def steer(message):
-                if current:
-                    awaiting_successor.add(current)
-                    await connection.response.steer(previous_response_id=current, input=message)
+            async def steer(text, images):
+                nonlocal committed
+                parent = current
+                committed = asyncio.get_running_loop().create_future()
+                awaiting_successor.add(parent)
+                content = [{"type": "input_text", "text": text}, *image_parts(images, "openai")]
+                await connection.response.steer(previous_response_id=parent, input=[
+                    {"type": "message", "role": "user", "content": content}])
+                await committed
 
             async for event in connection:
                 if event.type == "response.created":
+                    if current is None:
+                        register_steer(steer)
+                    elif current in awaiting_successor and committed is not None and not committed.done():
+                        committed.set_result(None)
                     current = event.response.id
-                    register_steer(steer)
                 elif event.type == "response.output_text.delta":
                     preview(event.delta)
                 elif event.type == "response.completed":
