@@ -3,10 +3,13 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,14 +34,18 @@ def visible(name):
             and not lower.endswith((".egg-info", ".pyc", ".pem", ".key")))
 
 
-def files(root, exclude=None):
+def files(root, exclude=None, *, cancelled=None):
     if not root.is_dir():
         raise FileNotFoundError(f"项目文件夹不存在：{root}")
     for folder, dirs, names in os.walk(root):
+        if cancelled is not None and cancelled.is_set():
+            raise InterruptedError("已停止读取项目文件")
         base = Path(folder)
         dirs[:] = sorted(d for d in dirs if visible(d) and not (base / d).is_symlink()
                          and (base / d).resolve() != exclude and (base / d).resolve().is_relative_to(root))
         for name in sorted(names):
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError("已停止读取项目文件")
             path = base / name
             if visible(name) and not path.is_symlink() and path.is_file():
                 yield path
@@ -69,23 +76,54 @@ def read_source(root, args):
             "text": "\n".join(lines[start - 1:start + 199])[:24000]}
 
 
-def review_changes(sources, exclude):
-    """Collect changed paths and bounded Git hunks alongside the review snapshot."""
+class ReviewCommands:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.process = None
+        self.stopped = False
+
+    def stop(self):
+        with self.lock:
+            self.stopped = True
+            if self.process is not None and self.process.poll() is None:
+                self.process.kill()
+
+    @contextmanager
+    def open(self, args):
+        with self.lock:
+            if self.stopped:
+                raise InterruptedError("已停止读取 Git 改动")
+            self.process = process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                      stderr=subprocess.DEVNULL)
+        try:
+            with process:
+                yield process
+        finally:
+            with self.lock:
+                self.process = None
+
+
+def review_changes(sources, exclude, *, commands=None):
+    """从项目的暂存区和工作区读取限长的 Git 差异。"""
+    commands = commands or ReviewCommands()
     sections = []
     if not shutil.which("git"):
         return "本机未安装 Git，可按关注点审查项目文件。"
     remaining = 32000
     for name, folder in sources.folders.items():
         git = ["git", "--literal-pathspecs", "-C", str(folder)]
-        top = subprocess.run([*git, "rev-parse", "--show-toplevel"], capture_output=True)
-        if top.returncode:
+        with commands.open([*git, "rev-parse", "--show-toplevel"]) as process:
+            top, _ = process.communicate()
+        if process.returncode:
             sections.append(name + " · 普通目录，可按关注点审查项目文件。")
             continue
-        root = Path(os.fsdecode(top.stdout).rstrip("\r\n"))
-        status = subprocess.run([*git, "status", "--porcelain=v1", "-z", "--no-renames", "-uall", "--", "."],
-                                capture_output=True, check=True)
+        root = Path(os.fsdecode(top).rstrip("\r\n"))
+        with commands.open([*git, "status", "--porcelain=v1", "-z", "--no-renames", "-uall", "--", "."]) as process:
+            status, _ = process.communicate()
+            if process.returncode:
+                raise subprocess.CalledProcessError(process.returncode, process.args)
         files = []
-        for entry in status.stdout.split(b"\0"):
+        for entry in status.split(b"\0"):
             if not entry:
                 continue
             path = root / os.fsdecode(entry[3:])
@@ -104,7 +142,7 @@ def review_changes(sources, exclude):
             if remaining <= 0:
                 break
             args = [*git, "diff", "--relative", "--no-ext-diff", "--no-textconv", "--no-renames", *flags, "--", *tracked]
-            with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+            with commands.open(args) as process:
                 data = process.stdout.read(remaining + 1)
                 if len(data) > remaining:
                     process.kill()
@@ -143,12 +181,15 @@ def edit_source(root, args):
 class Sources:
     folders: dict[str, Path]
 
-    def paths(self, exclude=None):
+    def paths(self, exclude=None, *, cancelled=None):
         multiple = len(self.folders) > 1
         for name, root in self.folders.items():
-            for path in files(root, exclude):
+            for path in files(root, exclude, cancelled=cancelled):
                 relative = path.relative_to(root)
                 yield (Path(name) / relative if multiple else relative), path
+
+    def list_files(self, exclude=None, *, cancelled=None):
+        return [relative.as_posix() for relative, _ in self.paths(exclude, cancelled=cancelled)]
 
     def locate(self, relative):
         parts = Path(relative)
@@ -162,7 +203,7 @@ class Sources:
         return Sources({k: path / k if len(self.folders) > 1 else path for k in self.folders})
 
 
-def fingerprint(root, copy_to=None, exclude=None):
+def fingerprint(root, copy_to=None, exclude=None, *, cancelled=None):
     sources = root if isinstance(root, Sources) else Sources({"": root})
     manifest = hashlib.sha256()
     if len(sources.folders) > 1:
@@ -170,25 +211,31 @@ def fingerprint(root, copy_to=None, exclude=None):
         if copy_to is not None:
             for alias in sources.folders:
                 (copy_to / alias).mkdir(exist_ok=True)
-    for name, path in sources.paths(exclude):
+    for name, path in sources.paths(exclude, cancelled=cancelled):
         checksum = hashlib.sha256()
+        output = nullcontext()
         if copy_to is not None:
             destination = copy_to / name
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
-            path = destination
-        with path.open("rb") as stream:
+            output = destination.open("wb")
+        with output as target, path.open("rb") as stream:
             for block in iter(lambda: stream.read(262144), b""):
+                if cancelled is not None and cancelled.is_set():
+                    raise InterruptedError("已停止读取项目文件")
                 checksum.update(block)
+                if target is not None:
+                    target.write(block)
+        if copy_to is not None:
+            shutil.copystat(path, destination)
         manifest.update(name.as_posix().encode() + b"\0" + checksum.digest())
     return manifest.hexdigest()
 
 
-def snapshot(root, parent, exclude=None):
+def snapshot(root, parent, exclude=None, *, cancelled=None):
     parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(dir=parent, prefix=".mixharness-"))
     try:
-        version = fingerprint(root, staging, exclude)
+        version = fingerprint(root, staging, exclude, cancelled=cancelled)
         target = parent / version
         if not target.exists():
             staging.rename(target)
@@ -226,8 +273,30 @@ async def run_check(source, runs, argv, timeout=180, invocation=None, project=No
         python = str(venv) if venv.is_file() else ("" if frozen else sys.executable)
     command = [sys.executable, runner, str(run_dir), str(source), str(timeout), python, subdirectory, *argv]
     env = {k: v for k, v in os.environ.items() if not any(word in k.upper() for word in ("KEY", "TOKEN", "PASSWORD", "SECRET"))}
-    await asyncio.to_thread(subprocess.run, command, check=True, env=env, stdin=subprocess.DEVNULL,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    launching = asyncio.create_task(asyncio.create_subprocess_exec(
+        *command, env=env, stdin=subprocess.DEVNULL, start_new_session=os.name != "nt",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
+    try:
+        process = await asyncio.shield(launching)
+        code = await process.wait()
+    except asyncio.CancelledError:
+        process = await launching
+        if process.returncode is None:
+            if os.name == "nt":
+                killer = await asyncio.create_subprocess_exec("taskkill", "/T", "/F", "/PID", str(process.pid),
+                                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                             creationflags=subprocess.CREATE_NO_WINDOW)
+                if await killer.wait() and process.returncode is None:
+                    raise RuntimeError("Windows 无法停止当前验证进程")
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        await process.wait()
+        raise
+    if code:
+        raise subprocess.CalledProcessError(code, command)
     return json.loads(receipt.read_text(encoding="utf-8"))
 
 

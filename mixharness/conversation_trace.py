@@ -32,7 +32,7 @@ def plan_details(meta, messages):
 
 
 def report_inputs(tasks):
-    reports = [t["basis"] for t in tasks if t["kind"] == "report" and t["status"] not in ("failed", "obsolete")]
+    reports = [t["basis"] for t in tasks if t["kind"] == "report" and t["status"] not in ("failed", "obsolete", "stopped")]
     engineering = {basis["engineering"] for basis in reports}
     verification = {(basis["engineering"], basis["verification"]) for basis in reports}
     inputs = {}

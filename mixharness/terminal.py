@@ -4,6 +4,7 @@ from contextlib import nullcontext
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 
@@ -58,6 +59,7 @@ class Terminal:
         self.pending = set()
         self.missing = set()
         self.running = set()
+        self.activity = ""
         self.sent = set()
         self.completion = CommandCompletion()
         self.prompt = None
@@ -66,8 +68,17 @@ class Terminal:
             @keys.add("escape", "enter")
             def newline(event):
                 event.current_buffer.insert_text("\n")
+            @keys.add("c-c", filter=Condition(lambda: bool(self.activity)))
+            def interrupt(event):
+                event.app.create_background_task(self.stop(self.sid))
             self.prompt = PromptSession(completer=self.completion, complete_while_typing=True,
-                                        reserve_space_for_menu=4, key_bindings=keys)
+                                        reserve_space_for_menu=4, key_bindings=keys, bottom_toolbar=lambda: self.activity)
+
+    async def stop(self, sid):
+        try:
+            await self.invoke({"command": "command", "id": sid, "line": "/stop"})
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            display(exc, file=sys.stderr)
 
     def select(self, sid):
         self.sid = sid
@@ -75,6 +86,7 @@ class Terminal:
         self.pending.clear()
         self.missing.clear()
         self.running.clear()
+        self.activity = ""
         self.sent.clear()
 
     async def update(self):
@@ -122,8 +134,23 @@ class Terminal:
         self.missing = {j["id"] for j in data["needs_key"]}
         for job in data["running"]:
             if job["id"] not in self.running:
-                display(f"… {job['title']} · {job['model']}")
+                actor = ROLE_NAMES.get(PROVIDERS.get(job.get("kind")), "模型")
+                display(f"进行中 · {actor} · {job['title']} · {job['model']}　/stop 停止")
         self.running = {j["id"] for j in data["running"]}
+        if data.get("stopping"):
+            self.activity = "正在停止任务…"
+        elif data["approvals"]:
+            self.activity = "等待批准"
+        elif data["running"]:
+            self.activity = "进行中 · " + "、".join(dict.fromkeys(j["title"] for j in data["running"]))
+        elif self.missing:
+            self.activity = "等待 API Key"
+        else:
+            self.activity = "等待执行" if data.get("active_count") else ""
+        if self.activity and not data.get("stopping"):
+            self.activity += "　Ctrl+C 停止"
+        if self.prompt:
+            self.prompt.app.invalidate()
 
     async def monitor(self):
         if self.prompt and not self.sid and self.options.get("backend", "clients") == "clients":

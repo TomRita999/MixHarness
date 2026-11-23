@@ -29,7 +29,8 @@ MODES = {"default": "默认模式", "plan": "计划模式", "goal": "目标模�
 MODE_TITLES = {**MODES, "side": "侧边问答"}
 GOAL_STATES = {"": "待设置", "active": "进行中", "paused": "已暂停", "blocked": "需要补充", "complete": "已完成"}
 STATUSES = {"ready": "待执行", "running": "进行中", "needs_key": "等待密钥", "waiting": "等待中",
-            "done": "已完成", "failed": "失败", "obsolete": "已跳过"}
+            "done": "已完成", "failed": "失败", "obsolete": "已跳过", "stopped": "已停止"}
+ACTIVE_STATUSES = {"ready", "running", "waiting", "needs_key"}
 JSON_FIELDS = {"brief", "versions", "basis", "payload", "args", "result", "meta", "backend_models", "efforts"}
 
 
@@ -183,7 +184,7 @@ class Store:
 
     def approvals(self, sid):
         return self.rows("SELECT a.* FROM approvals a JOIN jobs j ON j.id=a.job WHERE a.sid=? AND a.decision='pending' "
-                         "AND j.status NOT IN ('obsolete','failed','done') ORDER BY a.rowid", sid)
+                         "AND j.status IN ('ready','running','waiting','needs_key') ORDER BY a.rowid", sid)
 
     def project(self, pid):
         project = self.one("SELECT * FROM projects WHERE id=?", pid)
@@ -278,7 +279,7 @@ class Store:
 
     def require_idle_project(self, pid):
         if self.rows("SELECT j.id FROM jobs j JOIN sessions s ON s.id=j.sid WHERE s.project_id=? "
-                     "AND j.status NOT IN ('done','obsolete','failed') LIMIT 1", pid):
+                     "AND j.status IN ('ready','running','waiting','needs_key') LIMIT 1", pid):
             raise ValueError("请等当前任务跑完后再调整项目文件夹")
 
     def attach_folder(self, pid, directory):
@@ -319,7 +320,8 @@ class Store:
                       "(SELECT 1 FROM events e WHERE e.sid=s.id AND e.kind='message' AND instr(lower(e.body),lower(?))))")
             params.extend([query] * 3)
         return self.rows("SELECT s.id,s.title,s.updated,s.project_id,s.workspace,s.pinned,s.backend,"
-                         "'mixharness' AS source,p.name AS project_name "
+                         "'mixharness' AS source,p.name AS project_name,EXISTS(SELECT 1 FROM jobs j WHERE j.sid=s.id "
+                         "AND j.status IN ('ready','running','waiting')) AS working "
                          "FROM sessions s LEFT JOIN projects p ON p.id=s.project_id "
                          "WHERE s.archived=? AND (s.archived=1 OR COALESCE(p.archived,0)=0)" + search +
                          " ORDER BY s.pinned DESC,s.updated DESC,s.rowid DESC", *params)
@@ -461,7 +463,7 @@ class Store:
                      (staged[0]["name"] if staged else attachments[0].name))[:36]
         self.db.execute("UPDATE sessions SET revision=?,title=? WHERE id=?", (rev, title, sid))
         self.db.execute("UPDATE jobs SET status='obsolete' WHERE sid=? AND kind IN ('plan','proposal','goal_check','side') "
-                        "AND status NOT IN ('done','obsolete')", (sid,))
+                        "AND status NOT IN ('done','obsolete','stopped')", (sid,))
         if session["mode"] in ("plan", "side"):
             self.db.execute("UPDATE sessions SET planned=revision WHERE id=?", (sid,))
             kind = "proposal" if session["mode"] == "plan" else "side"
@@ -475,9 +477,10 @@ class Store:
             self.enqueue(session, "plan", {"revision": rev})
         return seq
 
-    def stop_jobs(self, sid):
-        count = self.db.execute("UPDATE jobs SET status='obsolete' WHERE sid=? AND status IN "
-                                "('ready','running','waiting','needs_key')", (sid,)).rowcount
+    def stop_jobs(self, sid, *, user_requested=False):
+        status = "stopped" if user_requested else "obsolete"
+        count = self.db.execute("UPDATE jobs SET status=? WHERE sid=? AND status IN "
+                                "('ready','running','waiting','needs_key')", (status, sid)).rowcount
         self.db.execute("UPDATE approvals SET decision='expired' WHERE sid=? AND decision='pending'", (sid,))
         self.db.execute("UPDATE sessions SET planned=revision WHERE id=?", (sid,))
         return count
@@ -584,7 +587,7 @@ class Store:
                     continue
                 # API 工具链保留已使用的模型，档位可在同一模型的下一轮单独更新。
                 self.db.executemany(
-                    "UPDATE jobs SET model=?,effort=? WHERE sid=? AND kind=? AND status NOT IN ('done','obsolete') "
+                    "UPDATE jobs SET model=?,effort=? WHERE sid=? AND kind=? AND status NOT IN ('done','obsolete','stopped') "
                     "AND (model=? OR ?='clients' OR (status!='running' AND (cursor IS NULL OR cursor_backend!=? OR cursor_model!=model)))",
                     [(model, selected[p], sid, kind, model, old["backend"], old["backend"])
                      for kind, provider in PROVIDERS.items() if provider == p],
@@ -607,7 +610,7 @@ class Store:
                             (backend, models["gemini"], models["openai"], pack(remembered), pack(selected), sid))
             self.db.executemany(
                 "UPDATE jobs SET model=?,effort=?,status=CASE WHEN status='needs_key' THEN 'ready' ELSE status END "
-                "WHERE sid=? AND kind=? AND status NOT IN ('done','obsolete')",
+                "WHERE sid=? AND kind=? AND status NOT IN ('done','obsolete','stopped')",
                 [(models[provider], selected.get(provider, ""), sid, kind) for kind, provider in PROVIDERS.items()],
             )
             name = "本机客户端" if backend == "clients" else "API"
@@ -636,7 +639,7 @@ class Store:
                     changed.add(key)
             self.db.execute("UPDATE sessions SET planned=revision,brief=?,versions=? WHERE id=?",
                             (pack(s["brief"]), pack(s["versions"]), s["id"]))
-            for old in self.rows("SELECT * FROM jobs WHERE sid=? AND status NOT IN ('done','obsolete')", s["id"]):
+            for old in self.rows("SELECT * FROM jobs WHERE sid=? AND status NOT IN ('done','obsolete','stopped')", s["id"]):
                 if old["payload"].get("direct") and old["status"] in ("needs_key", "ready") and not old["cursor"]:
                     self.db.execute("UPDATE jobs SET basis=? WHERE id=?", (pack({k: s["versions"][k] for k in old["basis"]}), old["id"]))
                 elif changed.intersection(old["basis"]):

@@ -73,7 +73,15 @@ class Rpc:
     async def dispatch(self, message, notify=None):
         method = message.get("method")
         if "id" in message and method:
-            reply = await self.handle_request(method, message.get("params", {})) if self.handle_request else None
+            try:
+                reply = await self.handle_request(method, message.get("params", {})) if self.handle_request else None
+            except asyncio.CancelledError:
+                if method == "session/request_permission":
+                    answer = {"result": {"outcome": {"outcome": "cancelled"}}}
+                else:
+                    answer = {"error": {"code": -32800, "message": "任务已取消"}}
+                await self.send({"jsonrpc": "2.0", "id": message["id"], **answer})
+                raise
             if reply is not None:
                 answer = {"result": reply}
             elif method == "session/request_permission":
@@ -88,6 +96,9 @@ class Rpc:
         self.counter += 1
         number = self.counter
         await self.send({"jsonrpc": "2.0", "id": number, "method": method, "params": params})
+        return await self.response(number, notify)
+
+    async def response(self, number, notify=None):
         while True:
             message = await self.read()
             if "method" not in message and message.get("id") == number:

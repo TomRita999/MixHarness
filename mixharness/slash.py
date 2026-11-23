@@ -83,7 +83,7 @@ def context_command(engine, argument, sid, pid):
     if sid:
         session = engine.store.session(sid)
         jobs = engine.store.rows("SELECT j.*,s.backend FROM jobs j JOIN sessions s ON s.id=j.sid WHERE sid=? "
-                                 "AND j.status!='obsolete' ORDER BY j.rowid DESC LIMIT 1", sid)
+                                 "AND j.status NOT IN ('obsolete','stopped') ORDER BY j.rowid DESC LIMIT 1", sid)
         size = 0
         if jobs:
             calls = [c for c in engine.store.calls(jobs[0]) if c["result"] is not None]
@@ -446,14 +446,8 @@ async def execute_command(engine, args):
     elif cmd == "diff":
         text = await diff(engine, session)
     elif cmd == "stop":
-        with engine.store.db:
-            count = engine.store.stop_jobs(sid)
-            if session["goal_status"] == "active":
-                engine.store.db.execute("UPDATE sessions SET goal_status='paused',mode='default' WHERE id=?", (sid,))
-            if count:
-                engine.store.event(sid, "progress", "system", f"用户停止了 {count} 项任务")
-        engine.notify(sid)
-        text = f"已停止 {count} 项任务"
+        count = await engine.stop_session(sid)
+        text = f"已停止 {count} 项任务" if count else "当前会话没有待停止的任务"
     elif cmd == "export":
         text = transcript(engine.store, sid)
         if arg:

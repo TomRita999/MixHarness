@@ -315,6 +315,25 @@ class DesktopTests(unittest.TestCase):
                         self.assertEqual(window.backend_box.currentData(), "api")
                         self.assertIn("等待 Gemini API Key", window.work_status.text())
                         self.assertEqual(window.state["session"]["revision"], 2)
+                        self.assertTrue(window.stop_button.isVisible())
+                        self.assertFalse(window.work_progress.isVisible())
+                        window.editor.setPlainText("保留这条尚未发送的补充")
+                        QTest.mouseClick(window.stop_button, Qt.MouseButton.LeftButton)
+                        async with asyncio.timeout(5):
+                            while window.work_status.text() != "任务已停止":
+                                await asyncio.sleep(0.03)
+                        self.assertFalse(window.stop_button.isVisible())
+                        self.assertEqual(window.editor.toPlainText(), "保留这条尚未发送的补充")
+                        QTest.keyClick(window.editor, Qt.Key.Key_Return)
+                        async with asyncio.timeout(5):
+                            while not window.stop_button.isVisible():
+                                await asyncio.sleep(0.03)
+                        QTest.keyClick(window.editor, Qt.Key.Key_Escape)
+                        async with asyncio.timeout(5):
+                            while window.stop_button.isVisible():
+                                await asyncio.sleep(0.03)
+                        self.assertEqual(window.state["session"]["revision"], 3)
+                        self.assertEqual([t["status"] for t in window.state["tasks"]], ["obsolete", "stopped", "stopped"])
                     finally:
                         worker.cancel()
                         await asyncio.gather(worker, return_exceptions=True)

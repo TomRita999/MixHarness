@@ -75,11 +75,13 @@ class Editor(QPlainTextEdit):
     image_files = Signal(list)
     image_bytes = Signal(bytes)
     submitted = Signal()
+    interrupted = Signal()
     focus_changed = Signal(bool)
 
     def __init__(self):
         super().__init__()
         self.preedit = False
+        self.can_interrupt = False
         self.setObjectName("editor")
         self.setAccessibleName("消息")
         self.setPlaceholderText("输入消息，或用 / 调用指令…")
@@ -121,6 +123,12 @@ class Editor(QPlainTextEdit):
     def keyPressEvent(self, event):
         enter = event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
         modifiers = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        if (event.key() == Qt.Key.Key_Escape and modifiers == Qt.KeyboardModifier.NoModifier
+                and self.can_interrupt and not self.preedit):
+            if not event.isAutoRepeat():
+                self.interrupted.emit()
+            event.accept()
+            return
         if enter and modifiers == Qt.KeyboardModifier.NoModifier and not self.preedit:
             if not event.isAutoRepeat():
                 self.submitted.emit()

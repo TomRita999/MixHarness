@@ -132,6 +132,10 @@ def apply_theme(app, name):
         QPushButton#nav:hover { color: $ink; }
         QPushButton#quiet { color: $muted; text-align: left; font-size: 12px; padding: 4px 8px; }
         QPushButton#quiet:hover { color: $ink; }
+        QPushButton#workStatus { color: $ink; text-align: left; font-size: 12px; padding: 4px 2px; }
+        QPushButton#stopWork { border: 1px solid $strong; border-radius: 10px; color: $ink; padding: 3px 12px; }
+        QPushButton#stopWork:hover { background: $hover; }
+        QPushButton#stopWork:disabled { color: $muted; }
         QPushButton#speed { padding: 0; border-radius: 6px; }
         QPushButton#speed:focus { border: 1px solid $strong; }
         QToolButton#daybreak { padding: 3px 7px; font-size: 12px; color: $secondary; }

@@ -7,7 +7,7 @@ from .chat_snapshot import snapshot_link, transcript
 from .desktop_style import THEMES
 from .desktop_widgets import Document, Editor, Timeline, button, label
 from .slash import mcp_text
-from .store import STATUSES, new_id
+from .store import ACTIVE_STATUSES, new_id
 
 
 class McpDialog(QDialog):
@@ -120,11 +120,19 @@ class SideChat(QDockWidget):
         layout.addWidget(self.timeline, 1)
         self.status = label("", "caption")
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
+        activity = QHBoxLayout()
+        activity.addWidget(self.status, 1)
+        self.stop_button = button("停止", self.stop, name="stopWork")
+        self.stop_button.setAccessibleName("停止侧边聊天任务")
+        self.stop_button.setToolTip("停止侧边聊天任务（输入框内按 Esc）")
+        activity.addWidget(self.stop_button)
+        self.stop_button.hide()
+        layout.addLayout(activity)
         self.editor = Editor()
         self.editor.setAccessibleName("侧边问题")
         self.editor.setPlaceholderText("基于主对话问 GPT…")
         self.editor.submitted.connect(self.send)
+        self.editor.interrupted.connect(self.stop)
         layout.addWidget(self.editor)
         self.send_button = button("提问", self.send, name="primary")
         layout.addWidget(self.send_button, 0, Qt.AlignmentFlag.AlignRight)
@@ -137,6 +145,13 @@ class SideChat(QDockWidget):
 
     def update_button(self):
         self.send_button.setEnabled(bool(self.editor.toPlainText().strip()))
+
+    def stop(self):
+        if self.sid and self.stop_button.isEnabled():
+            self.stop_button.setEnabled(False)
+            self.editor.can_interrupt = False
+            self.status.setText("正在停止任务…")
+            self.host.run_task(self.host.engine.stop_session(self.sid))
 
     def send(self):
         question = self.editor.toPlainText().strip()
@@ -172,9 +187,16 @@ class SideChat(QDockWidget):
             self.status.setText("这段会话已被删除。")
             self.editor.setEnabled(False)
             self.send_button.setEnabled(False)
+            self.stop_button.hide()
             return
         self.timeline.update_events(state["events"], THEMES[self.host.theme])
         latest = state["tasks"][-1] if state["tasks"] else None
         status = latest["status"] if latest else None
-        self.status.setText("等待 OpenAI API Key" if status == "needs_key" else
-                            STATUSES[status] if status in ("ready", "running", "waiting") else "")
+        stopping = self.sid in engine.stopping and status not in ACTIVE_STATUSES
+        self.status.setText("正在停止任务…" if stopping else {
+            "ready": "问题已排队", "running": "GPT 正在回答", "waiting": "正在等待前置任务",
+            "needs_key": "等待 OpenAI API Key", "stopped": "任务已停止",
+        }.get(status, ""))
+        self.stop_button.setVisible(stopping or status in ACTIVE_STATUSES)
+        self.stop_button.setEnabled(status in ACTIVE_STATUSES)
+        self.editor.can_interrupt = self.stop_button.isEnabled()

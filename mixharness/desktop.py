@@ -6,7 +6,7 @@ from PySide6.QtCore import QEvent, QPoint, QProcess, QSignalBlocker, QSize, Qt, 
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QHeaderView, QInputDialog,
-    QLineEdit, QListWidget, QListWidgetItem,
+    QLineEdit, QListWidget, QListWidgetItem, QProgressBar,
     QMainWindow, QMenu, QMessageBox, QSizePolicy, QSplitter, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -16,7 +16,7 @@ from .desktop_slash import SlashMenu
 from .desktop_chat_actions import McpDialog, ShareDialog, SideChat, save_transcript
 from .chat_snapshot import feedback_url, transcript
 from .agent_settings import PERMISSIONS, SPEEDS, available_speeds
-from .slash import execute_command, goal_text, split
+from .slash import PROVIDER_NAMES, execute_command, goal_text, split
 from .slash_catalog import COMMANDS, command_name
 from .desktop_clients import ClientHistory
 from .desktop_inputs import ComposerInputs
@@ -29,7 +29,7 @@ from .desktop_widgets import (
 from .providers import MODELS
 from .clients import CLIENTS
 from .reasoning import LEVEL_NAMES, group_for, model_available, resolve_choice, select_daybreak_model
-from .store import GOAL_STATES, LABELS, MODES, MODE_TITLES, PROVIDERS, STATUSES, new_id
+from .store import ACTIVE_STATUSES, GOAL_STATES, LABELS, MODES, MODE_TITLES, PROVIDERS, STATUSES, new_id
 
 
 USER_ROLE = Qt.ItemDataRole.UserRole
@@ -212,9 +212,24 @@ class Window(QMainWindow):
         self.preview.setMaximumHeight(110)
         col.addWidget(self.preview)
         self.preview.hide()
-        self.work_status = button("", self.status_action, name="quiet")
-        col.addWidget(self.work_status, 0, ALIGN.AlignLeft)
-        self.work_status.hide()
+        self.activity_row = QWidget()
+        activity = QHBoxLayout(self.activity_row)
+        activity.setContentsMargins(7, 0, 4, 0)
+        activity.setSpacing(6)
+        self.work_progress = QProgressBar()
+        self.work_progress.setRange(0, 0)
+        self.work_progress.setTextVisible(False)
+        self.work_progress.setFixedSize(28, 5)
+        self.work_progress.setAccessibleName("任务进行中")
+        activity.addWidget(self.work_progress)
+        self.work_status = button("", self.status_action, name="workStatus")
+        self.work_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        activity.addWidget(self.work_status, 1)
+        self.stop_button = button("停止", self.stop_work, name="stopWork")
+        self.stop_button.setAccessibleName("停止当前会话任务")
+        self.stop_button.setToolTip("停止当前会话任务（输入框内按 Esc）")
+        activity.addWidget(self.stop_button)
+        col.addWidget(self.activity_row)
         self.composer = QFrame()
         self.composer.setObjectName("composer")
         self.composer_shadow = QGraphicsDropShadowEffect(self.composer)
@@ -226,6 +241,7 @@ class Window(QMainWindow):
         controls.setSpacing(6)
         self.editor = Editor()
         self.editor.submitted.connect(self.send)
+        self.editor.interrupted.connect(self.stop_work)
         self.editor.textChanged.connect(self.editor_changed)
         self.editor.focus_changed.connect(self.composer_focus)
         self.inputs = ComposerInputs(self)
@@ -387,7 +403,7 @@ class Window(QMainWindow):
         chats = self.session_list(query)
         for chat in chats:
             by_project.setdefault(chat["project_id"], []).append(chat)
-        signature = (query, groups, [(s["id"], s["title"], s["project_id"], s["pinned"]) for s in chats])
+        signature = (query, groups, [(s["id"], s["title"], s["project_id"], s["pinned"], s["working"]) for s in chats])
         if signature == self.history_key:
             self.select_history_row()
             return
@@ -410,12 +426,12 @@ class Window(QMainWindow):
                 self.add_row_actions(group, pid, project=True)
                 for session in visible:
                     item = QTreeWidgetItem(group, [session["title"]])
-                    item.setToolTip(0, session["title"])
+                    item.setToolTip(0, session["title"] + (" · 任务进行中" if session["working"] else ""))
                     item.setData(0, USER_ROLE, session["id"])
                     self.history_rows[("chat", session["id"])] = item
                     if session["pinned"]:
                         item.setIcon(0, icon("pin"))
-                    self.add_row_actions(item, session["id"], project=False)
+                    self.add_row_actions(item, session["id"], project=False, working=session["working"])
                 collapsed = self.settings.value("collapsed/" + (pid or "local"), False, type=bool)
                 group.setExpanded(bool(query) or not collapsed)
             self.history.doItemsLayout()
@@ -431,12 +447,20 @@ class Window(QMainWindow):
             with QSignalBlocker(self.history):
                 self.history.setCurrentItem(item, 0)
 
-    def add_row_actions(self, item, identifier, *, project):
+    def add_row_actions(self, item, identifier, *, project, working=False):
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addStretch()
+        if working:
+            progress = QProgressBar()
+            progress.setRange(0, 0)
+            progress.setFixedSize(16, 4)
+            progress.setTextVisible(False)
+            progress.setAccessibleName("会话任务进行中")
+            progress.setToolTip("会话任务进行中")
+            layout.addWidget(progress)
         if project:
             compose = button("在此新建会话", lambda: self.create_chat(identifier), "new", "rowAction", True)
             compose.setFixedSize(23, 24)
@@ -1032,26 +1056,45 @@ class Window(QMainWindow):
             self.preview.setVisible(bool(text))
 
     def update_status(self):
-        tasks = getattr(self, "state", {}).get("tasks", [])
-        active = [j for j in tasks if j["status"] in ("needs_key", "running", "ready", "waiting")]
+        tasks = self.state["tasks"]
+        active = [j for j in tasks if j["status"] in ACTIVE_STATUSES]
         pending = next((j for j in active if j["status"] == "needs_key"), None)
-        running = next((j for j in active if j["status"] == "running"), None)
-        self.work_status.setEnabled(self.backend_task is None)
-        if self.backend_task:
-            self.work_status.setText("正在读取客户端模型…")
+        running = [j for j in active if j["status"] == "running"]
+        approvals = self.state.get("approvals")
+        stopping = self.sid in self.engine.stopping and not active
+        phases = [self.engine.activity[j["id"]] for j in running if j["id"] in self.engine.activity]
+        labels = [PROVIDER_NAMES[PROVIDERS[j["kind"]]] + " · " + LABELS[j["kind"]] for j in running]
+        running_text = "、".join(dict.fromkeys(labels))
+        if stopping:
+            text = "正在停止任务…"
+        elif self.backend_task:
+            text = "正在读取客户端模型…"
         elif self.backend_error:
-            self.work_status.setText(self.backend_error + " · 重试")
-        elif self.state.get("approvals"):
-            request = self.state["approvals"][0]
-            self.work_status.setText("待批准：" + request["title"] + " · 查看")
+            text = self.backend_error + " · 重试"
+        elif approvals:
+            text = "等待批准 · " + approvals[0]["title"] + " · 查看"
         elif pending:
-            provider = "Gemini" if pending["kind"] in ("plan", "report", "section") else "OpenAI"
-            self.work_status.setText("等待 " + provider + " API Key · 去配置")
+            provider = "Gemini" if PROVIDERS[pending["kind"]] == "gemini" else "OpenAI"
+            text = "等待 " + provider + " API Key · 去配置"
+            if running:
+                text = running_text + " 进行中　" + text
         elif running:
-            self.work_status.setText(running["title"] + "…")
+            text = "进行中　" + running_text
         elif active:
-            self.work_status.setText("等待前置任务…")
-        self.work_status.setVisible(bool(active or self.backend_task or self.backend_error))
+            text = "任务已排队" if any(j["status"] == "ready" for j in active) else "正在等待前置任务"
+        elif tasks and tasks[-1]["status"] == "stopped":
+            text = "任务已停止"
+        else:
+            text = ""
+        self.work_status.setText(text)
+        self.work_status.setToolTip("\n".join([text, *dict.fromkeys(phases)]))
+        self.work_status.setAccessibleName(self.work_status.toolTip())
+        self.work_status.setEnabled(self.backend_task is None and not stopping)
+        self.work_progress.setVisible(bool(stopping or self.backend_task or running and not approvals))
+        self.stop_button.setVisible(bool(active or stopping))
+        self.stop_button.setEnabled(bool(active))
+        self.editor.can_interrupt = bool(active)
+        self.activity_row.setVisible(bool(text))
         if getattr(self, "state", {}).get("session", {}).get("backend") == "clients":
             errors = [c.error for c in self.engine.client_catalogs.values() if c.error]
             self.connection_state.setText(errors[0] if errors else "")
@@ -1063,6 +1106,13 @@ class Window(QMainWindow):
         self.connection_state.setText(text)
         self.connection_state.setToolTip("打开设置\n" + str(self.engine.project / ".env"))
         self.connection_state.setVisible(bool(text))
+
+    def stop_work(self):
+        if self.sid and self.stop_button.isEnabled():
+            self.stop_button.setEnabled(False)
+            self.editor.can_interrupt = False
+            self.work_status.setText("正在停止任务…")
+            self.run_task(self.engine.stop_session(self.sid))
 
     def status_action(self):
         if self.backend_error:

@@ -1,4 +1,5 @@
 import asyncio
+import re
 import shutil
 import tempfile
 import unittest
@@ -16,6 +17,44 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ProjectTests(unittest.TestCase):
+    def test_stop_running_check_terminates_the_project_command(self):
+        scratch = ROOT / ".work" / "tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temp:
+            root = Path(temp)
+            source = root / "source"
+            source.mkdir()
+            shutil.copy2(ROOT / "pyproject.toml", source)
+            runs = root / "runs"
+            async def exercise():
+                command = ["@python", "-u", "-m", "http.server", "0", "--bind", "127.0.0.1"]
+                task = asyncio.create_task(workspace.run_check(source, runs, command, timeout=30))
+                try:
+                    async with asyncio.timeout(15):
+                        while True:
+                            if task.done():
+                                self.fail(str(await task))
+                            log = next(runs.rglob("output.log"), None)
+                            match = re.search(r"port (\d+)", log.read_text(encoding="utf-8")) if log else None
+                            if match:
+                                break
+                            await asyncio.sleep(0.03)
+                    port = int(match[1])
+                    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                    writer.write(b"GET /pyproject.toml HTTP/1.0\r\n\r\n")
+                    await writer.drain()
+                    self.assertIn((source / "pyproject.toml").read_bytes(), await reader.read())
+                    writer.close()
+                    await writer.wait_closed()
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                self.assertTrue(task.cancelled())
+                with self.assertRaises(OSError):
+                    await asyncio.open_connection("127.0.0.1", port)
+                self.assertFalse(list(runs.rglob("result.json")))
+            asyncio.run(exercise())
+
     def test_named_projects_without_source_folders(self):
         scratch = ROOT / ".work" / "tests"
         scratch.mkdir(parents=True, exist_ok=True)

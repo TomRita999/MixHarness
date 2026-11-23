@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -34,6 +35,8 @@ class Engine:
         self.home = home
         self.project = project
         self.active = {}
+        self.stopping = {}
+        self.activity = {}
         self.steering = {}
         self.previews = {}
         self.changes = {}
@@ -249,7 +252,7 @@ class Engine:
     def decide(self, sid, identifier, allow):
         with self.store.db:
             changed = self.store.db.execute("UPDATE approvals SET decision=? WHERE sid=? AND id=? AND decision='pending' "
-                                            "AND job IN (SELECT id FROM jobs WHERE status NOT IN ('obsolete','done','failed'))",
+                                            "AND job IN (SELECT id FROM jobs WHERE status IN ('ready','running','waiting','needs_key'))",
                                             ("allow" if allow else "deny", sid, identifier)).rowcount
             if not changed:
                 raise ValueError("这项审批请求已经结束")
@@ -360,6 +363,49 @@ class Engine:
         self.changes[sid] = self.changes.get(sid, 0) + 1
         self.signal.set()
 
+    def set_activity(self, job, text):
+        if self.activity.get(job["id"]) != text:
+            self.activity[job["id"]] = text
+            self.notify(job["sid"])
+
+    async def stop_session(self, sid):
+        store = self.store
+        with store.db:
+            session = store.session(sid)
+            jobs = store.rows("SELECT id FROM jobs WHERE sid=? AND status IN ('ready','running','waiting','needs_key')", sid)
+            count = store.stop_jobs(sid, user_requested=True)
+            if session["goal_status"] == "active":
+                store.db.execute("UPDATE sessions SET goal_status='paused',mode='default' WHERE id=?", (sid,))
+        previous = self.stopping.get(sid)
+        if not count:
+            if previous:
+                await asyncio.shield(previous)
+            self.notify(sid)
+            return 0
+        pending = [previous] if previous else []
+        for job in jobs:
+            jid = job["id"]
+            self.steering.pop(jid, None)
+            task = self.active.get(jid)
+            if task is not None and not task.done():
+                pending.append(task)
+                if not task.cancelling():
+                    task.cancel()
+        async def finish():
+            try:
+                await asyncio.gather(*pending, return_exceptions=True)
+                if store.rows("SELECT 1 FROM sessions WHERE id=?", sid):
+                    with store.db:
+                        store.event(sid, "progress", "system", f"已停止 {count} 项任务", {"stopped": count})
+            finally:
+                if self.stopping.get(sid) is asyncio.current_task():
+                    del self.stopping[sid]
+                self.notify(sid)
+        stopping = self.stopping[sid] = asyncio.create_task(finish())
+        self.notify(sid)
+        await asyncio.shield(stopping)
+        return count
+
     def delete_session(self, sid):
         jobs = self.store.delete_session(sid)
         def closed(task):
@@ -374,12 +420,13 @@ class Engine:
                 task = self.active[jid]
                 self.closing_jobs.setdefault(sid, set()).add(task)
                 task.add_done_callback(closed)
-                task.cancel()
+                if not task.cancelling():
+                    task.cancel()
         self.notify(sid)
         self.client_locks.pop(sid, None)
         self.cleanup_signal.set()
 
-    async def file_operation(self, sid, operation):
+    async def file_operation(self, sid, operation, *, cancel=None):
         # 记录还在写入的快照和验证副本，待文件操作结束后再清理磁盘。
         task = asyncio.create_task(operation)
         self.file_operations.setdefault(sid, set()).add(task)
@@ -391,7 +438,18 @@ class Engine:
                 done.exception()
             self.cleanup_signal.set()
         task.add_done_callback(finished)
-        return await asyncio.shield(task)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if cancel is not None:
+                cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    async def scan_files(self, sid, operation, *args, **kwargs):
+        cancelled = threading.Event()
+        scan = asyncio.to_thread(operation, *args, **kwargs, cancelled=cancelled)
+        return await self.file_operation(sid, scan, cancel=cancelled.set)
 
     async def clean_deleted(self):
         while True:
@@ -473,7 +531,7 @@ class Engine:
                         del self.active[jid]
                         if not task.cancelled():
                             task.result()
-                    elif not self.store.rows("SELECT 1 FROM jobs WHERE id=? AND status!='obsolete'", jid):
+                    elif not task.cancelling() and not self.store.rows("SELECT 1 FROM jobs WHERE id=? AND status NOT IN ('obsolete','stopped')", jid):
                         task.cancel()
                 ready = self.store.rows(
                     "SELECT j.*,s.backend FROM jobs j JOIN sessions s ON s.id=j.sid "
@@ -504,8 +562,9 @@ class Engine:
             cleanup.cancel()
             config.cancel()
             for task in self.active.values():
-                task.cancel()
-            await asyncio.gather(cleanup, config, *self.active.values(), return_exceptions=True)
+                if not task.cancelling():
+                    task.cancel()
+            await asyncio.gather(cleanup, config, *self.active.values(), *self.stopping.values(), return_exceptions=True)
 
     def set_status(self, job, status):
         with self.store.db:
@@ -545,7 +604,7 @@ class Engine:
                    for e in entries if e["seq"] > session["context_after"]]
         works = self.store.rows("SELECT id,kind,status,title,error FROM jobs WHERE sid=? AND status!='obsolete'", sid)
         assets = self.store.rows("SELECT id,name,digest,meta FROM artifacts WHERE sid=? ORDER BY rowid DESC LIMIT 80", sid)
-        draft = self.store.rows("SELECT draft FROM jobs WHERE sid=? AND kind='report' AND draft!='' "
+        draft = self.store.rows("SELECT draft FROM jobs WHERE sid=? AND kind='report' AND draft!='' AND status NOT IN ('obsolete','stopped') "
                                 "ORDER BY rowid DESC LIMIT 1", sid)
         context = {"当前需求": session["brief"], "需求版本": session["versions"], "本次任务": job["payload"],
                    "共享记录": history, "任务": works, "可读取的成果": assets,
@@ -598,12 +657,13 @@ class Engine:
         sources = self.sources(self.store.session(job["sid"]))
         payload = job["payload"]
         if "source" not in payload:
-            version = await self.file_operation(job["sid"], asyncio.to_thread(
-                workspace.snapshot, sources, self.home / "snapshots" / job["sid"], self.home))
+            version = await self.scan_files(job["sid"], workspace.snapshot, sources, self.home / "snapshots" / job["sid"], self.home)
             await self.gate(job)
             payload["source"] = version
             if payload.get("review"):
-                payload["git_changes"] = await asyncio.to_thread(workspace.review_changes, sources, self.home)
+                commands = workspace.ReviewCommands()
+                review = asyncio.to_thread(workspace.review_changes, sources, self.home, commands=commands)
+                payload["git_changes"] = await self.file_operation(job["sid"], review, cancel=commands.stop)
                 await self.gate(job)
             with self.store.db:
                 self.store.db.execute("UPDATE jobs SET payload=? WHERE id=?", (pack(job["payload"]), job["id"]))
@@ -615,7 +675,7 @@ class Engine:
                     all(session["versions"][k] == v for k, v in c["basis"].items())]
         if not relevant:
             return
-        current = await asyncio.to_thread(workspace.fingerprint, self.sources(session), exclude=self.home)
+        current = await self.scan_files(job["sid"], workspace.fingerprint, self.sources(session), exclude=self.home)
         await self.gate(job)
         with self.store.db:
             for check in relevant:
@@ -632,11 +692,13 @@ class Engine:
             session = await self.gate(job)
             sources = self.sources(session)
             if job["kind"] == "verification":
+                self.set_activity(job, "正在核对项目快照")
                 sources = sources.at_snapshot(await self.verify_source(job))
             calls = self.store.calls(job)
             for call in calls:
                 if call["result"] is None and not call["child"]:
                     await self.gate(job)
+                    self.set_activity(job, "正在处理 " + call["name"])
                     try:
                         await self.tool(job, call, sources)
                     except (ValueError, OSError, KeyError) as exc:
@@ -662,10 +724,13 @@ class Engine:
             async with asyncio.timeout(420) as deadline:
                 self.deadlines[jid] = deadline
                 if job["backend"] == "clients":
+                    self.set_activity(job, "正在连接 " + ("Codex" if PROVIDERS[job["kind"]] == "openai" else "Antigravity"))
                     reply = await workflow_turn(self, request, context, next(iter(sources.folders.values())))
                 elif PROVIDERS[job["kind"]] == "gemini":
+                    self.set_activity(job, "正在请求 Gemini API")
                     reply = await google_turn(key, request, context, results, preview)
                 else:
+                    self.set_activity(job, "正在请求 OpenAI API")
                     reply = await openai_turn(key, request, context, results, preview,
                                               lambda sender: self.steering.update({jid: sender}))
                     self.steering.pop(jid, None)
@@ -680,7 +745,7 @@ class Engine:
             if job["kind"] == "report" and not reply.calls:
                 await self.check_report_sources(job, session)
             if job["kind"] == "verification" and not reply.calls:
-                current = await asyncio.to_thread(workspace.fingerprint, self.sources(session), exclude=self.home)
+                current = await self.scan_files(sid, workspace.fingerprint, self.sources(session), exclude=self.home)
                 await self.gate(job)
                 if current != job["payload"]["source"]:
                     del job["payload"]["source"]
@@ -731,6 +796,7 @@ class Engine:
                         result["diagnostic"] = exc.details
                     self.store.finish(job, message[:2200], result, success=False)
         finally:
+            self.activity.pop(jid, None)
             self.deadlines.pop(jid, None)
             self.steering.pop(jid, None)
             self.previews.pop(jid, None)
@@ -769,7 +835,7 @@ class Engine:
             self.notify(sid)
             return
         if name == "list_files":
-            paths = await asyncio.to_thread(lambda: [relative.as_posix() for relative, _ in sources.paths(self.home)])
+            paths = await self.scan_files(sid, sources.list_files, self.home)
             result = {"paths": paths[:2000], "total": len(paths), "checks_by_folder": self.checks(originals)}
         elif name in ("read_file", "edit_file"):
             folder, relative = sources.locate(args["path"])
@@ -801,16 +867,17 @@ class Engine:
             await self.authorize_tool(job, call, "运行 " + args["name"], detail, routine=isolated_compile)
             if job["kind"] == "engineering":
                 parent = self.home / "snapshots" / sid
-                version = await self.file_operation(sid, asyncio.to_thread(workspace.snapshot, originals, parent, self.home))
+                version = await self.scan_files(sid, workspace.snapshot, originals, parent, self.home)
                 sources = originals.at_snapshot(parent / version)
             else:
                 version = job["payload"]["source"]
             invocation = workspace.digest(pack([jid, call["cursor"], call["cid"], version]).encode())
             source = self.home / "snapshots" / sid / version
             subdirectory = alias if len(originals.folders) > 1 else "."
-            result = await self.file_operation(sid, workspace.run_check(
+            self.set_activity(job, "正在运行 " + args["name"])
+            result = await workspace.run_check(
                 source, self.home / "runs" / sid, commands[args["name"]], invocation=invocation,
-                project=originals.folders[alias], python=self.check_python, subdirectory=subdirectory, isolated_compile=isolated_compile))
+                project=originals.folders[alias], python=self.check_python, subdirectory=subdirectory, isolated_compile=isolated_compile)
             result.update(source=version, folder=alias)
         await self.gate(job)
         with st.db:

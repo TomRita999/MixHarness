@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import sqlite3
+from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime
 
@@ -308,7 +309,7 @@ class ClientCatalog:
                 self.error = str(exc) or "读取客户端目录超时"
 
 
-async def client_approval(engine, job, method, params):
+async def client_approval(engine, job, method, params, *, read_only=False):
     if method == "session/request_permission":
         call = params["toolCall"]
         requested = {"操作": call.get("kind"), "位置": call.get("locations"), "参数": call.get("rawInput"),
@@ -323,7 +324,7 @@ async def client_approval(engine, job, method, params):
                "applyPatchApproval": "应用文件修改"}
     if method not in methods:
         return None
-    allowed = await engine.native_approval(job, "Codex", methods[method], params)
+    allowed = not read_only and await engine.native_approval(job, "Codex", methods[method], params)
     if method == "item/permissions/requestApproval":
         return {"permissions": params["permissions"] if allowed else {}, "scope": "turn"}
     if method in ("execCommandApproval", "applyPatchApproval"):
@@ -344,12 +345,38 @@ def project_reads(engine, job, cwd, paths, client, directory=None):
         engine.record_reads(job, client, files)
 
 
+@asynccontextmanager
+async def interruptible_turn(engine, job, client, rpc, interrupt):
+    try:
+        yield
+    except asyncio.CancelledError:
+        rpc.handle_request = None
+        try:
+            async with asyncio.timeout(3):
+                status = await interrupt()
+        except (TimeoutError, OSError, ClientError):
+            status = "unconfirmed"
+        if engine.store.rows("SELECT 1 FROM jobs WHERE id=? AND status='stopped'", job["id"]):
+            description = {"unconfirmed": " 未确认中断，正在关闭本次连接", "interrupted": " 已确认中断",
+                           "cancelled": " 已确认中断"}.get(status, " 已结束本轮任务")
+            with engine.store.db:
+                engine.store.event(job["sid"], "progress", "system", client + description,
+                                   {"job": job["id"], "client": client, "stop_status": status})
+            engine.notify(job["sid"])
+        raise
+
+
+def is_dot_model(model):
+    return model == "gpt-dot" or model.startswith("gpt-") and model.endswith("-dot")
+
+
 async def codex_turn(engine, job, cwd, prompt, schema):
     model, effort = job["model"], job["effort"]
     mode = job["permission"]
     speed = job["speed"]
     proposal = job["kind"] == "proposal"
-    readonly = proposal or job["kind"] in ("goal_check", "side") or job["payload"].get("review") or job["payload"].get("read_only")
+    readonly = (is_dot_model(model) or proposal or job["kind"] in ("goal_check", "side")
+                or job["payload"].get("review") or job["payload"].get("read_only"))
     async with connection("codex") as rpc:
         await rpc.initialize("codex", experimental=True)
         tier = "default"
@@ -381,19 +408,23 @@ async def codex_turn(engine, job, cwd, prompt, schema):
             config.update({"features.apps": False, "features.plugins": False})
             effective = (await rpc.request("config/read", {"cwd": str(cwd)}))["config"]
             config["mcp_servers"] = {name: {"enabled": False} for name in effective.get("mcp_servers") or {}}
-        rpc.handle_request = lambda method, params: client_approval(engine, job, method, params)
+        rpc.handle_request = lambda method, params: client_approval(engine, job, method, params, read_only=readonly)
         started = await rpc.request("thread/start", options)
         tid = started["thread"]["id"]
         if not started["thread"]["ephemeral"]:
             raise ClientError("Codex 未启用临时线程，已取消本次调用")
-        if readonly and started["sandbox"]["type"] != "readOnly":
+        if readonly and (started["sandbox"]["type"] != "readOnly" or started["approvalPolicy"] != "never"):
             raise ClientError("Codex 未确认只读权限，任务已停止")
         fragments, complete, final, plan_text = [], None, "", ""
+        turn_id = None
         def event(method, params):
-            nonlocal complete, final, plan_text
+            nonlocal complete, final, plan_text, turn_id
             if params.get("threadId") != tid:
                 return
-            if method == "item/agentMessage/delta":
+            if method == "turn/started":
+                turn_id = params["turn"]["id"]
+                engine.set_activity(job, "Codex 已开始生成")
+            elif method == "item/agentMessage/delta":
                 fragments.append(params["delta"])
             elif method == "item/completed" and params["item"]["type"] == "agentMessage":
                 final = params["item"]["text"]
@@ -419,11 +450,27 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                 if method == "item/tool/requestUserInput":
                     raise PlanQuestion("\n".join(q["question"] + ("\n" + " / ".join(o["label"] for o in q["options"])
                                             if q.get("options") else "") for q in data["questions"]))
-                return await client_approval(engine, job, method, data)
+                return await client_approval(engine, job, method, data, read_only=True)
             rpc.handle_request = planning_input
-        await rpc.request("turn/start", params, event)
-        while complete is None:
-            await rpc.dispatch(await rpc.read(), event)
+
+        async def interrupt():
+            def terminal_event(method, data):
+                if method in ("turn/started", "turn/completed"):
+                    event(method, data)
+            current = turn_id
+            if current is None:
+                current = (await rpc.response(rpc.counter, terminal_event))["turn"]["id"]
+            if complete is None:
+                await rpc.request("turn/interrupt", {"threadId": tid, "turnId": current}, terminal_event)
+                while complete is None:
+                    await rpc.dispatch(await rpc.read(), terminal_event)
+            return complete["status"]
+
+        async with interruptible_turn(engine, job, "Codex", rpc, interrupt):
+            turn_id = (await rpc.request("turn/start", params, event))["turn"]["id"]
+            engine.set_activity(job, "Codex 已开始生成")
+            while complete is None:
+                await rpc.dispatch(await rpc.read(), event)
         if complete["status"] != "completed":
             error = complete.get("error") or {}
             raise CodexTurnError(error.get("message") or "Codex 任务未完成", started["sandbox"]["type"],
@@ -475,6 +522,7 @@ async def antigravity_turn(engine, job, cwd, prompt):
             if method != "session/update" or params.get("sessionId") != bound:
                 return
             update = params.get("update", {})
+            engine.set_activity(job, "Antigravity 正在处理请求")
             if update.get("sessionUpdate") == "agent_message_chunk":
                 fragments.append(update["content"].get("text", ""))
             elif update.get("sessionUpdate") in ("tool_call", "tool_call_update"):
@@ -488,7 +536,14 @@ async def antigravity_turn(engine, job, cwd, prompt):
                     elif update.get("status") == "failed":
                         reading.pop(key)
         parts = [{"type": "text", "text": prompt}, *image_parts(job.get("images", []), "antigravity")]
-        result = await rpc.request("session/prompt", {"sessionId": bound, "prompt": parts}, event)
+        async def interrupt():
+            await rpc.send({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": bound}})
+            result = await rpc.response(rpc.counter)
+            return result["stopReason"]
+
+        async with interruptible_turn(engine, job, "Antigravity", rpc, interrupt):
+            engine.set_activity(job, "正在向 Antigravity 发送请求")
+            result = await rpc.request("session/prompt", {"sessionId": bound, "prompt": parts}, event)
         if result["stopReason"] != "end_turn":
             raise ClientError("Antigravity 返回状态 " + result["stopReason"])
         return "".join(fragments)
@@ -508,6 +563,9 @@ async def workflow_turn(engine, job, context, cwd):
               "需要调用 MixHarness 工具时，在 calls 中填写工具名与 JSON 字符串 arguments，结果会在下一轮返回。"
               "\n输出格式\n" + pack(schema) + "\n可用工具\n" + pack(tools) + "\n共享会话\n" + context)
     if PROVIDERS[kind] == "openai":
+        if is_dot_model(job["model"]) and kind in ("engineering", "verification") and not job["payload"].get("read_only"):
+            prompt += ("\nCodex 在只读环境中分析项目。需要修改文件或运行验证时，在 calls 中提出已列出的 MixHarness 工具请求。"
+                       "MixHarness 按当前会话权限审批并执行。收到工具回执后再报告实际结果。")
         raw = await codex_turn(engine, job, cwd, prompt, schema)
     else:
         raw = await antigravity_turn(engine, job, cwd, prompt)

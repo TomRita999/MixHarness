@@ -88,12 +88,14 @@ async def dispatch(engine, args):
         if native and args.get("version") is None and not catalog.groups and not catalog.error:
             await catalog.refresh()
         events = engine.store.rows("SELECT seq,actor,kind,body FROM events WHERE sid=? AND seq>? ORDER BY seq", sid, args.get("after", 0))
-        jobs = engine.store.rows("SELECT id,kind,status FROM jobs WHERE sid=? AND status='needs_key'", sid)
-        running = engine.store.rows("SELECT id,title,model FROM jobs WHERE sid=? AND status='running'", sid)
+        jobs = engine.store.rows("SELECT id,kind,status,title,model FROM jobs WHERE sid=? AND status IN "
+                                 "('ready','running','waiting','needs_key') ORDER BY rowid", sid)
         options = available_speeds(group_for(catalog.groups, session["openai"])) if native else {}
         daybreak_options = native and any(model_available(g, True) for g in catalog.groups)
-        return {"version": version, "events": events, "approvals": engine.store.approvals(sid), "needs_key": jobs,
-                "running": running, "speed_options": list(options), "daybreak_available": daybreak_options or session["daybreak"],
+        return {"version": version, "events": events, "approvals": engine.store.approvals(sid),
+                "needs_key": [j for j in jobs if j["status"] == "needs_key"], "active_count": len(jobs),
+                "running": [j for j in jobs if j["status"] == "running"], "stopping": sid in engine.stopping,
+                "speed_options": list(options), "daybreak_available": daybreak_options or session["daybreak"],
                 "workspace": session["workspace"]}
     if cmd == "settings":
         sid, pid, directory = args.get("id"), args.get("project_id"), args.get("cwd")
