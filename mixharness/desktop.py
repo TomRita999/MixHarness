@@ -3,11 +3,11 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPoint, QProcess, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QHeaderView, QInputDialog,
     QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMenu, QMessageBox, QSizePolicy, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QMessageBox, QSizePolicy, QSplitter, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .desktop_projects import ArchiveDialog, ProjectDialog
@@ -236,22 +236,30 @@ class Window(QMainWindow):
         controls.addWidget(self.editor)
         tools = QHBoxLayout()
         tools.setSpacing(2)
-        # 工具栏顺序：附件 · 两个模型 · 加速 ‖ 执行方式 · 发送，全部垂直居中。
+        # 工具栏顺序：附件 · Gemini · GPT ‖ 执行方式 · 发送。
         self.add_input = button("添加附件或引用", self.inputs.menu, "plus", "round", icon_only=True)
         self.add_input.setFixedSize(30, 30)
         tools.addWidget(self.add_input)
         tools.addSpacing(4)
+        self.daybreak_action = QAction(self)
+        self.daybreak_action.setCheckable(True)
+        self.daybreak_action.triggered.connect(self.change_daybreak)
+        self.daybreak_icons = (icon("toggle-left"), icon("toggle-right", role=QPalette.ColorRole.Link))
+        self.speed_icons = (icon("zap", role=QPalette.ColorRole.PlaceholderText), icon("zap", role=QPalette.ColorRole.Link))
+        self.speed_box = button("GPT Fast 速度", self.speed_menu, name="speed", icon_only=True)
+        self.speed_box.setFixedSize(26, 26)
+        self.speed_box.setIconSize(QSize(16, 16))
         self.pickers = {}
         for provider, title in (("gemini", "Gemini"), ("openai", "OpenAI")):
-            pick = ModelPicker(provider, title)
+            pick = ModelPicker(provider, title, self.daybreak_action if provider == "openai" else None)
+            if provider == "openai":
+                pick.layout().insertWidget(0, self.speed_box)
             pick.setMaximumWidth(260)
             pick.changed.connect(self.choose_model)
             pick.refresh_requested.connect(self.refresh_catalog)
             pick.usage_requested.connect(self.show_usage)
             self.pickers[provider] = pick
             tools.addWidget(pick)
-        self.speed_box = button("GPT Fast 速度", self.speed_menu, name="quiet")
-        tools.addWidget(self.speed_box)
         tools.addStretch()
         self.backend_box = FitCombo()
         self.backend_box.setObjectName("flat")
@@ -282,8 +290,12 @@ class Window(QMainWindow):
             self.permission_box.addItem(title, mode)
         self.permission_box.currentIndexChanged.connect(self.change_permission)
         foot.addWidget(self.permission_box)
-        self.daybreak_button = button("Daybreak", self.change_daybreak, name="quiet")
-        self.daybreak_button.setCheckable(True)
+        self.daybreak_button = QToolButton()
+        self.daybreak_button.setObjectName("daybreak")
+        self.daybreak_button.setDefaultAction(self.daybreak_action)
+        self.daybreak_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.daybreak_button.setIconSize(QSize(20, 20))
+        self.daybreak_button.setCursor(Qt.CursorShape.PointingHandCursor)
         foot.addWidget(self.daybreak_button)
         self.connection_state = button("", self.connections, name="quiet")
         foot.addWidget(self.connection_state)
@@ -880,6 +892,8 @@ class Window(QMainWindow):
                 picker.select(model, data, effort)
                 if provider == "openai":
                     self.refresh_access()
+                    if data["source"] == "client":
+                        picker.refresh_open_models()
                 self.editor_changed()
                 self.update_status()
         task = asyncio.create_task(fetch())
@@ -1163,18 +1177,24 @@ class Window(QMainWindow):
         speeds = available_speeds(group_for(catalog.groups, model)) if native else {}
         enabled = bool(session.get("daybreak", self.draft_daybreak)) and native
         picker = self.pickers["openai"]
-        picker.daybreak = enabled
+        mode_changed = enabled != self.daybreak_action.isChecked()
+        self.daybreak_action.setChecked(enabled)
         group = group_for(picker.catalog.get("groups", []), model)
         compatible = picker.accepts(group)
         if native:
             picker.effort_control.setEnabled(bool(compatible and group and len(group["choices"]) > 1 and not self.backend_task))
         eligible = any(model_available(g, True) for g in catalog.groups)
-        with QSignalBlocker(self.daybreak_button):
-            self.daybreak_button.setChecked(enabled)
-        self.daybreak_button.setVisible(native and (eligible or enabled))
-        self.daybreak_button.setEnabled(self.backend_task is None and (enabled or eligible))
-        self.daybreak_button.setText("Daybreak 开" if enabled else "Daybreak 关")
-        self.daybreak_button.setToolTip("使用当前账户授权的 Daybreak Blue 模型" if compatible else "请选择兼容模型或关闭 Daybreak")
+        show_daybreak = native and (eligible or enabled)
+        self.daybreak_action.setVisible(show_daybreak)
+        self.daybreak_action.setEnabled(self.backend_task is None and (enabled or eligible))
+        self.daybreak_action.setText("Daybreak 模式    " + ("已开启" if enabled else "已关闭"))
+        self.daybreak_action.setIconText("Daybreak")
+        self.daybreak_action.setIcon(self.daybreak_icons[enabled])
+        self.daybreak_action.setToolTip("关闭 Daybreak，使用常规模型" if enabled else "开启 Daybreak，使用当前账户授权的模型")
+        self.daybreak_button.setAccessibleName(self.daybreak_action.text())
+        self.daybreak_button.setVisible(show_daybreak)
+        if native and mode_changed:
+            picker.refresh_open_models()
         if self.slash_menu.isVisible():
             self.slash_menu.refresh_matches()
         speed = session.get("speed", self.draft_speed)
@@ -1182,14 +1202,16 @@ class Window(QMainWindow):
             speed = self.draft_speed = "standard"
             if self.sid:
                 self.engine.set_access(self.sid, speed=speed)
-        self.speed_box.setText({"standard": "Fast 关", "fast": "Fast 开", "ultrafast": "Ultrafast"}[speed] + " ▾")
+        speed_label = "Fast 已关闭" if speed == "standard" else SPEEDS[speed] + " 已开启"
+        self.speed_box.setIcon(self.speed_icons[speed != "standard"])
+        self.speed_box.setAccessibleName("GPT 加速，" + speed_label)
         if not native:
             reason = "切换到本机客户端即可查看 Codex 加速档位"
         elif self.backend_task or self.pickers["openai"].loading:
             reason = "正在读取 Codex 模型速度"
         else:
-            reason = catalog.error or ("Codex 速度" if speeds else "当前账户或模型未提供加速档位")
-        self.speed_box.setToolTip(reason)
+            reason = catalog.error or ("点击选择速度" if speeds else "当前账户或模型未提供加速档位")
+        self.speed_box.setToolTip(speed_label + " · " + reason)
 
     def change_daybreak(self, enabled):
         try:
@@ -1198,7 +1220,8 @@ class Window(QMainWindow):
             else:
                 picker = self.pickers["openai"]
                 model = select_daybreak_model(picker.catalog["groups"], picker.model, enabled)
-                self.draft_daybreak = picker.daybreak = enabled
+                self.draft_daybreak = enabled
+                self.daybreak_action.setChecked(enabled)
                 if model != picker.model:
                     self.choose_model("openai", model)
         except ValueError as exc:

@@ -12,6 +12,7 @@ GLYPHS = {
     "send": 0xE04A, "chat": 0xE117, "gemini": 0xE47E, "openai": 0xE040, "close": 0xE1B2,
     "plus": 0xE13D, "more": 0xE0B6, "archive": 0xE041, "pin": 0xE259, "trash": 0xE18E,
     "chevron-down": 0xE06D, "chevron-right": 0xE06F, "pencil": 0xE12F,
+    "zap": 0xE1B4, "toggle-left": 0xE18B, "toggle-right": 0xE18C,
 }
 
 
@@ -23,19 +24,18 @@ def load_icons():
 
 
 class Glyph(QIconEngine):
-    def __init__(self, family, name, inverse, scale=1.0):
+    def __init__(self, family, name, role, scale=1.0):
         super().__init__()
-        self.family, self.name, self.inverse, self.scale = family, name, inverse, scale
+        self.family, self.name, self.role, self.scale = family, name, role, scale
 
     def clone(self):
-        return Glyph(self.family, self.name, self.inverse, self.scale)
+        return Glyph(self.family, self.name, self.role, self.scale)
 
     def paint(self, painter, rect, mode, state):
-        role = QPalette.ColorRole.Base if self.inverse else QPalette.ColorRole.Text
         group = QPalette.ColorGroup.Disabled if mode == QIcon.Mode.Disabled else QPalette.ColorGroup.Active
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        painter.setPen(QApplication.palette().color(group, role))
+        painter.setPen(QApplication.palette().color(group, self.role))
         font = QFont(self.family)
         font.setPixelSize(max(1, round(min(rect.width(), rect.height()) * self.scale)))
         painter.setFont(font)
@@ -132,6 +132,10 @@ def apply_theme(app, name):
         QPushButton#nav:hover { color: $ink; }
         QPushButton#quiet { color: $muted; text-align: left; font-size: 12px; padding: 4px 8px; }
         QPushButton#quiet:hover { color: $ink; }
+        QPushButton#speed { padding: 0; border-radius: 6px; }
+        QPushButton#speed:focus { border: 1px solid $strong; }
+        QToolButton#daybreak { padding: 3px 7px; font-size: 12px; color: $secondary; }
+        QToolButton#daybreak:hover, QToolButton#daybreak:checked { color: $ink; }
         QPushButton#primary { background: $ink; color: $inverse; border-radius: 9px; padding: 7px 18px; font-weight: 600; }
         QPushButton#primary:hover { background: $secondary; }
         QPushButton#primary:disabled { background: $line; color: $muted; }

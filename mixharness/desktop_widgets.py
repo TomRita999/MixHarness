@@ -7,8 +7,8 @@ from math import ceil
 from pathlib import Path
 
 from dotenv import set_key
-from PySide6.QtCore import QBuffer, QEasingCurve, QIODevice, QPoint, QPointF, QPropertyAnimation, QSaveFile, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QFontMetrics, QIcon, QImage, QPainter, QPixmap, QTextCursor
+from PySide6.QtCore import QBuffer, QEasingCurve, QIODevice, QPoint, QPointF, QPropertyAnimation, QSaveFile, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QFontMetrics, QIcon, QImage, QPainter, QPalette, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QTextEdit, QToolButton, QToolTip,
@@ -34,8 +34,9 @@ def label(text, name=""):
     return result
 
 
-def icon(name, inverse=False, scale=1.0):
-    return QIcon(Glyph(QApplication.instance().property("iconFamily"), name, inverse, scale))
+def icon(name, inverse=False, scale=1.0, *, role=QPalette.ColorRole.Text):
+    return QIcon(Glyph(QApplication.instance().property("iconFamily"), name,
+                       QPalette.ColorRole.Base if inverse else role, scale))
 
 
 def menu_icon(name):
@@ -175,12 +176,12 @@ class ModelPicker(QWidget):
     refresh_requested = Signal(str)
     usage_requested = Signal(str)
 
-    def __init__(self, provider, title):
+    def __init__(self, provider, title, daybreak_action=None):
         super().__init__()
         self.provider = provider
         self.title = title
         self.model = ""
-        self.daybreak = False
+        self.daybreak_action = daybreak_action
         self.effort = ""
         self.catalog = {}
         self.dialog = None
@@ -195,7 +196,8 @@ class ModelPicker(QWidget):
         self.control = QToolButton()
         self.control.setObjectName("model")
         self.control.setAccessibleName(title + " 模型")
-        self.control.setIcon(icon(provider))
+        if provider != "openai":
+            self.control.setIcon(icon(provider))
         self.control.setIconSize(QSize(14, 14))
         self.control.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.control.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
@@ -232,7 +234,9 @@ class ModelPicker(QWidget):
             self.update_list()
 
     def accepts(self, group):
-        return self.provider != "openai" or self.catalog.get("source") != "client" or model_available(group, self.daybreak)
+        if self.provider != "openai" or self.catalog.get("source") != "client":
+            return True
+        return model_available(group, bool(self.daybreak_action and self.daybreak_action.isChecked()))
 
     def selected_level(self, group):
         if not group:
@@ -275,12 +279,32 @@ class ModelPicker(QWidget):
             self.level_actions(menu, group)
             self.popup(menu, self.effort_control)
 
+    def refresh_open_models(self):
+        menu = self.menu
+        if menu and menu.objectName() == "modelList" and QApplication.activePopupWidget() is menu:
+            menu.close()
+            self.open_models()
+
     def open_models(self):
         client = self.catalog["source"] == "client"
         if not client and self.provider == "openai":
             self.open_dialog()
             return
         menu = self.new_menu(self.title + " 模型")
+        menu.setObjectName("modelList")
+        daybreak = self.daybreak_action
+        if client and daybreak and daybreak.isVisible():
+            switch = menu.addAction(daybreak.icon(), daybreak.text())
+            switch.setCheckable(True)
+            switch.setChecked(daybreak.isChecked())
+            switch.setEnabled(daybreak.isEnabled())
+
+            def toggle_daybreak():
+                daybreak.trigger()
+                QTimer.singleShot(0, self.control, self.open_models)
+
+            switch.triggered.connect(toggle_daybreak)
+            menu.addSeparator()
         selected = group_for(self.catalog["groups"], self.model)
         for group in self.catalog["groups"]:
             levels = group["choices"]
