@@ -60,6 +60,9 @@ async def main():
             assert any(a["meta"].get("exit_code") == 0 and Path(a["meta"]["log"]).is_file() for a in state["artifacts"])
             assert engine.store.rows("SELECT id FROM approvals WHERE sid=? AND decision='allow'", sid)
             assert any(e["kind"] == "verification" for e in state["events"])
+            requested = {e["meta"]["job"] for e in state["events"] if e["kind"] == "verification"}
+            assert requested <= {e["meta"]["job"] for e in state["events"] if e.get("intermediate")}
+            assert all(not e.get("intermediate") for e in state["events"] if e["actor"] == "gemini")
             assert any(t["kind"] == "verification" and t["effort"] == coding_effort for t in state["tasks"])
             assert all(t["effort"] == state["session"]["efforts"]["gemini"] for t in state["tasks"]
                        if t["kind"] in ("plan", "report") and t["status"] == "done")

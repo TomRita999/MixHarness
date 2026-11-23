@@ -1,4 +1,5 @@
 import asyncio
+import shutil
 import tempfile
 import tomllib
 import unittest
@@ -19,6 +20,7 @@ from mixharness.desktop_usage import UsageDialog
 from mixharness.desktop_widgets import Document, SettingsDialog
 from mixharness.engine import open_engine
 from mixharness.providers import MODELS
+from mixharness.store import new_id
 from tests.qt_app import application
 
 
@@ -84,6 +86,13 @@ class DesktopTests(unittest.TestCase):
                     self.assertIn("Fast 已关闭", window.speed_box.accessibleName())
                     self.assertTrue(window.daybreak_button.isHidden())
                     QTest.mouseClick(window.speed_box, left)
+                    self.assertIsNone(self.app.activePopupWidget())
+                    self.assertIsNotNone(window.backend_task)
+                    self.assertFalse(window.speed_box.isEnabled())
+                    window.backend_box.setCurrentIndex(window.backend_box.findData("api"))
+                    await asyncio.sleep(0)
+                    self.assertFalse(window.speed_box.isChecked())
+                    window.send_command("/fast")
                     speed_menu = self.app.activePopupWidget()
                     self.assertTrue(any("开启 Fast" in a.text() and a.isEnabled() for a in speed_menu.actions()))
                     QTest.keyClick(speed_menu, Qt.Key.Key_Escape)
@@ -102,6 +111,72 @@ class DesktopTests(unittest.TestCase):
                     window.close()
                     await asyncio.sleep(0)
                 loop.run_until_complete(exercise())
+
+    def test_report_input_expands_from_draft_to_finished_message(self):
+        scratch = ROOT / ".work/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            with open_engine(root, root / "data") as engine:
+                store = engine.store
+                session = engine.create_session(*(MODELS[p][0] for p in ("gemini", "openai")), directory=root)
+                sid = session["id"]
+                shutil.copy2(ROOT / "pyproject.toml", root)
+                request = "核对项目的 Python 版本，并为安装说明写一句话。"
+                seq, _ = engine.submit(sid, request, new_id())
+                plan = store.one("SELECT * FROM jobs WHERE sid=? AND kind='plan'", sid)
+                engine.set_status(plan, "running")
+                store.apply_plan(plan, {"engineering": "读取 pyproject.toml", "report": request, "report_after_gpt": True}, "")
+                job = store.one("SELECT * FROM jobs WHERE sid=? AND kind='engineering'", sid)
+                engine.set_status(job, "running")
+                project = (root / "pyproject.toml").read_text(encoding="utf-8")
+                version = tomllib.loads(project)["project"]["requires-python"]
+                version_line = next(line for line in project.splitlines() if line.startswith("requires-python"))
+                engine.record_reads(job, "MixHarness", ["pyproject.toml"])
+                with store.db:
+                    store.save_turn(job, new_id(), seq, version_line, [], backend="api")
+                window = Window(engine, QSettings(str(root / "desktop.ini"), QSettings.Format.IniFormat))
+                window.show()
+                try:
+                    window.select_session(sid)
+                    self.app.processEvents()
+                    timeline = window.timeline
+                    draft = timeline.draft_rows[job["id"]]
+                    self.assertTrue(draft.result_toggle.isVisible())
+                    self.assertTrue(draft.body.isHidden())
+                    self.assertTrue(window.preview.isHidden())
+                    QTest.mouseClick(draft.result_toggle, Qt.MouseButton.LeftButton)
+                    self.assertIn(version, draft.body.toPlainText())
+                    with store.db:
+                        store.finish(job, project, {})
+                    window.refresh(force=True)
+                    self.app.processEvents()
+                    result = timeline.rows[-1]
+                    self.assertFalse(timeline.draft_rows)
+                    self.assertTrue(result.result_toggle.isChecked())
+                    self.assertTrue(result.body.isVisible() and result.trace.isVisible())
+                    self.assertIn(version, result.body.toPlainText())
+                    QTest.keyClick(result.result_toggle, Qt.Key.Key_Space)
+                    self.assertTrue(result.body.isHidden() and result.trace.isHidden())
+                    writer = store.one("SELECT * FROM jobs WHERE sid=? AND kind='report'", sid)
+                    with store.db:
+                        store.finish(writer, "Python " + version, {})
+                    window.refresh(force=True)
+                    self.app.processEvents()
+                    self.assertTrue(timeline.rows[-1].body.isVisible())
+                    self.assertIsNone(timeline.rows[-1].result_toggle)
+                    self.assertTrue(result.body.isHidden())
+                    window.set_theme("dark")
+                    self.assertTrue(timeline.rows[-2].body.isHidden())
+                    branch = store.fork_session(sid, "")
+                    window.select_session(branch["id"])
+                    self.app.processEvents()
+                    copied = next(r for r in timeline.rows if r.result_toggle is not None)
+                    self.assertTrue(copied.body.isHidden() and copied.result_toggle.isVisible())
+                    QTest.mouseClick(copied.result_toggle, Qt.MouseButton.LeftButton)
+                    self.assertIn(version, copied.body.toPlainText())
+                finally:
+                    window.close()
 
     def test_markdown_table_and_code_examples_keep_their_structure(self):
         settings = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -228,6 +303,9 @@ class DesktopTests(unittest.TestCase):
                         self.assertTrue(window.backend_box.view().isVisible())
                         self.assertEqual([window.backend_box.itemText(i) for i in range(window.backend_box.count())],
                                          ["API", "本机客户端"])
+                        view = window.backend_box.view()
+                        self.assertEqual(view.textElideMode(), Qt.TextElideMode.ElideNone)
+                        self.assertGreaterEqual(view.viewport().width(), view.sizeHintForColumn(0))
                         QTest.keyClick(window.backend_box.view(), Qt.Key.Key_End)
                         QTest.keyClick(window.backend_box.view(), Qt.Key.Key_Return)
                         self.assertIn("正在读取", window.work_status.text())

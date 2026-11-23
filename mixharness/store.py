@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .attachments import InputLibrary
-from .conversation_trace import describe_events
+from .conversation_trace import describe_events, report_input_kind, report_inputs
 from .reasoning import LEVELS
 
 
@@ -421,10 +421,16 @@ class Store:
                             "SELECT ?,?,?,gemini,openai,brief,versions,?,?,backend,efforts,revision,revision,?,?,?,?,?,daybreak "
                             "FROM sessions WHERE id=?", (branch, name, str(workspace or original["workspace"]), now(), project, mode,
                             objective, goal_status, note, speed, sid))
+            inputs = report_inputs(self.task_summaries(sid, with_output=False))
             for event in self.db.execute("SELECT seq,kind,actor,body,meta,at FROM events WHERE sid=? AND kind='message' ORDER BY seq", (sid,)):
+                meta = event["meta"] if event["actor"] == "user" else "{}"
+                if event["actor"] == "openai":
+                    original_meta = json.loads(event["meta"])
+                    scope = report_input_kind(original_meta, inputs)
+                    if scope:
+                        meta = pack({"report_input": scope, "model": original_meta.get("model")})
                 seq = self.db.execute("INSERT INTO events(sid,kind,actor,body,meta,at) VALUES(?,?,?,?,?,?)",
-                                      (branch, event["kind"], event["actor"], event["body"],
-                                       event["meta"] if event["actor"] == "user" else "{}", event["at"])).lastrowid
+                                      (branch, event["kind"], event["actor"], event["body"], meta, event["at"])).lastrowid
                 self.db.execute("INSERT INTO message_inputs SELECT ?,item FROM message_inputs WHERE seq=? ORDER BY rowid",
                                 (seq, event["seq"]))
             if not side and self.current_proposal(sid):
@@ -753,6 +759,12 @@ class Store:
                 "SELECT 1 FROM jobs WHERE sid=? AND status IN ('ready','running','needs_key','waiting') LIMIT 1", (sid,)).fetchone():
             self.enqueue(session, "goal_check", {"revision": session["revision"]})
 
+    def task_summaries(self, sid, *, with_output=True):
+        columns = "id,kind,status,basis,json_extract(payload,'$.direct') AS direct"
+        if with_output:
+            columns += ",title,model,effort,draft,error,at"
+        return self.rows(f"SELECT {columns} FROM jobs WHERE sid=? ORDER BY rowid", sid)
+
     def snapshot(self, sid):
         events = self.rows("SELECT * FROM events WHERE sid=? ORDER BY seq", sid)
         inputs = self.inputs.for_session(sid)
@@ -760,7 +772,7 @@ class Store:
             if event["seq"] in inputs:
                 event["attachments"] = inputs[event["seq"]]
         approvals = self.rows("SELECT id,source,title,decision FROM approvals WHERE sid=?", sid)
-        tasks = self.rows("SELECT id,kind,status,title,model,effort,draft,error,basis,at FROM jobs WHERE sid=? ORDER BY rowid", sid)
+        tasks = self.task_summaries(sid)
         describe_events(events, tasks, approvals)
         return {
             "session": self.session(sid),

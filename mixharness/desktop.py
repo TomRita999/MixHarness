@@ -246,7 +246,8 @@ class Window(QMainWindow):
         self.daybreak_action.triggered.connect(self.change_daybreak)
         self.daybreak_icons = (icon("toggle-left"), icon("toggle-right", role=QPalette.ColorRole.Link))
         self.speed_icons = (icon("zap", role=QPalette.ColorRole.PlaceholderText), icon("zap", role=QPalette.ColorRole.Link))
-        self.speed_box = button("GPT Fast 速度", self.speed_menu, name="speed", icon_only=True)
+        self.speed_box = button("GPT Fast 速度", self.toggle_fast, name="speed", icon_only=True)
+        self.speed_box.setCheckable(True)
         self.speed_box.setFixedSize(26, 26)
         self.speed_box.setIconSize(QSize(16, 16))
         self.pickers = {}
@@ -975,6 +976,8 @@ class Window(QMainWindow):
             changed_backend = self.backend_box.currentData() != backend
             with QSignalBlocker(self.backend_box):
                 self.backend_box.setCurrentIndex(self.backend_box.findData(backend))
+            if changed_backend:
+                self.backend_box.updateGeometry()
             project = self.engine.store.project(self.pid) if self.pid else None
             self.project_name.setText(project["name"] if project else ("独立会话" if self.sid else "选择项目"))
             self.project_name.setToolTip("\n".join(f["path"] for f in project["folders"]) if project else "选择项目")
@@ -1007,12 +1010,20 @@ class Window(QMainWindow):
                 self.refresh_catalogs()
         self.versions = self.engine.changes.copy()
         drafts = []
+        intermediate = {}
         for task in self.state["tasks"]:
-            stream = self.engine.previews.get(task["id"])
-            saved = task["draft"] if task["status"] in ("waiting", "running", "ready") else ""
-            if stream or saved:
+            if task["status"] not in ("waiting", "running", "ready"):
+                continue
+            jid = task["id"]
+            body = self.engine.previews.get(jid) or task["draft"]
+            if not body:
+                continue
+            if task.get("intermediate"):
+                intermediate[jid] = (task, body)
+            else:
                 author = "GPT" if PROVIDERS[task["kind"]] == "openai" else "Gemini"
-                drafts.append(f"**{author} · {LABELS[task['kind']]}草稿**\n\n" + (stream or saved))
+                drafts.append(f"**{author} · {LABELS[task['kind']]}草稿**\n\n" + body)
+        self.timeline.update_drafts(intermediate)
         text = "\n\n".join(drafts)
         if text != self.preview_text:
             self.preview_text = text
@@ -1203,14 +1214,17 @@ class Window(QMainWindow):
             if self.sid:
                 self.engine.set_access(self.sid, speed=speed)
         speed_label = "Fast 已关闭" if speed == "standard" else SPEEDS[speed] + " 已开启"
+        self.speed_box.setChecked(speed != "standard")
         self.speed_box.setIcon(self.speed_icons[speed != "standard"])
         self.speed_box.setAccessibleName("GPT 加速，" + speed_label)
+        self.speed_box.setEnabled(self.backend_task is None and (not native or speed != "standard" or "fast" in speeds))
         if not native:
-            reason = "切换到本机客户端即可查看 Codex 加速档位"
+            reason = "点击切换到本机客户端并开启 Fast"
         elif self.backend_task or self.pickers["openai"].loading:
             reason = "正在读取 Codex 模型速度"
         else:
-            reason = catalog.error or ("点击选择速度" if speeds else "当前账户或模型未提供加速档位")
+            reason = "点击关闭加速" if speed != "standard" else (
+                "点击开启 Fast" if "fast" in speeds else catalog.error or "当前账户或模型未提供 Fast")
         self.speed_box.setToolTip(speed_label + " · " + reason)
 
     def change_daybreak(self, enabled):
@@ -1231,6 +1245,12 @@ class Window(QMainWindow):
     def popup_choices(self, control, menu):
         menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         menu.popup(control.mapToGlobal(QPoint(0, -menu.sizeHint().height() - 3)))
+
+    def toggle_fast(self, enabled):
+        if self.backend_box.currentData() == "api":
+            self.enable_native_fast()
+        else:
+            self.change_speed("fast" if enabled else "standard")
 
     def speed_menu(self):
         menu = QMenu(self)

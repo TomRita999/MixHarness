@@ -44,12 +44,27 @@ async def exercise(window, workspace):
         standard_icon = window.speed_box.icon().pixmap(16, 16).toImage()
         for tier in ("fast", "standard"):
             QTest.mouseClick(window.speed_box, left)
-            menu = QApplication.activePopupWidget()
-            option = next(a for a in menu.actions() if a.text() == ("开启 Fast" if tier == "fast" else "关闭 Fast"))
-            QTest.mouseClick(menu, left, pos=menu.actionGeometry(option).center())
+            assert QApplication.activePopupWidget() is None
+            assert window.speed_box.isChecked() == (tier == "fast")
             assert window.draft_speed == tier
             assert (standard_icon != window.speed_box.icon().pixmap(16, 16).toImage()) == (tier == "fast")
-        print("已通过模型名前的闪电切换 Fast 和标准速度。", flush=True)
+        session = engine.create_session(window.pickers["gemini"].model, fast["id"], directory=workspace, backend="clients")
+        window.select_session(session["id"])
+        for tier in ("fast", "standard"):
+            QTest.mouseClick(window.speed_box, left)
+            assert QApplication.activePopupWidget() is None
+            assert engine.store.session(window.sid)["speed"] == tier
+            window.select_session(session["id"])
+            assert window.speed_box.isChecked() == (tier == "fast")
+        window.backend_box.setCurrentIndex(window.backend_box.findData("api"))
+        QTest.mouseClick(window.speed_box, left)
+        assert QApplication.activePopupWidget() is None
+        await window.backend_task
+        saved = engine.store.session(window.sid)
+        assert saved["backend"] == "clients" and saved["speed"] == "fast" and window.speed_box.isChecked()
+        QTest.mouseClick(window.speed_box, left)
+        window.new_session()
+        print("已验证草稿、已保存会话和从 API 切换到本机客户端的单击 Fast 操作。", flush=True)
     if not blue:
         assert window.daybreak_button.isHidden()
         picker.control.click()

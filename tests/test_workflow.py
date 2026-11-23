@@ -13,6 +13,7 @@ from mixharness import workspace
 from mixharness.app import markdown
 from mixharness.engine import Engine
 from mixharness.providers import MODELS, Plan, declarations
+from mixharness.slash import execute_command
 from mixharness.store import Store, Superseded, new_id
 
 
@@ -187,6 +188,36 @@ class WorkflowTests(unittest.TestCase):
         events = store.snapshot(sid)["events"]
         self.assertIsNone(store.report_wait_status(sid, events[-1]["seq"]))
         self.assertIn(("本次任务实际读取", "pyproject.toml"), events[-1]["trace"])
+
+    def test_standalone_results_reviews_and_questions_stay_visible(self):
+        store, sid = self.store, self.sid
+        request = "读取项目的 Python 版本要求。"
+        store.message(sid, request, new_id())
+        self.requirements(engineering=request)
+        evidence = workspace.read_source(self.project, {"path": "pyproject.toml"})
+        research = self.start_job("engineering")
+        with store.db:
+            store.finish(research, evidence["text"], {})
+        self.assertFalse(store.snapshot(sid)["events"][-1].get("intermediate"))
+
+        store.message(sid, "核对依赖后编写安装说明。", new_id())
+        self.requirements(verification="核对安装依赖", report="编写安装说明")
+        check = self.start_job("verification")
+        with store.db:
+            store.finish(check, "要为哪个操作系统编写说明？", {"needs_input": True})
+        engine = Engine(store, self.base, self.project)
+        asyncio.run(execute_command(engine, {"id": sid, "line": "/review 安装依赖"}))
+        review = self.start_job("verification")
+        with store.db:
+            store.finish(review, evidence["sha256"], {})
+        state = store.snapshot(sid)
+        self.assertEqual({e["meta"]["job"] for e in state["events"] if e.get("intermediate")}, {research["id"]})
+        writer = self.start_job("report")
+        with self.assertRaises(FileNotFoundError) as missing:
+            (self.project / "INSTALL.md").read_text(encoding="utf-8")
+        with store.db:
+            store.finish(writer, str(missing.exception), {}, success=False)
+        self.assertFalse(any(e.get("intermediate") for e in store.snapshot(sid)["events"]))
 
     def test_snapshot_runs_an_actual_process(self):
         shutil.copytree(ROOT / "mixharness", self.project / "mixharness",

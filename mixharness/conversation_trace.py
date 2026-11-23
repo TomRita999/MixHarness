@@ -31,13 +31,39 @@ def plan_details(meta, messages):
     return lines
 
 
+def report_inputs(tasks):
+    reports = [t["basis"] for t in tasks if t["kind"] == "report" and t["status"] not in ("failed", "obsolete")]
+    engineering = {basis["engineering"] for basis in reports}
+    verification = {(basis["engineering"], basis["verification"]) for basis in reports}
+    inputs = {}
+    for task in tasks:
+        if task.get("direct"):
+            continue
+        kind, basis = task["kind"], task["basis"]
+        if ((kind == "engineering" and basis["engineering"] in engineering) or
+                (kind == "verification" and (basis["engineering"], basis["verification"]) in verification)):
+            inputs[task["id"]] = kind
+    return inputs
+
+
+def report_input_kind(meta, inputs):
+    if not meta.get("needs_input"):
+        return inputs.get(meta.get("job")) or meta.get("report_input")
+
+
 def describe_events(events, tasks, approvals):
     messages, outcomes, failures, reads = {}, {}, {}, {}
     decisions = {a["id"]: a for a in approvals}
     failed = {t["id"] for t in tasks if t["status"] == "failed"}
+    inputs = report_inputs(tasks)
+    for task in tasks:
+        if task["id"] in inputs:
+            task["intermediate"] = True
     for event in events:
         kind, meta = event["kind"], event["meta"]
         jid = meta.get("job")
+        if kind == "message" and event["actor"] == "openai" and report_input_kind(meta, inputs):
+            event["intermediate"] = True
         if meta.get("files_read"):
             reads.setdefault(jid, {}).update(dict.fromkeys(meta["files_read"]))
         if event["actor"] == "user":

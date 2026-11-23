@@ -19,6 +19,7 @@ from .desktop_style import Glyph
 from .desktop_markdown import link_plain_text, render_markdown
 from .markdown_links import HASH_LINE
 from .attachments import TYPES
+from .store import LABELS
 from .reasoning import LEVEL_NAMES, api_group, group_for, model_available
 
 
@@ -57,6 +58,17 @@ def button(text, callback, glyph=None, name="", icon_only=False):
     result.setCursor(Qt.CursorShape.PointingHandCursor)
     result.clicked.connect(callback)
     return result
+
+
+def disclosure(text):
+    control = QToolButton()
+    control.setObjectName("activity")
+    control.setText(text)
+    control.setCheckable(True)
+    control.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    control.setArrowType(Qt.ArrowType.RightArrow)
+    control.toggled.connect(lambda opened: control.setArrowType(Qt.ArrowType.DownArrow if opened else Qt.ArrowType.RightArrow))
+    return control
 
 
 class Editor(QPlainTextEdit):
@@ -137,6 +149,14 @@ class FitCombo(QComboBox):
 
     def minimumSizeHint(self):
         return self.sizeHint()
+
+    def showPopup(self):
+        view = self.view()
+        view.ensurePolished()
+        view.setTextElideMode(Qt.TextElideMode.ElideNone)
+        margins = view.contentsMargins()
+        view.setMinimumWidth(view.sizeHintForColumn(self.modelColumn()) + margins.left() + margins.right())
+        super().showPopup()
 
     def enterEvent(self, event):
         super().enterEvent(event)
@@ -538,10 +558,15 @@ class Document(QTextBrowser):
 
 
 class MessageRow(QWidget):
-    def __init__(self, event, input_library=None, retry=None, workspace=None):
+    def __init__(self, event, input_library=None, retry=None, workspace=None, expanded_jobs=None):
         super().__init__()
         self.user = event["actor"] == "user"
         self.text = event["body"]
+        self.result_toggle = None
+        self.trace = None
+        self.intermediate = None
+        self.rendered = None
+        self.available = None
         row = QHBoxLayout(self)
         row.setContentsMargins(2, 5, 2, 5)
         row.setSpacing(0)
@@ -557,16 +582,28 @@ class MessageRow(QWidget):
         else:
             title = {"requirements": "Gemini · 需求整理", "verification": "Gemini 请求 GPT 验证",
                      "failure": author + " · 失败"}.get(event["kind"], author)
-            model = event.get("meta", {}).get("model")
+            meta = event.get("meta", {})
+            model = meta.get("model")
+            scope = meta.get("kind") or meta.get("report_input")
             if model:
                 title += " · " + model
-            box.addWidget(label(title, "messageAuthor"))
+            self.author_label = label(title, "messageAuthor")
+            box.addWidget(self.author_label)
+            if (expanded_jobs is not None and event["actor"] == "openai" and event["kind"] == "message"
+                    and scope in ("engineering", "verification") and not meta.get("needs_input")):
+                self.expanded_jobs = expanded_jobs
+                self.job = meta.get("job") or event["seq"]
+                self.result_toggle = disclosure("GPT 中间输出 · " + LABELS[scope])
+                self.result_toggle.setToolTip(title)
+                self.result_toggle.setChecked(self.job in expanded_jobs)
+                self.result_toggle.toggled.connect(self.toggle_result)
+                box.addWidget(self.result_toggle, 0, ALIGN.AlignLeft)
         if event.get("notice"):
             notice = label(event["notice"])
             notice.setWordWrap(True)
             box.addWidget(notice)
         if event.get("trace"):
-            trace = QFrame()
+            self.trace = trace = QFrame()
             trace.setObjectName("trace")
             details = QVBoxLayout(trace)
             details.setSpacing(3)
@@ -598,7 +635,7 @@ class MessageRow(QWidget):
             self.body.setPlainText(self.text)
             if self.user:
                 link_plain_text(self.body.document(), self.body.palette())
-        else:
+        elif self.result_toggle is None:
             self.body.show_markdown(self.text)
         self.body.setAccessibleName(author + "的消息")
         self.body.setAccessibleDescription(self.body.toPlainText())
@@ -606,14 +643,8 @@ class MessageRow(QWidget):
             stamp = datetime.fromisoformat(event["at"]).astimezone().strftime("%Y-%m-%d %H:%M")
             self.block.setToolTip(author + " · " + stamp)
         if event.get("notice"):
-            control = QToolButton()
-            control.setObjectName("activity")
-            control.setText("原始错误")
-            control.setCheckable(True)
-            control.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-            control.setArrowType(Qt.ArrowType.RightArrow)
+            control = disclosure("原始错误")
             control.toggled.connect(self.body.setVisible)
-            control.toggled.connect(lambda opened: control.setArrowType(Qt.ArrowType.DownArrow if opened else Qt.ArrowType.RightArrow))
             box.addWidget(control, 0, ALIGN.AlignLeft)
             self.body.hide()
         elif event["kind"] == "requirements" and event.get("trace"):
@@ -640,14 +671,46 @@ class MessageRow(QWidget):
             if not self.text:
                 self.body.hide()
         row.addWidget(self.block)
-        metrics = QFontMetrics(self.body.font())
-        self.natural = max((metrics.horizontalAdvance(line[:1024]) for line in self.text.splitlines()), default=0)
+        self.natural = 0
+        if self.user:
+            metrics = QFontMetrics(self.body.font())
+            self.natural = max((metrics.horizontalAdvance(line[:1024]) for line in self.text.splitlines()), default=0)
         if inputs:
             self.natural = max(self.natural, 150)
             if not self.text:
                 self.text = "、".join(item["name"] for item in inputs)
+        if self.result_toggle is not None:
+            self.set_intermediate(bool(event.get("intermediate")))
+
+    def set_intermediate(self, intermediate):
+        if self.intermediate == intermediate:
+            return
+        self.intermediate = intermediate
+        self.author_label.setVisible(not intermediate)
+        self.result_toggle.setVisible(intermediate)
+        self.show_result()
+
+    def toggle_result(self, opened):
+        if opened:
+            self.expanded_jobs.add(self.job)
+        else:
+            self.expanded_jobs.discard(self.job)
+        self.show_result()
+
+    def show_result(self):
+        visible = not self.intermediate or self.result_toggle.isChecked()
+        self.body.setVisible(visible)
+        if self.trace is not None:
+            self.trace.setVisible(visible)
+        if visible and self.rendered != self.text:
+            self.body.show_markdown(self.text)
+            self.body.setAccessibleDescription(self.body.toPlainText())
+            self.rendered = self.text
+            if self.available is not None:
+                self.fit(self.available)
 
     def fit(self, available):
+        self.available = available
         width = max(50, available - 6)
         if self.user:
             width = max(40, min(int(width * 0.78), self.natural + 34))
@@ -668,7 +731,9 @@ class Timeline(QScrollArea):
         self.input_library = input_library
         self.workspace = None
         self.retry = retry
-        self.failure_rows = {}
+        self.event_rows = {}
+        self.draft_rows = {}
+        self.expanded_jobs = set()
         self.setAccessibleName("共享会话记录")
         self.setObjectName("timeline")
         self.setWidgetResizable(True)
@@ -698,7 +763,8 @@ class Timeline(QScrollArea):
             item.widget().hide()
             item.widget().deleteLater()
         self.rows.clear()
-        self.failure_rows.clear()
+        self.event_rows.clear()
+        self.draft_rows.clear()
         self.records.clear()
         self.group_button = self.group_body = None
         self.seen = 0
@@ -729,7 +795,7 @@ class Timeline(QScrollArea):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        for row in self.rows:
+        for row in (*self.rows, *self.draft_rows.values()):
             row.fit(self.viewport().width() - 4)
         self.navigation_changed.emit()
 
@@ -739,22 +805,17 @@ class Timeline(QScrollArea):
             box = QVBoxLayout(group)
             box.setContentsMargins(1, 0, 1, 0)
             box.setSpacing(4)
-            control = QToolButton()
-            control.setObjectName("activity")
-            control.setCheckable(True)
-            control.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-            control.setArrowType(Qt.ArrowType.RightArrow)
+            control = disclosure("")
             details = label("", "caption")
             details.setWordWrap(True)
             details.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             details.hide()
             control.toggled.connect(details.setVisible)
-            control.toggled.connect(lambda opened: control.setArrowType(Qt.ArrowType.DownArrow if opened else Qt.ArrowType.RightArrow))
             box.addWidget(control, 0, ALIGN.AlignLeft)
             box.addWidget(details)
             self.group_button, self.group_body = control, details
-            self.column.insertWidget(self.column.count() - 1, group)
+            self.column.insertWidget(self.column.count() - 1 - len(self.draft_rows), group)
         prior = self.group_body.text()
         self.group_body.setText(prior + "\n" + text if prior else text)
         self.group_button.setText(title or "过程")
@@ -765,9 +826,11 @@ class Timeline(QScrollArea):
         changed = False
         for event in events:
             if event["seq"] <= self.seen:
-                actions = self.failure_rows.get(event["seq"])
-                if actions is not None:
-                    actions.setVisible(bool(event.get("retryable")))
+                row = self.event_rows.get(event["seq"])
+                if row is not None and row.retry_actions is not None:
+                    row.retry_actions.setVisible(bool(event.get("retryable")))
+                if row is not None and row.result_toggle is not None:
+                    row.set_intermediate(bool(event.get("intermediate")))
                 continue
             self.seen = event["seq"]
             kind = event["kind"]
@@ -781,18 +844,46 @@ class Timeline(QScrollArea):
                 self.progress(event["body"], event.get("approval_label"))
                 continue
             self.group_button = self.group_body = None
-            row = MessageRow(event, self.input_library, self.retry, self.workspace)
-            if row.retry_actions is not None:
-                self.failure_rows[event["seq"]] = row.retry_actions
+            row = MessageRow(event, self.input_library, self.retry, self.workspace, self.expanded_jobs)
+            self.event_rows[event["seq"]] = row
             row.fit(self.viewport().width() - 4)
             self.rows.append(row)
-            self.column.insertWidget(self.column.count() - 1, row)
+            self.column.insertWidget(self.column.count() - 1 - len(self.draft_rows), row)
         if changed and follow:
             self.column.activate()
             self.canvas.adjustSize()
             bar.setValue(bar.maximum())
         if changed:
             self.navigation_changed.emit()
+
+    def update_drafts(self, drafts):
+        bar = self.verticalScrollBar()
+        follow = bar.maximum() - bar.value() < 30
+        changed = False
+        for jid in self.draft_rows.keys() - drafts.keys():
+            row = self.draft_rows.pop(jid)
+            self.column.removeWidget(row)
+            row.hide()
+            row.deleteLater()
+            changed = True
+        for jid, (task, text) in drafts.items():
+            row = self.draft_rows.get(jid)
+            if row is None:
+                event = {"actor": "openai", "kind": "message", "body": text, "intermediate": True,
+                         "meta": {"job": jid, "kind": task["kind"], "model": task["model"]}}
+                row = MessageRow(event, workspace=self.workspace, expanded_jobs=self.expanded_jobs)
+                self.draft_rows[jid] = row
+                row.fit(self.viewport().width() - 4)
+                self.column.insertWidget(self.column.count() - 1, row)
+                changed = True
+            elif row.text != text:
+                row.text = text
+                row.show_result()
+                changed |= row.result_toggle.isChecked()
+        if changed and follow:
+            self.column.activate()
+            self.canvas.adjustSize()
+            bar.setValue(bar.maximum())
 
 
 class MessageNav(QWidget):
