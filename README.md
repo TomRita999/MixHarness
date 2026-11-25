@@ -149,3 +149,12 @@ python packaging/check_desktop.py
 ```
 
 三端 CI 自动构建配置见 `.github/workflows/test.yml`。
+
+## 友情推荐
+
+如果你对多 Agent 协作和随身 AI 助手也感兴趣，推荐看看朋友开源的项目 **[Reduction](https://github.com/mindtravel/Reduction)** —— 一套把蓝牙耳机、安卓手机、电脑桌面（Windows 桌宠 / WSL / Linux）和可选云中转串起来的智能随身助手：
+
+- **熄屏纯语音交互**：戴着蓝牙耳机说 “Hi Reduction” 就能唤醒记录想法或派发任务，说“完毕”结束录音，不用频繁掏手机。
+- **卡片式信息整理**：基于 CARD 卡片协议，把日常事务、图片和文档归类整理成卡片，平时不用盯着屏幕，有空时一次性集中审核；支持私人标注，公开导出时自动过滤隐私内容。
+- **跨端多 Agent 调度**：采用 super agent + sub agent 分工，随身端负责理解意图与派发任务，电脑端负责执行工具、读取授权目录、查看电脑上其他编程 Agent 状态以及语音管理 GitHub 动态，任务产出还会经独立核验后才记为完成。
+- **轻量开源**：最小配置只需一个 DeepSeek API Key，密钥与数据留在本地设备上，采用 MIT 协议开源。
