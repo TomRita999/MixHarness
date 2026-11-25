@@ -7,6 +7,7 @@ from PySide6.QtCore import QSettings, Qt
 from PySide6.QtTest import QTest
 from qasync import QEventLoop
 
+from mixharness.clients import is_dot_model
 from mixharness.desktop import Window
 from mixharness.desktop_style import load_icons
 from mixharness.engine import open_engine
@@ -89,6 +90,41 @@ async def exercise(app, engine, work):
         assert not window.recipient and window.sid == sid
         print("同一会话 Gemini → GPT → Gemini 三轮真实应答通过。Gemini 流式显示", bool(streamed or more_stream),
               "；窗口截图目录", work, flush=True)
+
+        if any(is_dot_model(m) for m in engine.client_catalogs["openai"].labels):
+            window.apply_backend(sid, "api")
+            follow_up = "请只回复刚才对话中的编号。"
+            window.editor.setPlainText(follow_up)
+            QTest.mouseClick(window.dot_chat, left)
+            await window.backend_task
+            session = engine.store.session(sid)
+            dot = session["openai"]
+            assert is_dot_model(dot) and session["backend"] == "clients" and window.sid == sid
+            assert window.recipient == "openai" and window.editor.toPlainText() == follow_up
+            assert "GPT-dot" in window.editor.placeholderText() and window.send_button.isEnabled()
+            QTest.keyClick(window.editor, Qt.Key.Key_Return)
+            messages, _ = await replies(4, key=token)
+            assert messages[-1]["actor"] == "openai" and window.state["tasks"][-1]["model"] == dot
+            choose("Gemini")
+            QTest.mouseClick(window.dot_chat, left)
+            await window.backend_task
+            assert window.sid == sid and window.pickers["openai"].model == dot
+            assert len(window.state["tasks"]) == 4
+            window.new_standalone()
+            window.backend_box.setCurrentIndex(window.backend_box.findData("api"))
+            window.editor.setPlainText(follow_up)
+            QTest.mouseClick(window.dot_chat, left)
+            await window.backend_task
+            assert window.sid is None and window.recipient == "openai" and window.send_button.isEnabled()
+            assert is_dot_model(window.pickers["openai"].model) and window.editor.toPlainText() == follow_up
+            variant = next((g for g in engine.client_catalogs["openai"].groups
+                            if is_dot_model(g["id"]) and "high" in g["choices"] and window.pickers["openai"].accepts(g)), None)
+            if variant:
+                window.choose_model("openai", variant["id"], "high")
+                QTest.mouseClick(window.dot_chat, left)
+                await window.backend_task
+                assert (window.pickers["openai"].model, window.pickers["openai"].effort) == (variant["id"], "high")
+            print("GPT-dot 侧栏入口在 API 会话和新草稿中均可使用，实际回复模型", dot, flush=True)
     finally:
         window.close()
         worker.cancel()

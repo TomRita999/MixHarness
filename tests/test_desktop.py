@@ -1,4 +1,5 @@
 import asyncio
+import os
 import shutil
 import tempfile
 import tomllib
@@ -8,7 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtGui import QPalette, QTextTable
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QInputDialog, QMenu, QMessageBox, QPushButton
+from PySide6.QtWidgets import QDialog, QInputDialog, QMenu, QMessageBox, QPushButton
 from qasync import QEventLoop
 
 from mixharness.chat_snapshot import markdown
@@ -216,6 +217,8 @@ class DesktopTests(unittest.TestCase):
                     self.assertEqual(window.composer.width(), 736)
                     self.assertEqual(window.sidebar.width(), 290)
                     self.assertEqual(window.rail.width(), 52)
+                    self.assertEqual([b.text() for b in window.sidebar.findChildren(QPushButton, "nav")],
+                                     ["新聊天", "GPT-dot"])
                     window.editor.setPlainText("能帮我解释同一会话的消息记录吗？")
                     QTest.mouseClick(window.recipient_button, Qt.MouseButton.LeftButton)
                     menu = self.app.activePopupWidget()
@@ -246,6 +249,37 @@ class DesktopTests(unittest.TestCase):
                     self.assertEqual(window.backend_box.itemText(1), "本机客户端")
                     window.go_forward.click()
                     self.assertIsNone(window.sid)
+                finally:
+                    window.close()
+
+    def test_missing_codex_keeps_dot_shortcut_from_switching_the_draft(self):
+        scratch = ROOT / ".work/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            previous = os.environ.get("MIXHARNESS_CODEX")
+            if previous is None:
+                self.addCleanup(os.environ.pop, "MIXHARNESS_CODEX", None)
+            else:
+                self.addCleanup(os.environ.__setitem__, "MIXHARNESS_CODEX", previous)
+            os.environ["MIXHARNESS_CODEX"] = str(root / "missing-codex")
+            with open_engine(root, root / "data") as engine, QEventLoop(self.app) as loop:
+                window = Window(engine, QSettings(str(root / "desktop.ini"), QSettings.Format.IniFormat))
+
+                async def exercise():
+                    window.show()
+                    window.select_recipient("gemini")
+                    window.editor.setPlainText("请解释刚才的回复。")
+                    QTest.mouseClick(window.dot_chat, Qt.MouseButton.LeftButton)
+                    await window.backend_task
+                    self.assertEqual((window.sid, window.recipient, window.backend_box.currentData()), (None, "gemini", "api"))
+                    self.assertEqual(window.editor.toPlainText(), "请解释刚才的回复。")
+                    self.assertTrue(window.dot_chat.isEnabled() and window.send_button.isEnabled())
+                    dialog = next(d for d in window.findChildren(QDialog) if d.windowTitle() == "无法打开 GPT-dot")
+                    self.assertIn("codex 程序不存在", dialog.findChild(Document).toPlainText())
+                    dialog.close()
+                try:
+                    loop.run_until_complete(exercise())
                 finally:
                     window.close()
 

@@ -28,7 +28,7 @@ from .desktop_widgets import (
     ALIGN, ArtifactDialog, Document, Editor, FitCombo, HistoryTree, menu_icon, MessageNav, ModelPicker, SettingsDialog, Submenu, Timeline, button, icon, label,
 )
 from .providers import MODELS
-from .clients import CLIENTS
+from .clients import CLIENTS, is_dot_model
 from .reasoning import LEVEL_NAMES, group_for, model_available, resolve_choice, select_daybreak_model
 from .store import ACTIVE_STATUSES, CHAT_JOBS, GOAL_STATES, LABELS, MODES, MODE_TITLES, PROVIDERS, STATUSES, accepts_guidance, new_id
 
@@ -181,7 +181,9 @@ class Window(QMainWindow):
         source_row.addWidget(button("搜索聊天", self.search, "search", icon_only=True))
         col.addLayout(source_row)
         col.addWidget(button("新聊天", self.new_session, "new", "nav"))
-        col.addWidget(button("Gemini", lambda: self.select_recipient("gemini"), "gemini", "nav"))
+        self.dot_chat = button("GPT-dot", self.open_dot_chat, "openai", "nav")
+        self.dot_chat.setToolTip("在当前聊天中直接给 GPT-dot 发消息")
+        col.addWidget(self.dot_chat)
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("搜索项目或会话")
         self.filter.setClearButtonEnabled(True)
@@ -702,6 +704,8 @@ class Window(QMainWindow):
         for p, model in models.items():
             key = self.model_key(p, backend)
             effort = remembered.get("efforts", {}).get(p) if remembered.get(p) == model else None
+            if session.get("backend") == backend and session.get(p) == model:
+                effort = session.get("efforts", {}).get(p)
             if effort is None and self.settings.value(key) == model:
                 effort = self.settings.value(key + "-effort", "")
             group = group_for(catalogs[p].view()["groups"], model)
@@ -1029,6 +1033,64 @@ class Window(QMainWindow):
         self.refresh(force=True)
         self.editor.setFocus()
 
+    def recipient_name(self):
+        if (self.recipient == "openai" and self.backend_box.currentData() == "clients"
+                and is_dot_model(self.pickers["openai"].model)):
+            return "GPT-dot"
+        return RECIPIENTS[self.recipient]
+
+    def open_dot_chat(self):
+        self.cancel_backend_change()
+        sid = self.sid
+        session = self.engine.store.session(sid) if sid else {}
+        switching = session.get("backend", self.settings.value("backend", "api")) != "clients"
+        codex = self.engine.client_catalogs["openai"]
+        gemini = self.engine.client_catalogs["gemini"]
+
+        async def activate():
+            try:
+                catalogs = [] if any(is_dot_model(m) for m in codex.labels) else [codex]
+                if switching and sid and not gemini.groups and any(
+                    j["kind"] != CHAT_JOBS["openai"] for j in self.engine.store.active_jobs(sid)
+                ):
+                    catalogs.append(gemini)
+                await asyncio.gather(*(catalog.refresh() for catalog in catalogs))
+                if self.backend_task is not asyncio.current_task():
+                    return
+                daybreak = not switching and session.get("daybreak", self.draft_daybreak)
+                choices = {g["id"]: g["name"] for g in codex.groups
+                           if is_dot_model(g["id"]) and model_available(g, daybreak)}
+                if not choices:
+                    hint = ("当前 Daybreak 模式没有可用的 GPT-dot 模型。可在 GPT 模型列表顶部关闭 Daybreak 后重试。"
+                            if daybreak else "本机 Codex 账户没有提供 GPT-dot 模型。")
+                    raise ValueError(codex.error or hint)
+                models = self.preferred_models("clients", session)
+                current = session["openai"] if sid and not switching else models["openai"]
+                default = next((m for m, name in choices.items() if m == "gpt-dot" or name.casefold() == "gpt-dot"),
+                               next(iter(choices)))
+                model = current if current in choices else default
+                models["openai"] = model
+                efforts = self.preferred_efforts("clients", session, models)
+                if sid and switching:
+                    self.engine.switch_backend(sid, "clients", models, efforts, recipient="openai")
+                elif not sid:
+                    self.settings.setValue("backend", "clients")
+            except ValueError as exc:
+                self.command_detail("无法打开 GPT-dot", str(exc))
+                return
+            finally:
+                if self.backend_task is asyncio.current_task():
+                    self.backend_task = None
+                    self.refresh(force=True)
+            self.choose_model("openai", model, efforts["openai"])
+            self.sources_box.setCurrentIndex(0)
+            self.select_recipient("openai")
+            if switching and not gemini.groups and gemini not in catalogs:
+                self.refresh_catalog("gemini")
+
+        self.backend_task = self.run_task(activate())
+        self.refresh(force=True)
+
     def layout_models(self):
         if not hasattr(self, "compact_efforts"):
             return
@@ -1092,7 +1154,7 @@ class Window(QMainWindow):
             if provider == "openai" and previous != value:
                 self.draft_speed = "standard"
                 self.refresh_access()
-            self.layout_models()
+            self.refresh_mode()
             self.editor_changed()
             return
         session = self.engine.store.session(self.sid)
@@ -1140,6 +1202,7 @@ class Window(QMainWindow):
                 picker.select(model, data, effort)
                 if provider == "openai":
                     self.refresh_access()
+                    self.refresh_mode()
                     if data["source"] == "client":
                         picker.refresh_open_models()
                 self.editor_changed()
@@ -1329,7 +1392,7 @@ class Window(QMainWindow):
         self.stop_button.setEnabled(bool(active))
         self.continue_button.setVisible(paused and not stopping)
         guiding = not self.recipient and any(accepts_guidance(j) for j in active)
-        action = "发送给 " + RECIPIENTS[self.recipient] if self.recipient else (
+        action = "发送给 " + self.recipient_name() if self.recipient else (
             "发送引导" if guiding else "带着补充要求继续" if paused else "发送消息")
         self.send_button.setAccessibleName(action)
         self.send_button.setToolTip(action + "（Enter）")
@@ -1618,14 +1681,17 @@ class Window(QMainWindow):
             text = "目标 · " + GOAL_STATES[session["goal_status"]]
         self.mode_button.setText(text + " ▾")
         self.mode_button.setToolTip((session.get("objective") if mode == "goal" else "") or text)
-        self.recipient_button.setText(RECIPIENTS[self.recipient] + "  ▾")
-        self.recipient_button.setAccessibleName("消息接收方，" + RECIPIENTS[self.recipient])
+        recipient = self.recipient_name()
+        self.dot_chat.setEnabled(self.backend_task is None)
+        self.recipient_button.setEnabled(self.backend_task is None)
+        self.recipient_button.setText(recipient + "  ▾")
+        self.recipient_button.setAccessibleName("消息接收方，" + recipient)
         self.recipient_button.setToolTip("选择双模型协作、Gemini 或 GPT 直接对话")
         self.mode_button.setVisible(not self.recipient)
         self.mode_caption.setVisible(not self.recipient)
         self.layout_models()
         if self.recipient:
-            self.editor.setPlaceholderText("给 " + RECIPIENTS[self.recipient] + " 发消息…")
+            self.editor.setPlaceholderText("给 " + recipient + " 发消息…")
             return
         self.editor.setPlaceholderText({"side": "继续向 GPT 提问…", "plan": "描述想解决的问题，或补充计划要求…",
                                         "goal": "输入要达成的目标，或补充验收条件…",
