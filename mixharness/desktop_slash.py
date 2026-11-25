@@ -111,7 +111,7 @@ class SlashMenu(QListWidget):
             self.prefix = None
             self.hide()
             return
-        show_daybreak = not self.host.daybreak_button.isHidden()
+        show_daybreak = self.host.daybreak_action.isVisible() and self.host.recipient != "gemini"
         key = (text, self.host.sid, show_daybreak)
         if key != self.prefix:
             self.prefix = key

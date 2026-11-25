@@ -1,6 +1,6 @@
 import frontmatter
-from PySide6.QtCore import QPoint, Qt, QTimer, QSize, Signal
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtCore import QEvent, QPoint, QRectF, Qt, QTimer, QSize, Signal
+from PySide6.QtGui import QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
@@ -17,21 +17,69 @@ from .providers import FUNCTIONS
 ROLE = Qt.ItemDataRole.UserRole
 
 
-def attachment_button(parent, library, item):
+class ImagePreview(QPushButton):
+    def __init__(self, parent, picture):
+        super().__init__(parent)
+        self.setFixedSize(120, 120)
+        self.setObjectName("imagePreview")
+        self.picture = picture
+        self.remove_button = None
+
+    def add_remove_button(self, control):
+        self.remove_button = control
+        control.setParent(self)
+        control.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        control.move(self.width() - control.width() - 4, 4)
+        control.hide()
+
+    def event(self, event):
+        result = super().event(event)
+        if (getattr(self, "remove_button", None) and event.type() in
+                (QEvent.Type.Enter, QEvent.Type.Leave, QEvent.Type.FocusIn, QEvent.Type.FocusOut)):
+            self.remove_button.setVisible(self.underMouse() or self.hasFocus())
+        return result
+
+    def keyPressEvent(self, event):
+        if self.remove_button and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.remove_button.click()
+        else:
+            super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        bounds = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
+        shape = QPainterPath()
+        shape.addRoundedRect(bounds, 9, 9)
+        painter.setClipPath(shape)
+        picture = self.picture.rect()
+        side = min(picture.width(), picture.height())
+        source = QRectF((picture.width() - side) / 2, (picture.height() - side) / 2, side, side)
+        painter.drawPixmap(bounds, self.picture, source)
+        painter.setPen(QPen(self.palette().text() if self.hasFocus() else self.palette().mid(), 2 if self.hasFocus() else 1))
+        painter.drawPath(shape)
+
+
+def attachment_button(parent, library, item, *, large=False):
     caption = TYPES[item["kind"]] + " · " + item["name"]
-    control = QPushButton(parent)
-    control.setObjectName("quiet")
-    control.setCursor(Qt.CursorShape.PointingHandCursor)
-    control.setAccessibleName(caption)
-    control.setText(control.fontMetrics().elidedText(item["name"], Qt.TextElideMode.ElideMiddle, 130))
-    control.setToolTip(caption + ("\n" + item["source"] if item["source"] else ""))
     if item["kind"] == "image":
         thumb = QPixmap()
         thumb.loadFromData(library.data(item["id"]))
-        control.setIcon(QIcon(thumb.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)))
-        control.setIconSize(QSize(30, 30))
+    if large and item["kind"] == "image":
+        control = ImagePreview(parent, thumb)
     else:
-        control.setText(TYPES[item["kind"]] + " · " + control.text())
+        control = QPushButton(parent)
+        control.setObjectName("quiet")
+        name = control.fontMetrics().elidedText(item["name"], Qt.TextElideMode.ElideMiddle, 130)
+        if item["kind"] == "image":
+            control.setIcon(QIcon(thumb.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)))
+            control.setIconSize(QSize(30, 30))
+            control.setText(name)
+        else:
+            control.setText(TYPES[item["kind"]] + " · " + name)
+    control.setCursor(Qt.CursorShape.PointingHandCursor)
+    control.setAccessibleName(caption)
+    control.setToolTip(caption + ("\n" + item["source"] if item["source"] else ""))
 
     def preview():
         dialog = QDialog(parent)
@@ -68,7 +116,9 @@ class ComposerInputs(QScrollArea):
         self.library = window.engine.store.inputs
         self.items = []
         self.dialog = None
+        self.setObjectName("composerInputs")
         self.setAccessibleName("待发送的附件")
+        self.viewport().setAutoFillBackground(False)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setWidgetResizable(True)
         self.setFixedHeight(48)
@@ -79,17 +129,24 @@ class ComposerInputs(QScrollArea):
     def restore(self):
         self.items = self.library.metadata(self.window.draft_key())
         row = QWidget()
+        row.setObjectName("inputStrip")
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(8)
         for item in self.items:
-            layout.addWidget(attachment_button(self, self.library, item))
-            remove = button("移除 " + item["name"], lambda _, key=item["id"]: self.remove(key), "close", icon_only=True)
-            remove.setFixedSize(22, 22)
-            layout.addWidget(remove)
-            layout.addSpacing(5)
+            preview = attachment_button(row, self.library, item, large=True)
+            layout.addWidget(preview)
+            remove = button("移除 " + item["name"], lambda _, key=item["id"]: self.remove(key), "close", "removeInput", True)
+            remove.setFixedSize(20, 20)
+            remove.setIconSize(QSize(12, 12))
+            if isinstance(preview, ImagePreview):
+                preview.add_remove_button(remove)
+            else:
+                layout.addWidget(remove)
         layout.addStretch()
+        self.setFixedHeight(126 if any(item["kind"] == "image" for item in self.items) else 40)
         self.setWidget(row)
+        row.setAutoFillBackground(False)
         self.setVisible(bool(self.items))
         self.changed.emit()
 

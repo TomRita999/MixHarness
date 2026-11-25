@@ -34,3 +34,23 @@ int windowContainsText(void *nativeView, const char *text)
         return containsText(view.window, [NSString stringWithUTF8String:text], visited);
     }
 }
+
+int windowHasSingleTitle(void *nativeView)
+{
+    NSWindow *window = ((__bridge NSView *)nativeView).window;
+    return window.titleVisibility == NSWindowTitleHidden && window.title.length > 0 &&
+           window.movable && (window.styleMask & NSWindowStyleMaskResizable) &&
+           ![window standardWindowButton:NSWindowCloseButton].hidden;
+}
+
+void postWindowMouseEvent(void *nativeView, int x, int y, int phase)
+{
+    NSView *view = (__bridge NSView *)nativeView;
+    NSWindow *window = view.window;
+    NSPoint location = [view convertPoint:NSMakePoint(x, view.isFlipped ? y : NSHeight(view.bounds) - y) toView:nil];
+    NSEventType types[] = {NSEventTypeLeftMouseDown, NSEventTypeLeftMouseDragged, NSEventTypeLeftMouseUp};
+    NSEvent *event = [NSEvent mouseEventWithType:types[phase] location:location modifierFlags:0
+                             timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber
+                             context:nil eventNumber:0 clickCount:1 pressure:phase == 2 ? 0 : 1];
+    [NSApp postEvent:event atStart:NO];
+}

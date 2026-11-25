@@ -14,6 +14,7 @@ from qasync import QEventLoop
 from mixharness.attachments import Attachment, image_parts
 from mixharness.catalog import MODELS
 from mixharness.desktop import Window
+from mixharness.desktop_inputs import ImagePreview
 from mixharness.desktop_clients import ClientHistory
 from mixharness.engine import open_engine
 from mixharness.store import new_id
@@ -81,7 +82,10 @@ class InputTests(unittest.TestCase):
                 mime.setImageData(QImage(str(ICON)))
                 window.editor.insertFromMimeData(mime)
                 self.assertTrue(window.send_button.isEnabled())
-                window.inputs.remove(window.inputs.items[0]["id"])
+                preview = window.inputs.findChild(ImagePreview)
+                self.assertEqual((preview.width(), preview.height()), (120, 120))
+                preview.setFocus()
+                QTest.keyClick(preview, Qt.Key.Key_Delete)
                 self.assertFalse(window.send_button.isEnabled())
                 files = QMimeData()
                 files.setUrls([QUrl.fromLocalFile(str(ICON))])

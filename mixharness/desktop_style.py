@@ -17,6 +17,9 @@ GLYPHS = {
     "server": 0xE153, "review": 0xE0CB, "usage": 0xE1BF, "share": 0xE155,
     "fork": 0xE28D, "book": 0xE05F, "compact": 0xE529, "terminal": 0xE181,
     "plan": 0xE086, "goal": 0xE345,
+    "home": 0xE0F5, "files": 0xE0CF, "clipboard": 0xE219, "history": 0xE1F5,
+    "grid": 0xE0FF, "account": 0xE462, "filter": 0xE460, "sliders": 0xE29A,
+    "chevron-left": 0xE06E, "folder-open": 0xE247,
 }
 
 
@@ -56,11 +59,11 @@ class Glyph(QIconEngine):
 
 
 THEMES = {
-    "light": dict(canvas="#ffffff", side="#f9f9f9", hover="#f3f3f3", selected="#ededed", field="#ffffff",
+    "light": dict(canvas="#ffffff", side="#f8f7f6", hover="#eeeceb", selected="#e9e7e5", field="#ffffff", composer="#f5f5f5",
                   line="#ededed", strong="#dfdfdf", ink="#0d0d0d", secondary="#505050", muted="#737373",
                   inverse="#ffffff", bubble="#f3f3f3", link="#0969da", shadow="#19000000"),
-    "dark": dict(canvas="#181818", side="#000000", hover="#282828", selected="#303030", field="#212121",
-                 line="#303030", strong="#404040", ink="#ededed", secondary="#cdcdcd", muted="#999999",
+    "dark": dict(canvas="#181818", side="#222121", hover="#302f2f", selected="#393939", field="#292929", composer="#353535",
+                 line="#323131", strong="#444444", ink="#f1f1f1", secondary="#d2d2d2", muted="#a3a1a1",
                  inverse="#181818", bubble="#303030", link="#75b6ff", shadow="#30000000"),
 }
 
@@ -109,7 +112,7 @@ def apply_theme(app, name):
         QMainWindow, QDialog, QWidget#main, QWidget#content, QTextBrowser, QPlainTextEdit { background: $canvas; }
         QFrame#sidebar { background: $side; border-right: 1px solid $line; }
         QFrame#inspector { background: $side; border-left: 1px solid $line; }
-        QFrame#composer { background: $field; border: 1px solid $strong; border-radius: 22px; }
+        QFrame#composer { background: $composer; border: 1px solid $strong; border-radius: 22px; }
         QFrame#composer[focused="true"] { border-color: $strong; }
         QFrame#headerLine { background: $line; max-height: 1px; border: none; }
         QScrollArea#timeline, QWidget#timelineCanvas, QFrame#reply { background: $canvas; border: none; }
@@ -126,12 +129,18 @@ def apply_theme(app, name):
         QLabel#panelTitle { font-weight: 600; font-size: 13px; }
         QLabel#caption, QLabel#context, QLabel#counter { color: $muted; font-size: 12px; }
         QLabel#section { color: $muted; font-size: 11px; font-weight: 600; }
+        QLabel#historySection { color: $muted; font-size: 13px; font-weight: 500; padding: 9px 6px 2px; }
+        QFrame#rail { background: $side; border: none; border-right: 1px solid $line; }
+        QFrame#railRule { background: $strong; border: none; }
 
         QPushButton, QToolButton { background: transparent; border: none; border-radius: 8px; padding: 6px 8px; }
         QPushButton:hover, QToolButton:hover { background: $hover; }
         QPushButton:pressed, QToolButton:pressed, QToolButton:checked { background: $selected; }
         QPushButton:focus, QToolButton:focus { outline: none; }
         QPushButton:disabled { color: $muted; }
+        QPushButton[iconOnly="true"] { padding: 0; }
+        QPushButton#railHome { background: $selected; border-radius: 8px; }
+        QPushButton#account { background: #276d96; border-radius: 13px; }
         QPushButton#nav { text-align: left; min-height: 22px; padding: 4px 8px; color: $ink; }
         QPushButton#nav:hover { color: $ink; }
         QPushButton#quiet { color: $muted; text-align: left; font-size: 12px; padding: 4px 8px; }
@@ -142,8 +151,6 @@ def apply_theme(app, name):
         QPushButton#stopWork:disabled { color: $muted; }
         QPushButton#speed { padding: 0; border-radius: 6px; }
         QPushButton#speed:focus { border: 1px solid $strong; }
-        QToolButton#daybreak { padding: 3px 7px; font-size: 12px; color: $secondary; }
-        QToolButton#daybreak:hover, QToolButton#daybreak:checked { color: $ink; }
         QPushButton#primary { background: $ink; color: $inverse; border-radius: 9px; padding: 7px 18px; font-weight: 600; }
         QPushButton#primary:hover { background: $secondary; }
         QPushButton#primary:disabled { background: $line; color: $muted; }
@@ -173,6 +180,9 @@ def apply_theme(app, name):
         QComboBox QAbstractItemView::item:hover, QComboBox QAbstractItemView::item:selected { background: $hover; }
         QComboBox#flat { border: none; color: $muted; padding: 4px 22px 4px 8px; }
         QComboBox#flat:hover { color: $ink; }
+        QComboBox#workspaceName { font-size: 17px; font-weight: 600; color: $ink; border: none; padding: 4px 16px 4px 4px; }
+        QComboBox#workspaceName::drop-down { width: 15px; }
+        QComboBox#permission { border: none; font-size: 12px; }
 
         QLineEdit { border: 1px solid $line; background: $field; border-radius: 9px; padding: 7px 10px; }
         QLineEdit:focus { border-color: $strong; }
@@ -220,6 +230,10 @@ def apply_theme(app, name):
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
         QScrollBar:horizontal { height: 0; }
+        QScrollArea#composerInputs, QWidget#inputStrip { background: transparent; border: none; }
+        QScrollArea#composerInputs QScrollBar:horizontal { height: 5px; background: transparent; }
+        QScrollArea#composerInputs QScrollBar::handle:horizontal { background: $muted; border-radius: 2px; min-width: 16px; }
+        QPushButton#removeInput { background: $field; border: 1px solid $strong; border-radius: 10px; padding: 0; }
         QToolTip { background: $ink; color: $inverse; padding: 5px 8px; border: none; border-radius: 6px; }
     """
     for token in sorted(colors, key=len, reverse=True):

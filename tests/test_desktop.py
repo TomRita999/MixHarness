@@ -51,15 +51,15 @@ class DesktopTests(unittest.TestCase):
                     picker = window.pickers["gemini"]
                     QTest.mouseClick(picker.control, left)
                     menu = picker.menu
-                    family = next(a for a in menu.actions() if a.menu())
-                    menu.setActiveAction(family)
-                    QTest.keyClick(menu, Qt.Key.Key_Right)
-                    child = family.menu()
-                    self.assertTrue(child.isVisible())
-                    QTest.keyClick(child, Qt.Key.Key_Escape)
-                    self.assertFalse(child.isVisible())
-                    self.assertTrue(menu.isVisible())
-                    QTest.keyClick(menu, Qt.Key.Key_Escape)
+                    self.assertFalse(any(a.menu() for a in menu.actions()))
+                    family = next(a for a in menu.actions() if a.text() == "Gemini 4 Neon")
+                    QTest.mouseClick(menu, left, pos=menu.actionGeometry(family).center())
+                    self.assertEqual(picker.model, "gemini-4-neon")
+                    QTest.mouseClick(picker.effort_control, left)
+                    levels = picker.menu
+                    high = next(a for a in levels.actions() if a.text() == "XHigh")
+                    QTest.mouseClick(levels, left, pos=levels.actionGeometry(high).center())
+                    self.assertEqual((picker.model, picker.effort), ("gemini-4-neon", "xhigh"))
                     picker.open_dialog()
                     click_label(picker.dialog, "查看套餐用量")
                     usage = picker.dialog.findChild(UsageDialog)
@@ -78,13 +78,15 @@ class DesktopTests(unittest.TestCase):
                     self.assertTrue(settings.isVisible())
                     click_label(settings, "取消")
                     self.assertFalse(settings.isVisible())
+                    await asyncio.sleep(.02)
                     self.assertTrue(window.speed_box.isVisible())
                     speed_end = window.speed_box.mapTo(window, QPoint(window.speed_box.width(), 0)).x()
-                    model_start = window.pickers["openai"].control.mapTo(window, QPoint()).x()
-                    self.assertLessEqual(speed_end, model_start)
+                    model_control = window.compact_models if window.compact_models.isVisible() else window.pickers["openai"].control
+                    self.assertTrue(model_control.isVisible())
+                    self.assertLessEqual(speed_end, model_control.mapTo(window, QPoint()).x())
                     self.assertFalse(window.speed_box.icon().isNull())
                     self.assertIn("Fast 已关闭", window.speed_box.accessibleName())
-                    self.assertTrue(window.daybreak_button.isHidden())
+                    self.assertFalse(window.daybreak_action.isVisible())
                     QTest.mouseClick(window.speed_box, left)
                     self.assertIsNone(self.app.activePopupWidget())
                     self.assertIsNotNone(window.backend_task)
@@ -96,6 +98,7 @@ class DesktopTests(unittest.TestCase):
                     speed_menu = self.app.activePopupWidget()
                     self.assertTrue(any("开启 Fast" in a.text() and a.isEnabled() for a in speed_menu.actions()))
                     QTest.keyClick(speed_menu, Qt.Key.Key_Escape)
+                    QTest.mouseClick(window.options_button, left)
                     QTest.mouseClick(window.mode_button, left)
                     menu = self.app.activePopupWidget()
                     plan = next(a for a in menu.actions() if a.text() == "计划模式")
@@ -202,6 +205,7 @@ class DesktopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=scratch) as folder:
             root = Path(folder)
             settings = QSettings(str(root / "desktop.ini"), QSettings.Format.IniFormat)
+            settings.setValue("sidebar_width", 200)
             with open_engine(root, root / "data") as engine:
                 window = Window(engine, settings)
                 window.show()
@@ -209,8 +213,9 @@ class DesktopTests(unittest.TestCase):
                     window.resize(1440, 900)
                     self.app.processEvents()
                     self.assertEqual(window.header.height(), 46)
-                    self.assertEqual(window.composer.width(), 768)
-                    self.assertEqual(window.sidebar.width(), 275)
+                    self.assertEqual(window.composer.width(), 736)
+                    self.assertEqual(window.sidebar.width(), 290)
+                    self.assertEqual(window.rail.width(), 52)
                     window.editor.setPlainText("能帮我解释同一会话的消息记录吗？")
                     QTest.mouseClick(window.recipient_button, Qt.MouseButton.LeftButton)
                     menu = self.app.activePopupWidget()
@@ -229,9 +234,15 @@ class DesktopTests(unittest.TestCase):
                     window.resize(700, 490)
                     window.select_recipient("")
                     self.app.processEvents()
-                    for control in (window.recipient_button, window.compact_models, window.send_button):
+                    for control in (window.recipient_button, window.permission_box, window.send_button):
                         self.assertTrue(control.isVisible())
                         self.assertTrue(window.composer.rect().contains(control.mapTo(window.composer, control.rect().center())))
+                    if window.compact_models.isVisible():
+                        self.assertTrue(window.compact_efforts.isVisible())
+                        window.compact_models.click()
+                        menu = self.app.activePopupWidget()
+                        self.assertEqual([a.text() for a in menu.actions()], ["Gemini", "GPT"])
+                        QTest.keyClick(menu, Qt.Key.Key_Escape)
                     self.assertEqual(window.backend_box.itemText(1), "本机客户端")
                     window.go_forward.click()
                     self.assertIsNone(window.sid)
@@ -259,7 +270,7 @@ class DesktopTests(unittest.TestCase):
                     if picker.provider == "gemini":
                         menu = self.app.activePopupWidget()
                         family = next(a for a in menu.actions() if a.text().startswith("Gemini 4 Neon"))
-                        self.assertIn("XHigh", [a.text() for a in family.menu().actions()])
+                        self.assertIsNone(family.menu())
                         search = next(a for a in menu.actions() if a.text() == "搜索全部模型…")
                         QTest.mouseClick(menu, Qt.MouseButton.LeftButton, pos=menu.actionGeometry(search).center())
                     model = MODELS[picker.provider][1]
@@ -342,6 +353,7 @@ class DesktopTests(unittest.TestCase):
                         self.assertIn("Gemini 未配置", window.connection_state.text())
                         self.assertTrue(window.timeline.rows[-1].user)
                         self.assertGreater(window.timeline.rows[-1].block.x(), 0)
+                        QTest.mouseClick(window.options_button, Qt.MouseButton.LeftButton)
                         QTest.mouseClick(window.backend_box, Qt.MouseButton.LeftButton)
                         self.assertTrue(window.backend_box.view().isVisible())
                         self.assertEqual([window.backend_box.itemText(i) for i in range(window.backend_box.count())],
@@ -352,10 +364,13 @@ class DesktopTests(unittest.TestCase):
                         QTest.keyClick(window.backend_box.view(), Qt.Key.Key_End)
                         QTest.keyClick(window.backend_box.view(), Qt.Key.Key_Return)
                         self.assertIn("正在读取", window.work_status.text())
+                        if not window.options_menu.isVisible():
+                            QTest.mouseClick(window.options_button, Qt.MouseButton.LeftButton)
                         QTest.mouseClick(window.backend_box, Qt.MouseButton.LeftButton)
                         QTest.keyClick(window.backend_box.view(), Qt.Key.Key_Home)
                         QTest.keyClick(window.backend_box.view(), Qt.Key.Key_Return)
                         self.assertEqual(window.backend_box.currentData(), "api")
+                        window.options_menu.close()
                         self.assertIn("等待 Gemini API Key", window.work_status.text())
                         self.assertEqual(window.state["session"]["revision"], 2)
                         self.assertTrue(window.stop_button.isVisible())
@@ -410,15 +425,17 @@ class DesktopTests(unittest.TestCase):
                     QTest.mouseClick(widget, Qt.MouseButton.LeftButton)
                     self.app.processEvents()
                 def row_for(sid):
-                    for i in range(window.history.topLevelItemCount()):
-                        group = window.history.topLevelItem(i)
-                        for j in range(group.childCount()):
-                            child = group.child(j)
-                            if child.data(0, Qt.ItemDataRole.UserRole) == sid:
-                                return child
-                    self.fail("侧栏中找不到会话")
+                    return window.history_rows[("chat", sid)]
                 def action(sid, title):
-                    row = window.history.itemWidget(row_for(sid), 1)
+                    item = row_for(sid)
+                    window.history.scrollToItem(item)
+                    self.app.processEvents()
+                    QTest.mouseMove(window.history.viewport(), QPoint(1, 1))
+                    QTest.mouseMove(window.history.viewport(), window.history.visualItemRect(item).center())
+                    self.app.processEvents()
+                    row = window.history.itemWidget(item, 1)
+                    self.assertTrue(row.findChild(QPushButton).isVisible(),
+                                    (window.history.hover_id, sid, window.history.visualItemRect(item), row.geometry()))
                     click(row.findChild(QPushButton))
                     menu = self.app.activePopupWidget()
                     self.assertIsInstance(menu, QMenu)

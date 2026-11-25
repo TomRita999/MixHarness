@@ -36,7 +36,9 @@ async def exercise(window, workspace):
     menu = QApplication.activePopupWidget()
     assert menu is picker.menu and menu is not None
     assert menu.actions()[0].text().startswith("Daybreak 模式") == bool(blue), "已打开的菜单没有更新账户授权"
-    assert any(a.text().partition("    ")[0] == catalog.groups[0]["name"] for a in menu.actions())
+    assert not any(a.menu() for a in menu.actions())
+    listed = {a.text() for a in menu.actions()}
+    assert all((g["name"] in listed) == model_available(g, False) for g in catalog.groups)
     QTest.keyClick(menu, Qt.Key.Key_Escape)
     fast = next((g for g in catalog.groups if model_available(g, False) and "fast" in available_speeds(g)), None)
     if fast:
@@ -66,7 +68,7 @@ async def exercise(window, workspace):
         window.new_session()
         print("已验证草稿、已保存会话和从 API 切换到本机客户端的单击 Fast 操作。", flush=True)
     if not blue:
-        assert window.daybreak_button.isHidden()
+        assert not window.daybreak_action.isVisible()
         picker.control.click()
         assert all("Daybreak 模式" not in a.text() for a in picker.menu.actions())
         QTest.keyClick(picker.menu, Qt.Key.Key_Escape)
@@ -82,11 +84,11 @@ async def exercise(window, workspace):
     assert switch.text().startswith("Daybreak 模式") and not switch.isChecked()
     QTest.mouseClick(menu, left, pos=menu.actionGeometry(switch).center())
     await asyncio.sleep(0.05)
-    assert window.daybreak_button.isChecked() and picker.model in {g["id"] for g in blue}
+    assert window.daybreak_action.isChecked() and picker.model in {g["id"] for g in blue}
     menu = picker.menu
     assert menu is QApplication.activePopupWidget() and menu.actions()[0].isChecked()
     for group in catalog.groups:
-        action = next(a for a in menu.actions() if a.text().partition("    ")[0] == group["name"])
+        action = next(a for a in menu.actions() if a.text() == group["name"])
         assert action.isEnabled() == (group in blue), group["id"]
     QTest.keyClick(menu, Qt.Key.Key_Escape)
     print("模型菜单", picker.model, "可选", len(blue), "灰显", len(catalog.groups) - len(blue), flush=True)
@@ -95,17 +97,19 @@ async def exercise(window, workspace):
                                     backend="clients", daybreak=True)
     sid = session["id"]
     window.select_session(sid)
-    assert window.daybreak_button.isChecked()
-    QTest.mouseClick(window.daybreak_button, left)
+    assert window.daybreak_action.isChecked()
+    QTest.mouseClick(picker.control, left)
+    menu = picker.menu
+    QTest.mouseClick(menu, left, pos=menu.actionGeometry(menu.actions()[0]).center())
+    await asyncio.sleep(.05)
     assert not engine.store.session(sid)["daybreak"]
-    picker.control.click()
     menu = picker.menu
     switch = menu.actions()[0]
     assert not switch.isChecked()
     menu.setActiveAction(switch)
     QTest.keyClick(menu, Qt.Key.Key_Return)
     await asyncio.sleep(0.05)
-    assert engine.store.session(sid)["daybreak"] and window.daybreak_button.isChecked()
+    assert engine.store.session(sid)["daybreak"] and window.daybreak_action.isChecked()
     QTest.keyClick(picker.menu, Qt.Key.Key_Escape)
     result = await execute_command(engine, {"id": sid, "line": "/model openai"})
     if standard:
@@ -137,13 +141,13 @@ async def exercise(window, workspace):
     picker.control.click()
     await execute_command(engine, {"id": sid, "line": "/daybreak off"})
     window.refresh(force=True)
-    assert not window.daybreak_button.isChecked()
+    assert not window.daybreak_action.isChecked()
     assert picker.menu is QApplication.activePopupWidget() and not picker.menu.actions()[0].isChecked()
     QTest.keyClick(picker.menu, Qt.Key.Key_Escape)
     if only_blue:
         assert window.pickers["openai"].model != only_blue["id"]
     window.backend_box.setCurrentIndex(window.backend_box.findData("api"))
-    assert window.daybreak_button.isHidden()
+    assert not window.daybreak_action.isVisible()
     window.close()
     await asyncio.sleep(0)
 

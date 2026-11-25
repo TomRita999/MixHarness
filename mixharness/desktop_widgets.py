@@ -10,9 +10,9 @@ from dotenv import set_key
 from PySide6.QtCore import QBuffer, QEasingCurve, QIODevice, QPoint, QPointF, QPropertyAnimation, QRectF, QSaveFile, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QFontMetrics, QIcon, QImage, QPainter, QPainterPath, QPalette, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QTextEdit, QToolButton, QToolTip,
-    QTreeWidget, QVBoxLayout, QWidget,
+    QTreeWidget, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from .desktop_style import Glyph
@@ -20,7 +20,7 @@ from .desktop_markdown import link_plain_text, render_markdown
 from .markdown_links import HASH_LINE
 from .attachments import TYPES
 from .store import LABELS, PROVIDERS
-from .reasoning import LEVEL_NAMES, api_group, group_for, model_available
+from .reasoning import LEVEL_NAMES, api_group, group_for, model_available, resolve_choice
 
 
 ALIGN = Qt.AlignmentFlag
@@ -53,6 +53,7 @@ def button(text, callback, glyph=None, name="", icon_only=False):
         result.setIcon(icon(glyph, name == "send"))
         result.setIconSize(QSize(17, 17))
     if icon_only:
+        result.setProperty("iconOnly", True)
         result.setToolTip(text)
         result.setFixedSize(30, 30)
     result.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -175,6 +176,12 @@ class HistoryTree(QTreeWidget):
         self.hover_id = item.data(0, Qt.ItemDataRole.UserRole)
         self.update_actions()
 
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        item = self.itemAt(event.position().toPoint())
+        self.hover_id = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        self.update_actions()
+
     def leaveEvent(self, event):
         super().leaveEvent(event)
         self.hover_id = None
@@ -182,10 +189,11 @@ class HistoryTree(QTreeWidget):
 
     def update_actions(self):
         current = self.currentItem()
-        selected = current.data(0, Qt.ItemDataRole.UserRole) if current else None
+        selected = current.data(0, Qt.ItemDataRole.UserRole) if current and self.hasFocus() else None
         for identifier, (stamp, action) in self.actions_by_id.items():
             visible = identifier in (self.hover_id, selected)
-            stamp.setVisible(not visible)
+            if stamp:
+                stamp.setVisible(not visible)
             action.setVisible(visible)
 
     def drawRow(self, painter, option, index):
@@ -244,6 +252,8 @@ class FitCombo(QComboBox):
             painter.setBrush(palette.color(palette.ColorRole.Midlight))
             painter.drawRoundedRect(self.rect().adjusted(0, 1, 0, -1), 7, 7)
         color = palette.color(palette.ColorRole.Text if hover else palette.ColorRole.PlaceholderText)
+        if self.objectName() == "permission" and self.currentData() == "full":
+            color = QColor("#e58232" if palette.window().color().lightness() < 128 else "#a64912")
         painter.setPen(color)
         painter.setFont(self.font())
         rect = self.rect().adjusted(8, 0, -8, 0)
@@ -256,6 +266,31 @@ class FitCombo(QComboBox):
         painter.setPen(pen)
         painter.drawPolyline([QPointF(x, y - 1.5), QPointF(x + 3.5, y + 2), QPointF(x + 7, y - 1.5)])
         painter.end()
+
+
+class MenuSwitch(QCheckBox):
+    def sizeHint(self):
+        return QSize(self.fontMetrics().horizontalAdvance(self.text()) + 82, 34)
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        palette = self.palette()
+        painter.setPen(Qt.PenStyle.NoPen)
+        if self.underMouse() or self.hasFocus():
+            painter.setBrush(palette.midlight())
+            painter.drawRoundedRect(self.rect(), 7, 7)
+        painter.setPen(palette.text().color())
+        painter.drawText(self.rect().adjusted(12, 0, -44, 0), ALIGN.AlignLeft | ALIGN.AlignVCenter, self.text())
+        track = QRectF(self.width() - 38, (self.height() - 16) / 2, 28, 16)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(palette.text() if self.isChecked() else palette.dark())
+        painter.drawRoundedRect(track, 8, 8)
+        painter.setBrush(palette.base())
+        painter.drawEllipse(track.adjusted(14 if self.isChecked() else 2, 2, -2 if self.isChecked() else -14, -2))
 
 
 class ModelPicker(QWidget):
@@ -307,10 +342,10 @@ class ModelPicker(QWidget):
         self.caption.setText(self.title)
         self.control.setAccessibleName(self.title + " 模型")
         group = group_for(catalog["groups"], model)
-        self.control.setText((group["name"] if group else model or "选择模型") + " ▾")
+        self.control.setText(group["name"] if group else model or "选择模型")
         self.control.setToolTip(self.title + " · " + (model or "选择模型"))
         level = self.selected_level(group)
-        self.effort_control.setText((LEVEL_NAMES.get(level, level) or "默认") + " ▾")
+        self.effort_control.setText(LEVEL_NAMES.get(level, level) or "默认")
         self.effort_control.setAccessibleName(self.title + " 思考强度")
         self.effort_control.setToolTip("调整 " + self.title + " 的思考强度")
         self.effort_control.setVisible(bool(group and any(group["choices"])))
@@ -370,9 +405,10 @@ class ModelPicker(QWidget):
         menu = self.menu
         if menu and menu.objectName() == "modelList" and QApplication.activePopupWidget() is menu:
             menu.close()
-            self.open_models()
+            self.open_models(anchor=self.model_anchor)
 
     def open_models(self, checked=False, *, anchor=None):
+        self.model_anchor = anchor or self.control
         client = self.catalog["source"] == "client"
         if not client and self.provider == "openai":
             self.open_dialog()
@@ -381,14 +417,24 @@ class ModelPicker(QWidget):
         menu.setObjectName("modelList")
         daybreak = self.daybreak_action
         if client and daybreak and daybreak.isVisible():
-            switch = menu.addAction(daybreak.icon(), daybreak.text())
+            switch = QWidgetAction(menu)
+            switch.setText(daybreak.text())
             switch.setCheckable(True)
             switch.setChecked(daybreak.isChecked())
             switch.setEnabled(daybreak.isEnabled())
+            control = MenuSwitch("Daybreak 模式")
+            control.setAccessibleName("Daybreak 模式")
+            control.setToolTip(daybreak.toolTip())
+            control.setChecked(daybreak.isChecked())
+            control.setCursor(Qt.CursorShape.PointingHandCursor)
+            control.clicked.connect(switch.trigger)
+            switch.setDefaultWidget(control)
+            menu.addAction(switch)
 
             def toggle_daybreak():
+                menu.close()
                 daybreak.trigger()
-                QTimer.singleShot(0, self.control, self.open_models)
+                QTimer.singleShot(0, self.control, lambda: self.open_models(anchor=self.model_anchor))
 
             switch.triggered.connect(toggle_daybreak)
             menu.addSeparator()
@@ -397,21 +443,12 @@ class ModelPicker(QWidget):
             levels = group["choices"]
             if not client and not levels and group is not selected:
                 continue
-            level = self.selected_level(group) if group is selected else group["default"]
-            text = group["name"]
-            if level:
-                text += "    " + LEVEL_NAMES.get(level, level)
-            if not self.accepts(group):
-                action = menu.addAction(text)
-                action.setEnabled(False)
-            elif len(levels) > 1:
-                sub = Submenu(text, menu)
-                self.level_actions(sub, group)
-                action = sub.menuAction()
-            else:
-                model = next(iter(levels.values()), group["id"])
-                action = menu.addAction(text)
-                action.triggered.connect(lambda _, m=model, e=level: self.changed.emit(self.provider, m, e))
+            if client and daybreak and not daybreak.isChecked() and not model_available(group, False):
+                continue
+            action = menu.addAction(group["name"])
+            action.setEnabled(self.accepts(group))
+            value = self.model if group is selected else group["id"]
+            action.triggered.connect(lambda _, m=value: self.choose_model(m))
             action.setCheckable(True)
             action.setChecked(group is selected)
         if client and not self.catalog["groups"]:
@@ -504,11 +541,17 @@ class ModelPicker(QWidget):
             self.options.setCurrentRow(0)
         self.apply.setEnabled(bool(self.options.currentItem()))
 
+    def choose_model(self, model):
+        group = group_for(self.catalog["groups"], model) or api_group(self.provider, model)
+        effort = self.effort if self.effort in group["choices"] else ""
+        model, effort = resolve_choice(group, model, effort)
+        self.changed.emit(self.provider, model, effort)
+
     def choose(self):
         item = self.options.currentItem()
         if item and item.flags() & Qt.ItemFlag.ItemIsEnabled:
             model = item.data(Qt.ItemDataRole.UserRole)
-            self.changed.emit(self.provider, model, self.effort if model == self.model else "")
+            self.choose_model(model)
             self.dialog.accept()
 
     def custom(self):
@@ -525,7 +568,7 @@ class ModelPicker(QWidget):
             if not re.fullmatch(r"[a-zA-Z0-9._:/-]{1,150}", value):
                 QMessageBox.warning(self, "模型 ID 无效", "模型 ID 格式无效。")
                 return
-            self.changed.emit(self.provider, value, self.effort if value == self.model else "")
+            self.choose_model(value)
             if self.dialog:
                 self.dialog.accept()
 
@@ -674,6 +717,14 @@ class MessageRow(QWidget):
         if event.get("trace"):
             self.trace = trace = QFrame()
             trace.setObjectName("trace")
+            if self.result_toggle is None and event["kind"] in ("requirements", "message"):
+                requirements = event["kind"] == "requirements"
+                control = disclosure(self.author_label.text() if requirements else "交接记录")
+                if requirements:
+                    self.author_label.hide()
+                control.toggled.connect(trace.setVisible)
+                box.addWidget(control, 0, ALIGN.AlignLeft)
+                trace.hide()
             details = QVBoxLayout(trace)
             details.setSpacing(3)
             details.setContentsMargins(12, 8, 12, 9)
@@ -958,8 +1009,8 @@ class Timeline(QScrollArea):
 
 
 class MessageNav(QWidget):
-    """会话右侧的快速定位条：每个圆点对应一条你发送的消息，点击即可跳转。"""
-    STEP = 14
+    """聊天左侧的短线对应各条用户消息。"""
+    STEP = 10
 
     def __init__(self, timeline, parent):
         super().__init__(parent)
@@ -973,7 +1024,6 @@ class MessageNav(QWidget):
 
     def refresh(self):
         count = len(self.timeline.user_rows())
-        self.setFixedHeight(count * self.STEP + 10)
         self.setVisible(count >= 2 and self.timeline.isVisible())
         self.reposition()
         self.update()
@@ -981,16 +1031,19 @@ class MessageNav(QWidget):
     def reposition(self):
         host = self.parentWidget()
         if host:
-            right = self.timeline.mapTo(host, QPoint(self.timeline.width(), 0)).x()
-            gutter = max(0, host.width() - right)
-            self.setFixedWidth(min(22, max(12, gutter)))
-            inset = min(8, max(0, gutter - self.width()))
-            self.move(host.width() - self.width() - inset, max(48, (host.height() - self.height()) // 2))
+            gutter = self.timeline.mapTo(host, QPoint()).x()
+            self.setFixedWidth(16)
+            height = min(len(self.timeline.user_rows()) * self.STEP + 10, max(12, host.height() - 104))
+            self.setFixedHeight(height)
+            self.move(max(0, min(12, gutter - 16)), (host.height() - height) // 2)
             self.raise_()
 
     def index_at(self, y):
-        index = int((y - 5) // self.STEP)
+        index = int((y - 5) // self.step())
         return index if 0 <= index < len(self.timeline.user_rows()) else -1
+
+    def step(self):
+        return (self.height() - 10) / max(1, len(self.timeline.user_rows()))
 
     def paintEvent(self, event):
         rows = self.timeline.user_rows()
@@ -1000,13 +1053,14 @@ class MessageNav(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
+        step = self.step()
         for i in range(len(rows)):
             color = QColor(ink if i in (current, self.hovered) else muted)
             if i not in (current, self.hovered):
                 color.setAlphaF(0.55)
-            radius = 3.6 if i == current else (3.2 if i == self.hovered else 2.6)
+            width = 10 if i in (current, self.hovered) else 6
             painter.setBrush(color)
-            painter.drawEllipse(QPointF(self.width() / 2, 5 + self.STEP * i + self.STEP / 2), radius, radius)
+            painter.drawRoundedRect(QRectF(4, 4 + (i + .5) * step, width, min(2, step)), 1, 1)
         painter.end()
 
     def mouseMoveEvent(self, event):

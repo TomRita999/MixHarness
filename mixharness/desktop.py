@@ -1,17 +1,17 @@
 import asyncio
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPoint, QProcess, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPalette
+from PySide6.QtGui import QAction, QColor, QCursor, QDesktopServices, QIcon, QKeySequence, QPalette
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QHeaderView, QInputDialog,
-    QLineEdit, QListWidget, QListWidgetItem, QProgressBar,
-    QMainWindow, QMenu, QMessageBox, QSizePolicy, QSplitter, QTabWidget, QToolButton, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QBoxLayout, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QHeaderView, QInputDialog,
+    QFormLayout, QLineEdit, QListWidget, QListWidgetItem, QProgressBar,
+    QMainWindow, QMenu, QMessageBox, QSizePolicy, QSplitter, QTabWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from .desktop_projects import ArchiveDialog, ProjectDialog
+from .desktop_chrome import TitleBar, hide_macos_title
 from .desktop_agent import AgentDialog, ApprovalDialog
 from .desktop_slash import SlashMenu
 from .desktop_chat_actions import McpDialog, ShareDialog, SideChat, save_transcript
@@ -79,14 +79,16 @@ class Window(QMainWindow):
         self.make_chat()
         self.make_inspector()
         self.splitter.setStretchFactor(1, 1)
-        side_width = int(settings.value("sidebar_width", 275))
+        # 旧版保存的是单列侧栏宽度，新版还需要容纳左侧图标栏。
+        old_width = int(settings.value("sidebar_width", 290))
+        side_width = int(settings.value("navigation_width", max(290, old_width)))
         self.splitter.setSizes([side_width, self.width() - side_width - 1, int(settings.value("inspector_width", 280))])
         self.make_menus()
         system_dark = QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
         self.set_theme(str(settings.value("theme", "dark" if system_dark else "light")))
-        geometry = settings.value("geometry")
-        if geometry:
-            self.restoreGeometry(geometry)
+        self.saved_geometry = settings.value("geometry")
+        if self.saved_geometry:
+            self.restoreGeometry(self.saved_geometry)
         sessions = self.session_list()
         previous = settings.value("session")
         if any(s["id"] == previous for s in sessions):
@@ -109,26 +111,77 @@ class Window(QMainWindow):
     def make_sidebar(self):
         self.sidebar = QFrame()
         self.sidebar.setObjectName("sidebar")
-        self.sidebar.setMinimumWidth(200)
+        self.sidebar.setMinimumWidth(258)
         self.sidebar.setMaximumWidth(520)
-        col = QVBoxLayout(self.sidebar)
-        col.setContentsMargins(8, 0, 8, 8)
-        col.setSpacing(2)
+        sidebar_layout = QVBoxLayout(self.sidebar)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(0)
         brand = QHBoxLayout()
-        brand.setContentsMargins(70 if self.unified_titlebar else 4, 0, 4, 0)
-        brand.setSpacing(2)
+        brand.setContentsMargins(89 if self.unified_titlebar else 10, 0, 7, 0)
+        brand.setSpacing(4)
         brand.addWidget(button("收起侧栏", self.toggle_sidebar, "sidebar", icon_only=True))
-        self.go_back = button("后退", lambda: self.navigate(-1), "back", icon_only=True)
-        self.go_forward = button("前进", lambda: self.navigate(1), "forward", icon_only=True)
+        brand.addStretch()
+        self.go_back = button("后退", lambda: self.navigate(-1), "chevron-left", icon_only=True)
+        self.go_forward = button("前进", lambda: self.navigate(1), "chevron-right", icon_only=True)
         brand.addWidget(self.go_back)
         brand.addWidget(self.go_forward)
-        brand.addStretch()
-        titlebar = QWidget()
-        titlebar.setFixedHeight(46)
+        titlebar = TitleBar()
         titlebar.setLayout(brand)
-        col.addWidget(titlebar)
-        col.addWidget(button("新建聊天", self.new_session, "new", "nav"))
-        col.addWidget(button("搜索聊天", self.search, "search", "nav"))
+        sidebar_layout.addWidget(titlebar)
+        panes = QHBoxLayout()
+        panes.setContentsMargins(0, 4, 0, 0)
+        panes.setSpacing(0)
+        sidebar_layout.addLayout(panes, 1)
+        self.rail = QFrame()
+        self.rail.setObjectName("rail")
+        self.rail.setFixedWidth(52)
+        rail = QVBoxLayout(self.rail)
+        rail.setContentsMargins(6, 1, 6, 9)
+        rail.setSpacing(8)
+        def rail_button(title, glyph, callback, name="railAction"):
+            control = button(title, callback, glyph, name, True)
+            control.setFixedSize(36, 36)
+            control.setIconSize(QSize(18, 18))
+            rail.addWidget(control, 0, ALIGN.AlignHCenter)
+            return control
+        rail_button("工作台", "home", lambda: self.sources_box.setCurrentIndex(0), "railHome")
+        rail_button("打开项目", "files", self.choose_project)
+        rail_button("任务与成果", "clipboard", self.toggle_inspector)
+        rail_button("已归档的会话", "history", self.show_archive)
+        rail_button("更多操作", "more", self.rail_menu)
+        divider = QFrame()
+        divider.setObjectName("railRule")
+        divider.setFixedSize(24, 1)
+        rail.addWidget(divider, 0, ALIGN.AlignHCenter)
+        self.create_project_button = rail_button("新建项目", "fork", self.project_dialog)
+        rail_button("技能与上下文", "grid", self.agent_settings)
+        rail.addStretch(1)
+        self.theme_button = rail_button("切换主题", "moon", self.toggle_theme)
+        rail_button("连接设置", "account", self.connections, "account")
+        panes.addWidget(self.rail)
+        col = QVBoxLayout()
+        col.setContentsMargins(8, 1, 8, 8)
+        col.setSpacing(1)
+        panes.addLayout(col, 1)
+        source_row = QHBoxLayout()
+        source_row.setContentsMargins(3, 1, 0, 8)
+        source_row.setSpacing(2)
+        self.sources_box = QComboBox()
+        self.sources_box.setObjectName("workspaceName")
+        self.sources_box.setAccessibleName("会话来源")
+        self.sources_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        for title, value in (("MixHarness", "mixharness"), ("全部来源", "all"),
+                             ("Codex", "codex"), ("Antigravity", "antigravity")):
+            self.sources_box.addItem(title, value)
+        self.sources_box.setToolTip("选择会话来源")
+        source_row.addWidget(self.sources_box)
+        source_row.addStretch()
+        self.filter_button = button("筛选项目与会话", self.history_filter_menu, "filter", icon_only=True)
+        source_row.addWidget(self.filter_button)
+        source_row.addWidget(button("搜索聊天", self.search, "search", icon_only=True))
+        col.addLayout(source_row)
+        col.addWidget(button("新聊天", self.new_session, "new", "nav"))
+        col.addWidget(button("Gemini", lambda: self.select_recipient("gemini"), "gemini", "nav"))
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("搜索项目或会话")
         self.filter.setClearButtonEnabled(True)
@@ -139,23 +192,8 @@ class Window(QMainWindow):
         self.filter.textChanged.connect(self.search_changed)
         col.addWidget(self.filter)
         self.filter.hide()
-        col.addSpacing(16)
-        project_actions = QHBoxLayout()
-        caption = label("项目", "section")
-        caption.setIndent(8)
-        project_actions.addWidget(caption, 1)
-        self.create_project_button = button("新建项目", self.project_dialog, "plus", "rowAction", icon_only=True)
-        self.create_project_button.setFixedSize(26, 26)
-        self.sources_box = QComboBox()
-        self.sources_box.setObjectName("flat")
-        self.sources_box.setAccessibleName("会话来源")
-        for title, value in (("MixHarness", "mixharness"), ("全部来源", "all"),
-                             ("Codex", "codex"), ("Antigravity", "antigravity")):
-            self.sources_box.addItem(title, value)
-        self.sources_box.setToolTip("选择会话来源")
-        project_actions.addWidget(self.sources_box)
-        project_actions.addWidget(self.create_project_button)
-        col.addLayout(project_actions)
+        col.addSpacing(14)
+        self.history_filter = "all"
         self.history = HistoryTree()
         self.history.setAccessibleName("项目与会话")
         self.history.setColumnCount(2)
@@ -164,10 +202,10 @@ class Window(QMainWindow):
         self.history.header().setStretchLastSection(False)
         self.history.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.history.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.history.setColumnWidth(1, 48)
+        self.history.setColumnWidth(1, 24)
         self.history.setHeaderHidden(True)
-        self.history.setIndentation(15)
-        self.history.setExpandsOnDoubleClick(False)
+        self.history.setIndentation(13)
+        self.history.setRootIsDecorated(False)
         self.history.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.history.customContextMenuRequested.connect(self.history_menu)
         self.history.itemCollapsed.connect(lambda item: self.remember_expanded(item, False))
@@ -181,13 +219,31 @@ class Window(QMainWindow):
         self.sources_box.currentIndexChanged.connect(self.select_source)
         self.connection_state = button("", self.connections, name="quiet")
         col.addWidget(self.connection_state)
-        col.addWidget(button("归档", self.show_archive, "archive", "nav"))
-        foot = QHBoxLayout()
-        foot.addWidget(button("设置", self.connections, "settings", "nav"), 1)
-        self.theme_button = button("切换主题", self.toggle_theme, "moon", icon_only=True)
-        foot.addWidget(self.theme_button)
-        col.addLayout(foot)
         self.splitter.addWidget(self.sidebar)
+
+    def rail_menu(self):
+        menu = QMenu(self)
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        menu.addAction(menu_icon("usage"), "查看套餐用量", lambda: self.show_usage("openai"))
+        menu.addAction(menu_icon("archive"), "归档管理", self.show_archive)
+        menu.addAction(menu_icon("settings"), "连接设置", self.connections)
+        control = self.sender()
+        menu.popup(control.mapToGlobal(control.rect().topRight()))
+
+    def history_filter_menu(self):
+        menu = QMenu(self)
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        for key, title in (("all", "全部"), ("pinned", "仅置顶"), ("working", "任务进行中")):
+            action = menu.addAction(title)
+            action.setCheckable(True)
+            action.setChecked(self.history_filter == key)
+            action.triggered.connect(lambda _, value=key: self.set_history_filter(value))
+        menu.popup(self.filter_button.mapToGlobal(self.filter_button.rect().bottomLeft()))
+
+    def set_history_filter(self, value):
+        self.history_filter = value
+        self.sources_box.setCurrentIndex(0)
+        self.fill_history()
 
     def make_chat(self):
         main = QWidget()
@@ -196,32 +252,34 @@ class Window(QMainWindow):
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
         header = QHBoxLayout()
-        header.setContentsMargins(12, 0, 12, 0)
-        header.setSpacing(6)
+        header.setContentsMargins(8, 0, 8, 0)
+        header.setSpacing(4)
         self.expand_side = button("展开侧栏", self.toggle_sidebar, "sidebar", icon_only=True)
         self.expand_side.hide()
         header.addWidget(self.expand_side)
-        self.project_name = button("选择项目", self.project_picker, "folder", "quiet")
-        self.project_name.setMaximumWidth(200)
+        self.project_name = button("选择项目", self.project_picker, "folder", icon_only=True)
         self.title = label("新会话", "title")
+        self.title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.title.installEventFilter(self)
         self.title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         header.addWidget(self.project_name)
-        header.addWidget(label("/", "context"))
         header.addWidget(self.title, 1)
         self.chat_more = button("会话操作", self.current_chat_menu, "more", icon_only=True)
         header.addWidget(self.chat_more)
+        self.share_button = button("分享聊天", lambda: ShareDialog(self, self.sid).open(), "share", icon_only=True)
+        header.addWidget(self.share_button)
+        self.options_button = button("会话设置", self.show_options, "sliders", icon_only=True)
+        header.addWidget(self.options_button)
         self.inspect_button = button("任务与成果", self.toggle_inspector, "inspector", icon_only=True)
         header.addWidget(self.inspect_button)
-        self.header = QWidget()
-        self.header.setFixedHeight(46)
+        self.header = TitleBar()
         self.header.setLayout(header)
         body.addWidget(self.header)
         shell = QHBoxLayout()
-        shell.setContentsMargins(16, 0, 16, 12)
+        shell.setContentsMargins(20, 0, 20, 16)
         shell.setSpacing(0)
         view = QWidget()
-        view.setMaximumWidth(768)
+        view.setMaximumWidth(736)
         view.setMinimumWidth(0)
         view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.chat_layout = QVBoxLayout(view)
@@ -270,8 +328,8 @@ class Window(QMainWindow):
         self.composer_shadow.setOffset(0, 2)
         self.composer.setGraphicsEffect(self.composer_shadow)
         controls = QVBoxLayout(self.composer)
-        controls.setContentsMargins(12, 10, 10, 8)
-        controls.setSpacing(4)
+        controls.setContentsMargins(12, 12, 9, 8)
+        controls.setSpacing(6)
         self.editor = Editor()
         self.editor.submitted.connect(self.send)
         self.editor.interrupted.connect(self.stop_work)
@@ -283,18 +341,32 @@ class Window(QMainWindow):
         self.editor.image_bytes.connect(self.inputs.paste_image)
         controls.addWidget(self.inputs)
         controls.addWidget(self.editor)
-        tools = QHBoxLayout()
-        tools.setSpacing(2)
+        self.actions_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.actions_layout.setSpacing(2)
+        left = QHBoxLayout()
+        left.setSpacing(2)
         self.add_input = button("添加附件或引用", self.inputs.menu, "plus", "round", icon_only=True)
         self.add_input.setFixedSize(28, 28)
-        tools.addWidget(self.add_input)
+        left.addWidget(self.add_input)
+        self.permission_box = FitCombo()
+        self.permission_box.setObjectName("permission")
+        self.permission_box.setAccessibleName("操作权限")
+        self.permission_box.setToolTip("操作权限")
+        for mode, title in PERMISSIONS.items():
+            self.permission_box.addItem(title, mode)
+        self.permission_box.currentIndexChanged.connect(self.change_permission)
+        left.addWidget(self.permission_box)
         self.recipient_button = button("双模型协作", self.recipient_menu, name="recipient")
-        tools.addWidget(self.recipient_button)
+        left.addWidget(self.recipient_button)
+        left.addStretch()
+        self.actions_layout.addLayout(left)
+        tools = QHBoxLayout()
+        tools.setSpacing(2)
         tools.addStretch()
+        self.actions_layout.addLayout(tools)
         self.daybreak_action = QAction(self)
         self.daybreak_action.setCheckable(True)
         self.daybreak_action.triggered.connect(self.change_daybreak)
-        self.daybreak_icons = (icon("toggle-left"), icon("toggle-right", role=QPalette.ColorRole.Link))
         self.speed_icons = (icon("zap", role=QPalette.ColorRole.PlaceholderText), icon("zap", role=QPalette.ColorRole.Link))
         self.speed_box = button("GPT Fast 速度", self.toggle_fast, name="speed", icon_only=True)
         self.speed_box.setCheckable(True)
@@ -304,16 +376,18 @@ class Window(QMainWindow):
         for provider, title in (("gemini", "Gemini"), ("openai", "OpenAI")):
             pick = ModelPicker(provider, title, self.daybreak_action if provider == "openai" else None)
             if provider == "openai":
-                pick.layout().insertWidget(0, self.speed_box)
-            pick.setMaximumWidth(260)
+                tools.addWidget(self.speed_box)
             pick.changed.connect(self.choose_model)
             pick.refresh_requested.connect(self.refresh_catalog)
             pick.usage_requested.connect(self.show_usage)
             self.pickers[provider] = pick
             tools.addWidget(pick)
         self.compact_models = button("模型", self.compact_model_menu, name="recipient")
-        self.compact_models.setAccessibleName("选择模型和思考强度")
+        self.compact_models.setAccessibleName("选择模型")
         tools.addWidget(self.compact_models)
+        self.compact_efforts = button("强度", lambda: self.compact_model_menu(effort=True), name="recipient")
+        self.compact_efforts.setAccessibleName("调整思考强度")
+        tools.addWidget(self.compact_efforts)
         self.backend_box = FitCombo()
         self.backend_box.setObjectName("flat")
         self.backend_box.setAccessibleName("会话执行方式")
@@ -333,31 +407,21 @@ class Window(QMainWindow):
         self.send_button.setFixedSize(28, 28)
         self.send_button.setEnabled(False)
         tools.addWidget(self.send_button)
-        controls.addLayout(tools)
+        controls.addLayout(self.actions_layout)
         col.addWidget(self.composer)
-        foot = QHBoxLayout()
-        foot.setContentsMargins(6, 0, 0, 0)
-        foot.setSpacing(2)
+        self.options_menu = QMenu(self)
+        self.options_menu.setAccessibleName("会话设置")
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setContentsMargins(12, 10, 12, 10)
+        form.setSpacing(8)
         self.mode_button = button("会话模式", self.mode_menu, name="quiet")
-        foot.addWidget(self.mode_button)
-        self.permission_box = FitCombo()
-        self.permission_box.setObjectName("flat")
-        self.permission_box.setAccessibleName("操作权限")
-        self.permission_box.setToolTip("对应 Antigravity 的 Default / Auto / Turbo")
-        for mode, title in PERMISSIONS.items():
-            self.permission_box.addItem(title, mode)
-        self.permission_box.currentIndexChanged.connect(self.change_permission)
-        foot.addWidget(self.permission_box)
-        self.daybreak_button = QToolButton()
-        self.daybreak_button.setObjectName("daybreak")
-        self.daybreak_button.setDefaultAction(self.daybreak_action)
-        self.daybreak_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.daybreak_button.setIconSize(QSize(20, 20))
-        self.daybreak_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        foot.addWidget(self.daybreak_button)
-        foot.addStretch()
-        foot.addWidget(self.backend_box)
-        col.addLayout(foot)
+        self.mode_caption = label("会话模式", "caption")
+        form.addRow(self.mode_caption, self.mode_button)
+        form.addRow(label("执行方式", "caption"), self.backend_box)
+        panel_action = QWidgetAction(self.options_menu)
+        panel_action.setDefaultWidget(panel)
+        self.options_menu.addAction(panel_action)
         col.addStretch(1)
         shell.addWidget(view)
         body.addLayout(shell, 1)
@@ -368,6 +432,14 @@ class Window(QMainWindow):
         main.installEventFilter(self)
         self.composer.installEventFilter(self)
         self.splitter.addWidget(main)
+
+    def show_options(self):
+        anchor = self.options_button
+        self.options_menu.popup(anchor.mapToGlobal(anchor.rect().bottomRight()) - QPoint(self.options_menu.sizeHint().width(), 0))
+
+    def show_backend(self):
+        self.show_options()
+        QTimer.singleShot(0, self.backend_box, self.backend_box.showPopup)
 
     def make_inspector(self):
         self.inspector = QFrame()
@@ -432,19 +504,15 @@ class Window(QMainWindow):
         return self.engine.store.sessions(query=query)
 
     def remember_expanded(self, item, expanded):
-        if item.parent() is None and not self.filter.text().strip():
+        if item.data(0, USER_ROLE + 1) == "project" and not self.filter.text().strip():
             self.settings.setValue("collapsed/" + (item.data(0, USER_ROLE) or "local"), not expanded)
             self.select_history_row()
 
     def fill_history(self):
         query = self.filter.text().strip()
         groups = self.engine.store.projects()
-        groups.append({"id": None, "name": "独立会话", "folders": [], "pinned": False})
-        by_project = {}
         chats = self.session_list(query)
-        for chat in chats:
-            by_project.setdefault(chat["project_id"], []).append(chat)
-        signature = (query, groups, [(s["id"], s["title"], s["project_id"], s["pinned"], s["working"], s["updated"]) for s in chats])
+        signature = (query, self.history_filter, groups, [(s["id"], s["title"], s["project_id"], s["pinned"], s["working"], s["updated"]) for s in chats])
         if signature == self.history_key:
             self.select_history_row()
             return
@@ -455,28 +523,68 @@ class Window(QMainWindow):
             self.history.clear_actions()
             self.history_rows = {}
             self.history.clear()
-            for project in groups:
+            def section(title):
+                item = QTreeWidgetItem(self.history)
+                item.setFlags(Qt.ItemFlag.NoItemFlags)
+                item.setFirstColumnSpanned(True)
+                item.setSizeHint(0, QSize(0, 37))
+                heading = label(title, "historySection")
+                self.history.setItemWidget(item, 0, heading)
+
+            def chat_row(parent, session):
+                item = QTreeWidgetItem(parent, [session["title"]])
+                item.setToolTip(0, session["title"] + (" · 任务进行中" if session["working"] else ""))
+                item.setData(0, USER_ROLE, session["id"])
+                item.setData(0, USER_ROLE + 1, "chat")
+                self.history_rows[("chat", session["id"])] = item
+                self.add_row_actions(item, session["id"], project=False, working=session["working"])
+
+            def project_row(project, members):
                 pid, title = project["id"], project["name"]
-                visible = by_project.get(pid, [])
-                if query and not visible and query.casefold() not in title.casefold():
-                    continue
                 group = QTreeWidgetItem(self.history, [title])
-                group.setIcon(0, icon("pin" if project["pinned"] else ("folder" if pid else "chat")))
+                group.setIcon(0, icon("folder-open"))
                 group.setToolTip(0, "\n".join(f["path"] for f in project["folders"]) or title)
                 group.setData(0, USER_ROLE, pid)
+                group.setData(0, USER_ROLE + 1, "project")
                 self.history_rows[("project", pid)] = group
                 self.add_row_actions(group, pid, project=True)
-                for session in visible:
-                    item = QTreeWidgetItem(group, [session["title"]])
-                    item.setToolTip(0, session["title"] + (" · 任务进行中" if session["working"] else ""))
-                    item.setData(0, USER_ROLE, session["id"])
-                    self.history_rows[("chat", session["id"])] = item
-                    if session["pinned"]:
-                        item.setIcon(0, icon("pin"))
-                    self.add_row_actions(item, session["id"], project=False, working=session["working"], updated=session["updated"])
+                for session in members:
+                    chat_row(group, session)
                 collapsed = self.settings.value("collapsed/" + (pid or "local"), False, type=bool)
                 group.setExpanded(bool(query) or not collapsed)
+
+            pinned_projects = {p["id"] for p in groups if p["pinned"]}
+            members = {}
+            pins = []
+            for chat in chats:
+                if self.history_filter == "working" and not chat["working"]:
+                    continue
+                if chat["pinned"] and chat["project_id"] not in pinned_projects:
+                    pins.append(chat)
+                else:
+                    members.setdefault(chat["project_id"], []).append(chat)
+            projects = [p for p in groups if members.get(p["id"]) or
+                        (self.history_filter != "working" and query.casefold() in p["name"].casefold())]
+            for pinned, title in ((True, "置顶"), (False, "项目")):
+                matching = [p for p in projects if bool(p["pinned"]) == pinned]
+                if not pinned and self.history_filter == "pinned":
+                    break
+                if matching or (pinned and pins):
+                    section(title)
+                for project in matching:
+                    project_row(project, members.get(project["id"], []))
+                if pinned:
+                    for chat in pins:
+                        chat_row(self.history, chat)
+            if self.history_filter != "pinned" and members.get(None):
+                section("最近")
+                for chat in members[None]:
+                    chat_row(self.history, chat)
             self.history.doItemsLayout()
+            if self.history.viewport().underMouse():
+                hovered = self.history.itemAt(self.history.viewport().mapFromGlobal(QCursor.pos()))
+                if hovered:
+                    self.history.hover_item(hovered, 0)
             self.select_history_row()
         self.history.verticalScrollBar().setValue(scroll)
 
@@ -485,12 +593,12 @@ class Window(QMainWindow):
         item = self.history_rows.get(key)
         if item is not None and item.parent() is not None and not item.parent().isExpanded():
             item = item.parent()
-        if item is not None and item != self.history.currentItem():
+        if item != self.history.currentItem():
             with QSignalBlocker(self.history):
                 self.history.setCurrentItem(item, 0)
         self.history.update_actions()
 
-    def add_row_actions(self, item, identifier, *, project, working=False, updated=None):
+    def add_row_actions(self, item, identifier, *, project, working=False):
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -504,32 +612,19 @@ class Window(QMainWindow):
             progress.setAccessibleName("会话任务进行中")
             progress.setToolTip("会话任务进行中")
             layout.addWidget(progress)
-        stamp = None
-        if not project and not working:
-            stamp = label("", "caption")
-            layout.addWidget(stamp)
-            when = datetime.fromisoformat(updated).astimezone()
-            stamp.setText(when.strftime("%H:%M" if when.date() == datetime.now(when.tzinfo).date() else "%m/%d"))
-            stamp.setToolTip(when.strftime("%Y-%m-%d %H:%M"))
-        if project:
-            compose = button("在此新建会话", lambda: self.create_chat(identifier), "new", "rowAction", True)
-            compose.setFixedSize(23, 24)
-            layout.addWidget(compose)
-        if identifier:
-            action = button("项目操作" if project else "会话操作", lambda: self.show_row_menu(
-                identifier, project, action.mapToGlobal(action.rect().bottomLeft())), "more", "rowAction", True)
-            action.setFixedSize(23, 24)
-            action.setAccessibleName(item.text(0) + "，" + action.accessibleName())
-            layout.addWidget(action)
-            if stamp is not None:
-                self.history.add_trailing_action(item, stamp, action)
+        action = button("项目操作" if project else "会话操作", lambda: self.show_row_menu(
+            identifier, project, action.mapToGlobal(action.rect().bottomLeft())), "more", "rowAction", True)
+        action.setFixedSize(22, 24)
+        action.setAccessibleName(item.text(0) + "，" + action.accessibleName())
+        layout.addWidget(action)
+        self.history.add_trailing_action(item, progress if working else None, action)
         self.history.setItemWidget(item, 1, row)
 
     def history_changed(self, item, previous):
-        if not item:
+        if not item or not item.data(0, USER_ROLE + 1):
             return
         value = item.data(0, USER_ROLE)
-        if item.parent() is None:
+        if item.data(0, USER_ROLE + 1) == "project":
             if value != self.pid:
                 self.activate_project(value)
         elif value != self.sid:
@@ -741,8 +836,8 @@ class Window(QMainWindow):
 
     def history_menu(self, point):
         item = self.history.itemAt(point)
-        if item:
-            self.show_row_menu(item.data(0, USER_ROLE), item.parent() is None,
+        if item and item.data(0, USER_ROLE + 1):
+            self.show_row_menu(item.data(0, USER_ROLE), item.data(0, USER_ROLE + 1) == "project",
                                self.history.viewport().mapToGlobal(point))
 
     def current_chat_menu(self):
@@ -935,30 +1030,38 @@ class Window(QMainWindow):
         self.editor.setFocus()
 
     def layout_models(self):
-        if not hasattr(self, "compact_models"):
+        if not hasattr(self, "compact_efforts"):
             return
         active = [p for key, p in self.pickers.items() if not self.recipient or key == self.recipient]
-        required = sum(p.sizeHint().width() for p in active) + self.recipient_button.sizeHint().width() + 135
-        compact = self.composer.width() < required
+        width = self.composer.width()
+        stacked = width < 450
+        self.actions_layout.setDirection(QBoxLayout.Direction.TopToBottom if stacked else QBoxLayout.Direction.LeftToRight)
+        gpt = self.recipient != "gemini"
+        self.speed_box.setVisible(gpt)
+        reserved = 70 + 28 * int(gpt) + (30 if self.stop_button.isVisible() else 0)
+        if not stacked:
+            reserved += 38 + self.permission_box.sizeHint().width() + self.recipient_button.sizeHint().width()
+        compact = width < reserved + sum(p.sizeHint().width() for p in active)
         for picker in self.pickers.values():
             picker.setVisible(not compact and picker in active)
         self.compact_models.setVisible(compact)
+        self.compact_efforts.setVisible(compact and any(not p.effort_control.isHidden() for p in active))
+        self.compact_efforts.setEnabled(any(p.effort_control.isEnabled() and not p.effort_control.isHidden() for p in active))
 
-    def compact_model_menu(self):
+    def compact_model_menu(self, checked=False, *, effort=False):
+        anchor = self.compact_efforts if effort else self.compact_models
+        pickers = [p for key, p in self.pickers.items() if (not self.recipient or self.recipient == key)
+                   and (not effort or p.effort_control.isEnabled() and not p.effort_control.isHidden())]
+        def open_picker(picker):
+            (picker.open_effort if effort else picker.open_models)(anchor=anchor)
+        if len(pickers) == 1:
+            open_picker(pickers[0])
+            return
         menu = QMenu(self)
-        for provider, picker in self.pickers.items():
-            if self.recipient and provider != self.recipient:
-                continue
-            name = RECIPIENTS[provider]
-            menu.addAction(name + " 模型", lambda _, p=picker: p.open_models(anchor=self.compact_models))
-            if picker.effort_control.isEnabled() and not picker.effort_control.isHidden():
-                menu.addAction(name + " 思考强度", lambda _, p=picker: p.open_effort(anchor=self.compact_models))
-            if provider == "openai":
-                action = menu.addAction("Fast", self.speed_box.click)
-                action.setCheckable(True)
-                action.setEnabled(self.speed_box.isEnabled())
-                action.setChecked(self.speed_box.isChecked())
-        self.popup_choices(self.compact_models, menu)
+        menu.setAccessibleName(anchor.accessibleName())
+        for picker in pickers:
+            menu.addAction(RECIPIENTS[picker.provider], lambda _, p=picker: open_picker(p))
+        self.popup_choices(anchor, menu)
 
     def draft_key(self):
         return "drafts/" + self.sid if self.sid else "composers/" + (self.pid or "local")
@@ -989,6 +1092,7 @@ class Window(QMainWindow):
             if provider == "openai" and previous != value:
                 self.draft_speed = "standard"
                 self.refresh_access()
+            self.layout_models()
             self.editor_changed()
             return
         session = self.engine.store.session(self.sid)
@@ -1130,10 +1234,10 @@ class Window(QMainWindow):
             if changed_backend:
                 self.backend_box.updateGeometry()
             project = self.engine.store.project(self.pid) if self.pid else None
-            self.project_name.setText(project["name"] if project else ("独立会话" if self.sid else "选择项目"))
-            self.project_name.setToolTip("\n".join(f["path"] for f in project["folders"]) if project else "选择项目")
+            self.project_name.setToolTip((project["name"] + "\n" + "\n".join(f["path"] for f in project["folders"])) if project else "选择项目")
             self.chat_more.setVisible(bool(self.sid))
-            self.title.setToolTip(session["title"])
+            self.share_button.setVisible(bool(self.sid))
+            self.title.setToolTip(session["title"] if self.sid else project["name"] if project else "新聊天")
             self.fit_title()
             models = self.preferred_models(backend, session) if self.backend_task else session
             efforts = self.preferred_efforts(backend, session, models) if self.backend_task else session["efforts"]
@@ -1393,11 +1497,7 @@ class Window(QMainWindow):
         self.daybreak_action.setVisible(show_daybreak)
         self.daybreak_action.setEnabled(self.backend_task is None and (enabled or eligible))
         self.daybreak_action.setText("Daybreak 模式    " + ("已开启" if enabled else "已关闭"))
-        self.daybreak_action.setIconText("Daybreak")
-        self.daybreak_action.setIcon(self.daybreak_icons[enabled])
         self.daybreak_action.setToolTip("关闭 Daybreak，使用常规模型" if enabled else "开启 Daybreak，使用当前账户授权的模型")
-        self.daybreak_button.setAccessibleName(self.daybreak_action.text())
-        self.daybreak_button.setVisible(show_daybreak and self.recipient != "gemini")
         if native and mode_changed:
             picker.refresh_open_models()
         if self.slash_menu.isVisible():
@@ -1522,6 +1622,7 @@ class Window(QMainWindow):
         self.recipient_button.setAccessibleName("消息接收方，" + RECIPIENTS[self.recipient])
         self.recipient_button.setToolTip("选择双模型协作、Gemini 或 GPT 直接对话")
         self.mode_button.setVisible(not self.recipient)
+        self.mode_caption.setVisible(not self.recipient)
         self.layout_models()
         if self.recipient:
             self.editor.setPlaceholderText("给 " + RECIPIENTS[self.recipient] + " 发消息…")
@@ -1552,7 +1653,8 @@ class Window(QMainWindow):
                 verb = "pause" if status == "active" else "resume"
                 menu.addAction("暂停目标" if verb == "pause" else "继续目标", lambda: self.mode_action(verb))
             menu.addAction("清除目标", lambda: self.mode_action("clear"))
-        self.popup_choices(self.mode_button, menu)
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        menu.popup(self.options_button.mapToGlobal(self.options_button.rect().bottomLeft()))
 
     def select_mode(self, mode):
         if self.sid:
@@ -1616,7 +1718,7 @@ class Window(QMainWindow):
                        "skills": self.agent_settings, "mode": self.mode_menu, "plan": lambda: self.select_mode("plan"),
                        "goal": self.mode_menu if sid and self.state["session"]["objective"] else lambda: self.select_mode("goal"),
                        "model": self.pickers["openai"].open_models, "effort": self.pickers["openai"].open_effort,
-                       "permissions": self.permission_box.showPopup, "backend": self.backend_box.showPopup,
+                       "permissions": self.permission_box.showPopup, "backend": self.show_backend,
                        "project": self.project_picker, "projects": self.project_picker, "add-dir": self.choose_source}
             if sid:
                 actions.update(rename=lambda: self.rename_chat(sid), archive=lambda: self.archive_chat(sid),
@@ -1757,12 +1859,21 @@ class Window(QMainWindow):
         self.composer.style().unpolish(self.composer)
         self.composer.style().polish(self.composer)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.unified_titlebar:
+            hide_macos_title(self)
+            if self.saved_geometry:
+                # AppKit 创建扩展标题栏时会调整窗口框架，等原生窗口显示后恢复用户保存的尺寸。
+                geometry, self.saved_geometry = self.saved_geometry, None
+                QTimer.singleShot(0, self, lambda: self.restoreGeometry(geometry))
+
     def closeEvent(self, event):
         self.timer.stop()
         self.cancel_backend_change()
         self.save_draft()
         self.settings.setValue("geometry", self.saveGeometry())
-        for pane, key in ((self.sidebar, "sidebar_width"), (self.inspector, "inspector_width")):
+        for pane, key in ((self.sidebar, "navigation_width"), (self.inspector, "inspector_width")):
             if pane.isVisible():
                 self.settings.setValue(key, pane.width())
         self.settings.sync()

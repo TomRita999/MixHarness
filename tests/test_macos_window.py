@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def read_window(work, library):
-    from PySide6.QtCore import QSettings, Qt
+    from PySide6.QtCore import QPoint, QSettings, Qt
     from PySide6.QtGui import QAccessible
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
@@ -21,7 +21,8 @@ def read_window(work, library):
 
     app = QApplication([])
     QAccessible.setActive(True)
-    contains = ctypes.CDLL(str(library)).windowContainsText
+    native = ctypes.CDLL(str(library))
+    contains = native.windowContainsText
     contains.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     contains.restype = ctypes.c_int
     with open_engine(work, work / "data") as engine:
@@ -36,6 +37,25 @@ def read_window(work, library):
             read(body)
             return window.sid
         assert QTest.qWaitForWindowExposed(window)
+        if window.unified_titlebar:
+            native.windowHasSingleTitle.argtypes = [ctypes.c_void_p]
+            assert native.windowHasSingleTitle(int(window.winId()))
+            area = window.screen().availableGeometry()
+            window.resize(800, 520)
+            window.move(area.left() + 12, area.top() + 12)
+            window.raise_()
+            window.activateWindow()
+            QTest.qWait(100)
+            before = window.pos()
+            point = window.title.mapTo(window, window.title.rect().center())
+            delta = QPoint(46, 32)
+            native.postWindowMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            native.postWindowMouseEvent.restype = None
+            # AppKit 先分发这组窗口坐标，再由 Qt 处理移动；松开的位置和拖动终点一致。
+            for phase, location in enumerate((point, point + delta, point + delta)):
+                native.postWindowMouseEvent(int(window.winId()), location.x(), location.y(), phase)
+            QTest.qWait(160)
+            assert window.pos() == before + delta, (before, window.pos())
         first = send("会话 A", "第一条消息的正文。")
         window.new_standalone()
         send("会话 B", "第二条消息的正文。")
