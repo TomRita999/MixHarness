@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from mixharness.cli import parser
 from mixharness.commands import control_server
 from mixharness.engine import open_engine
 
@@ -14,6 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CliTests(unittest.TestCase):
+    def test_wait_timeout_is_opt_in(self):
+        cli = parser()
+        for args in (["run", "检查项目"], ["send", "session", "检查项目"], ["wait", "session"]):
+            with self.subTest(command=args[0]):
+                self.assertIsNone(cli.parse_args(args).timeout)
+                self.assertEqual(cli.parse_args([*args, "--timeout", "20"]).timeout, 20)
+
     def test_cli_and_running_engine_share_the_same_session(self):
         scratch = ROOT / ".work" / "tests"
         scratch.mkdir(parents=True, exist_ok=True)

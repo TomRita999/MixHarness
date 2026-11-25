@@ -50,7 +50,6 @@ class Engine:
         self.client_catalogs = {p: ClientCatalog(c) for p, c in CLIENTS.items()}
         self.client_locks = {}
         self.approval_waiters = {}
-        self.deadlines = {}
         record = self.store.rows("SELECT value FROM preferences WHERE key='agent'")
         self.settings = AgentSettings.model_validate_json(record[0]["value"]) if record else AgentSettings()
         self.signal = asyncio.Event()
@@ -282,16 +281,7 @@ class Engine:
             return False
         if job["permission"] == "full":
             return True
-        deadline = self.deadlines.get(job["id"])
-        if deadline:
-            loop = asyncio.get_running_loop()
-            remaining = deadline.when() - loop.time()
-            deadline.reschedule(None)
-        try:
-            return await self.wait_approval(job, source, title, json.dumps(details, ensure_ascii=False, indent=2), new_id())
-        finally:
-            if deadline and not deadline.expired():
-                deadline.reschedule(loop.time() + remaining)
+        return await self.wait_approval(job, source, title, json.dumps(details, ensure_ascii=False, indent=2), new_id())
 
     async def authorize_tool(self, job, call, title, detail, routine=False):
         session = self.store.session(job["sid"])
@@ -858,18 +848,16 @@ class Engine:
             def preview(text):
                 self.previews[jid] += text
 
-            async with asyncio.timeout(420) as deadline:
-                self.deadlines[jid] = deadline
-                if job["backend"] == "clients":
-                    self.set_activity(job, "正在连接 " + ("Codex" if PROVIDERS[job["kind"]] == "openai" else "Antigravity"))
-                    reply = await workflow_turn(self, request, context, next(iter(sources.folders.values())))
-                elif PROVIDERS[job["kind"]] == "gemini":
-                    self.set_activity(job, "正在请求 Gemini API")
-                    reply = await google_turn(key, request, context, results, preview)
-                else:
-                    self.set_activity(job, "正在请求 OpenAI API")
-                    reply = await openai_turn(key, request, context, results, preview,
-                                              lambda send: self.register_steering(request, send))
+            if job["backend"] == "clients":
+                self.set_activity(job, "正在连接 " + ("Codex" if PROVIDERS[job["kind"]] == "openai" else "Antigravity"))
+                reply = await workflow_turn(self, request, context, next(iter(sources.folders.values())))
+            elif PROVIDERS[job["kind"]] == "gemini":
+                self.set_activity(job, "正在请求 Gemini API")
+                reply = await google_turn(key, request, context, results, preview)
+            else:
+                self.set_activity(job, "正在请求 OpenAI API")
+                reply = await openai_turn(key, request, context, results, preview,
+                                          lambda send: self.register_steering(request, send))
             self.steering.pop(jid, None)
             await self.gate(job)
             if self.store.job(jid)["guide_seq"] > request["guide_seq"]:
@@ -944,7 +932,6 @@ class Engine:
                     self.store.finish(job, message[:2200], result, success=False)
         finally:
             self.activity.pop(jid, None)
-            self.deadlines.pop(jid, None)
             self.steering.pop(jid, None)
             worker = self.steer_workers.pop(jid, None)
             if worker:

@@ -173,7 +173,7 @@ async def dispatch(engine, args):
             return {"source": "mixharness", "id": sid, "seq": seq}
     elif cmd != "wait":
         raise ValueError("未知的命令")
-    return await settled(engine, sid, args.get("timeout", 600), return_on_approval=True, keep_native=args.get("keep_native", False))
+    return await settled(engine, sid, args.get("timeout"), return_on_approval=True, keep_native=args.get("keep_native", False))
 
 
 @asynccontextmanager

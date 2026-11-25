@@ -3,6 +3,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Literal
 
+import httpx2
 from google import genai
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field
@@ -10,6 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from .attachments import image_parts
 from .catalog import MODELS
 from .store import pack
+
+
+# HTTP 建连、读取、写入、连接池依次对应四项。等待模型返回数据没有截止时间。
+MODEL_HTTP_TIMEOUT = (180.0, None, 180.0, 180.0)
 
 
 class Plan(BaseModel):
@@ -162,9 +167,10 @@ class Turn:
 
 async def google_turn(key, job, context, results, preview):
     content = [{"type": "text", "text": context}, *image_parts(job.get("images", []), "gemini")]
-    async with genai.Client(api_key=key, vertexai=False).aio as client:
+    http_options = {"async_client_args": {"timeout": MODEL_HTTP_TIMEOUT}}
+    async with genai.Client(api_key=key, vertexai=False, http_options=http_options).aio as client:
         options = {"model": job["model"], "system_instruction": PROMPTS[job["kind"]], "store": True,
-                   "api_version": "v1", "timeout": 180}
+                   "api_version": "v1"}
         if job["effort"]:
             options["generation_config"] = {"thinking_level": job["effort"]}
         if job["kind"] == "plan":
@@ -226,7 +232,7 @@ async def openai_turn(key, job, context, results, preview, register_steer):
         options["reasoning"] = {"effort": job["effort"]}
     if job["cursor"]:
         options["previous_response_id"] = job["cursor"]
-    async with AsyncOpenAI(api_key=key, timeout=180, max_retries=0) as client:
+    async with AsyncOpenAI(api_key=key, timeout=httpx2.Timeout(MODEL_HTTP_TIMEOUT), max_retries=0) as client:
         if not job["model"].startswith("gpt-6"):
             response = await client.responses.create(**options)
             if response.status != "completed":

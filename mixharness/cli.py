@@ -79,7 +79,7 @@ def parser():
             cmd.add_argument("--wait", action=argparse.BooleanOptionalAction, default=True, help="等待执行完成")
             cmd.add_argument("--request-id", help="幂等请求标识")
         if name in ("run", "send", "wait"):
-            cmd.add_argument("--timeout", type=int, default=600, help="超时秒数")
+            cmd.add_argument("--timeout", type=int, help="等待秒数，默认一直等到任务完成")
     sub.add_parser("serve", help="启动后台任务引擎（Ctrl+C 退出）")
     sub.add_parser("desktop", help="打开桌面应用")
     return root
