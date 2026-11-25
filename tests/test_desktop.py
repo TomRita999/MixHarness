@@ -218,7 +218,7 @@ class DesktopTests(unittest.TestCase):
                     self.assertEqual(window.sidebar.width(), 290)
                     self.assertEqual(window.rail.width(), 52)
                     self.assertEqual([b.text() for b in window.sidebar.findChildren(QPushButton, "nav")],
-                                     ["新聊天", "GPT-dot"])
+                                     ["新聊天", "GPT-dot", "新建项目"])
                     window.editor.setPlainText("能帮我解释同一会话的消息记录吗？")
                     QTest.mouseClick(window.recipient_button, Qt.MouseButton.LeftButton)
                     menu = self.app.activePopupWidget()
@@ -479,6 +479,9 @@ class DesktopTests(unittest.TestCase):
                 def confirmation(text):
                     dialog = next(x for x in window.findChildren(QMessageBox) if x.isVisible())
                     click(next(b for b in dialog.buttons() if b.text() == text))
+                window.search()
+                window.filter.setText("没有匹配的项目")
+                self.assertEqual(window.history.topLevelItemCount(), 0)
                 click(window.create_project_button)
                 dialog = window.findChild(ProjectDialog)
                 self.assertFalse(dialog.save.isEnabled())
@@ -490,6 +493,7 @@ class DesktopTests(unittest.TestCase):
                 pid = window.pid
                 project = engine.store.project(pid)
                 self.assertEqual(project["name"], "桌面发布")
+                self.assertIn(("project", pid), window.history_rows)
                 self.assertEqual([f["path"] for f in project["folders"]], list(map(str, reversed(sources))))
                 self.assertEqual(engine.store.sessions(), [])
                 window.editor.setPlainText("整理桌面应用的发布说明。")
