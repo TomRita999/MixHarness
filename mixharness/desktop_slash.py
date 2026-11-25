@@ -1,8 +1,9 @@
 from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QPalette, QTextCursor
+from PySide6.QtGui import QIcon, QPalette, QTextCursor
 from PySide6.QtWidgets import QAbstractItemView, QLabel, QListWidget, QListWidgetItem, QStyle, QStyledItemDelegate
 
 from .slash_catalog import COMMANDS, matches
+from .desktop_widgets import icon
 
 
 ROLE = Qt.ItemDataRole.UserRole
@@ -11,8 +12,15 @@ NEEDS_CHAT = {"btw", "share", "fork", "compact", "archive", "implement", "tools"
 
 
 class CommandRow(QStyledItemDelegate):
+    def __init__(self, parent):
+        super().__init__(parent)
+        names = {"mcp": "server", "review": "review", "usage": "usage", "btw": "chat", "share": "share",
+                 "fork": "fork", "init": "book", "compact": "compact", "feedback": "chat", "archive": "archive",
+                 "fast": "zap", "plan": "plan", "goal": "goal", "new": "new", "history": "search"}
+        self.icons = {name: icon(names.get(name, "terminal"), role=QPalette.ColorRole.PlaceholderText) for name in COMMANDS}
+
     def sizeHint(self, option, index):
-        return QSize(0, max(32, option.fontMetrics.height() + 14))
+        return QSize(0, max(29, option.fontMetrics.height() + 10))
 
     def paint(self, painter, option, index):
         name = index.data(ROLE)
@@ -28,6 +36,9 @@ class CommandRow(QStyledItemDelegate):
             painter.drawRoundedRect(rect, 6, 6)
         align = Qt.AlignmentFlag.AlignVCenter
         bounds = rect.adjusted(10, 0, -10, 0)
+        self.icons[name].paint(painter, QRect(bounds.left(), bounds.center().y() - 7, 14, 14),
+                               Qt.AlignmentFlag.AlignCenter, QIcon.Mode.Normal)
+        bounds.adjust(22, 0, 0, 0)
         token = "/" + name
         regular = option.font
         metrics = option.fontMetrics

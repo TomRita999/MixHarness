@@ -7,19 +7,19 @@ from math import ceil
 from pathlib import Path
 
 from dotenv import set_key
-from PySide6.QtCore import QBuffer, QEasingCurve, QIODevice, QPoint, QPointF, QPropertyAnimation, QSaveFile, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QFontMetrics, QIcon, QImage, QPainter, QPalette, QPixmap, QTextCursor
+from PySide6.QtCore import QBuffer, QEasingCurve, QIODevice, QPoint, QPointF, QPropertyAnimation, QRectF, QSaveFile, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QFontMetrics, QIcon, QImage, QPainter, QPainterPath, QPalette, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QTextEdit, QToolButton, QToolTip,
-    QVBoxLayout, QWidget,
+    QTreeWidget, QVBoxLayout, QWidget,
 )
 
 from .desktop_style import Glyph
 from .desktop_markdown import link_plain_text, render_markdown
 from .markdown_links import HASH_LINE
 from .attachments import TYPES
-from .store import LABELS
+from .store import LABELS, PROVIDERS
 from .reasoning import LEVEL_NAMES, api_group, group_for, model_available
 
 
@@ -86,8 +86,19 @@ class Editor(QPlainTextEdit):
         self.setAccessibleName("消息")
         self.setPlaceholderText("输入消息，或用 / 调用指令…")
         self.setTabChangesFocus(True)
-        self.setFixedHeight(66)
+        self.setFixedHeight(40)
         self.document().setDocumentMargin(3)
+        self.document().documentLayout().documentSizeChanged.connect(self.fit_lines)
+
+    def fit_lines(self):
+        if self.objectName() != "editor":
+            return
+        block = self.document().begin()
+        lines = 0
+        while block.isValid() and lines < 7:
+            lines += max(1, block.layout().lineCount())
+            block = block.next()
+        self.setFixedHeight(max(40, min(7, lines) * self.fontMetrics().lineSpacing() + 10))
 
     def focusInEvent(self, event):
         super().focusInEvent(event)
@@ -141,6 +152,54 @@ class Submenu(QMenu):
     def __init__(self, title, parent):
         super().__init__(title, parent)
         parent.addMenu(self)
+
+
+class HistoryTree(QTreeWidget):
+    def __init__(self):
+        super().__init__()
+        self.actions_by_id = {}
+        self.hover_id = None
+        self.setMouseTracking(True)
+        self.itemEntered.connect(self.hover_item)
+        self.currentItemChanged.connect(lambda *_: self.update_actions())
+
+    def clear_actions(self):
+        self.actions_by_id.clear()
+        self.hover_id = None
+
+    def add_trailing_action(self, item, stamp, action):
+        self.actions_by_id[item.data(0, Qt.ItemDataRole.UserRole)] = (stamp, action)
+        action.hide()
+
+    def hover_item(self, item, column):
+        self.hover_id = item.data(0, Qt.ItemDataRole.UserRole)
+        self.update_actions()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.hover_id = None
+        self.update_actions()
+
+    def update_actions(self):
+        current = self.currentItem()
+        selected = current.data(0, Qt.ItemDataRole.UserRole) if current else None
+        for identifier, (stamp, action) in self.actions_by_id.items():
+            visible = identifier in (self.hover_id, selected)
+            stamp.setVisible(not visible)
+            action.setVisible(visible)
+
+    def drawRow(self, painter, option, index):
+        if self.currentIndex().siblingAtColumn(0) != index.siblingAtColumn(0):
+            return super().drawRow(painter, option, index)
+        area = QRectF(0, option.rect.top() + 1, self.viewport().width(), option.rect.height() - 2)
+        outline = QPainterPath()
+        outline.addRoundedRect(area, 7, 7)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillPath(outline, self.palette().highlight())
+        painter.setClipPath(outline, Qt.ClipOperation.IntersectClip)
+        super().drawRow(painter, option, index)
+        painter.restore()
 
 
 class FitCombo(QComboBox):
@@ -300,12 +359,12 @@ class ModelPicker(QWidget):
         screen = control.screen().availableGeometry()
         menu.popup(QPoint(position.x(), max(screen.top(), position.y() - menu.sizeHint().height() - 4)))
 
-    def open_effort(self):
+    def open_effort(self, checked=False, *, anchor=None):
         group = group_for(self.catalog["groups"], self.model)
         if group and self.accepts(group):
             menu = self.new_menu(self.title + " 思考强度")
             self.level_actions(menu, group)
-            self.popup(menu, self.effort_control)
+            self.popup(menu, anchor or self.effort_control)
 
     def refresh_open_models(self):
         menu = self.menu
@@ -313,7 +372,7 @@ class ModelPicker(QWidget):
             menu.close()
             self.open_models()
 
-    def open_models(self):
+    def open_models(self, checked=False, *, anchor=None):
         client = self.catalog["source"] == "client"
         if not client and self.provider == "openai":
             self.open_dialog()
@@ -363,7 +422,7 @@ class ModelPicker(QWidget):
         refresh = menu.addAction("刷新列表", lambda: self.refresh_requested.emit(self.provider))
         refresh.setEnabled(client or self.catalog["configured"])
         menu.addAction("查看套餐用量", lambda: self.usage_requested.emit(self.provider))
-        self.popup(menu, self.control)
+        self.popup(menu, anchor or self.control)
 
     def open_dialog(self):
         if self.dialog:
@@ -576,13 +635,13 @@ class MessageRow(QWidget):
         self.rendered = None
         self.available = None
         row = QHBoxLayout(self)
-        row.setContentsMargins(2, 5, 2, 5)
+        row.setContentsMargins(0, 6, 0, 6)
         row.setSpacing(0)
         self.block = QFrame()
         self.block.setObjectName("userBubble" if self.user else "reply")
         box = QVBoxLayout(self.block)
         box.setSpacing(5)
-        margins = (14, 9, 14, 9) if self.user else (0, 2, 0, 4)
+        margins = (14, 8, 14, 8) if self.user else (0, 2, 0, 4)
         box.setContentsMargins(*margins)
         author = ACTORS.get(event["actor"], event["actor"])
         if self.user:
@@ -753,7 +812,7 @@ class Timeline(QScrollArea):
         self.canvas.setObjectName("timelineCanvas")
         self.column = QVBoxLayout(self.canvas)
         self.column.setContentsMargins(0, 6, 2, 10)
-        self.column.setSpacing(5)
+        self.column.setSpacing(8)
         self.column.addStretch()
         self.setWidget(self.canvas)
         self.rows = []
@@ -879,9 +938,11 @@ class Timeline(QScrollArea):
         for jid, (task, text) in drafts.items():
             row = self.draft_rows.get(jid)
             if row is None:
-                event = {"actor": "openai", "kind": "message", "body": text, "intermediate": True,
+                event = {"actor": PROVIDERS[task["kind"]], "kind": "message", "body": text,
+                         "intermediate": bool(task.get("intermediate")),
                          "meta": {"job": jid, "kind": task["kind"], "model": task["model"]}}
                 row = MessageRow(event, workspace=self.workspace, expanded_jobs=self.expanded_jobs)
+                row.rendered = text if not row.intermediate else row.rendered
                 self.draft_rows[jid] = row
                 row.fit(self.viewport().width() - 4)
                 self.column.insertWidget(self.column.count() - 1, row)
@@ -889,7 +950,7 @@ class Timeline(QScrollArea):
             elif row.text != text:
                 row.text = text
                 row.show_result()
-                changed |= row.result_toggle.isChecked()
+                changed |= not row.intermediate or row.result_toggle.isChecked()
         if changed and follow:
             self.column.activate()
             self.canvas.adjustSize()
@@ -912,7 +973,7 @@ class MessageNav(QWidget):
 
     def refresh(self):
         count = len(self.timeline.user_rows())
-        self.setFixedSize(22, count * self.STEP + 10)
+        self.setFixedHeight(count * self.STEP + 10)
         self.setVisible(count >= 2 and self.timeline.isVisible())
         self.reposition()
         self.update()
@@ -920,7 +981,11 @@ class MessageNav(QWidget):
     def reposition(self):
         host = self.parentWidget()
         if host:
-            self.move(host.width() - self.width() - 8, max(48, (host.height() - self.height()) // 2))
+            right = self.timeline.mapTo(host, QPoint(self.timeline.width(), 0)).x()
+            gutter = max(0, host.width() - right)
+            self.setFixedWidth(min(22, max(12, gutter)))
+            inset = min(8, max(0, gutter - self.width()))
+            self.move(host.width() - self.width() - inset, max(48, (host.height() - self.height()) // 2))
             self.raise_()
 
     def index_at(self, y):

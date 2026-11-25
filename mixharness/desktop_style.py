@@ -13,6 +13,10 @@ GLYPHS = {
     "plus": 0xE13D, "more": 0xE0B6, "archive": 0xE041, "pin": 0xE259, "trash": 0xE18E,
     "chevron-down": 0xE06D, "chevron-right": 0xE06F, "pencil": 0xE12F,
     "zap": 0xE1B4, "toggle-left": 0xE18B, "toggle-right": 0xE18C,
+    "back": 0xE048, "forward": 0xE049, "stop": 0xE167,
+    "server": 0xE153, "review": 0xE0CB, "usage": 0xE1BF, "share": 0xE155,
+    "fork": 0xE28D, "book": 0xE05F, "compact": 0xE529, "terminal": 0xE181,
+    "plan": 0xE086, "goal": 0xE345,
 }
 
 
@@ -52,12 +56,12 @@ class Glyph(QIconEngine):
 
 
 THEMES = {
-    "light": dict(canvas="#ffffff", side="#f8f8f7", hover="#efefed", selected="#e7e7e4", field="#ffffff",
-                  line="#e6e6e3", strong="#cfcfcb", ink="#1b1b1b", secondary="#555553", muted="#8b8b88",
-                  inverse="#ffffff", bubble="#f2f2f0", link="#0969da", shadow="#14000000"),
-    "dark": dict(canvas="#161616", side="#0f0f0f", hover="#222222", selected="#2b2b2b", field="#1d1d1d",
-                 line="#2a2a2a", strong="#3d3d3d", ink="#ededed", secondary="#b8b8b8", muted="#7f7f7f",
-                 inverse="#161616", bubble="#262626", link="#58a6ff", shadow="#66000000"),
+    "light": dict(canvas="#ffffff", side="#f9f9f9", hover="#f3f3f3", selected="#ededed", field="#ffffff",
+                  line="#ededed", strong="#dfdfdf", ink="#0d0d0d", secondary="#505050", muted="#737373",
+                  inverse="#ffffff", bubble="#f3f3f3", link="#0969da", shadow="#19000000"),
+    "dark": dict(canvas="#181818", side="#000000", hover="#282828", selected="#303030", field="#212121",
+                 line="#303030", strong="#404040", ink="#ededed", secondary="#cdcdcd", muted="#999999",
+                 inverse="#181818", bubble="#303030", link="#75b6ff", shadow="#30000000"),
 }
 
 
@@ -105,7 +109,7 @@ def apply_theme(app, name):
         QMainWindow, QDialog, QWidget#main, QWidget#content, QTextBrowser, QPlainTextEdit { background: $canvas; }
         QFrame#sidebar { background: $side; border-right: 1px solid $line; }
         QFrame#inspector { background: $side; border-left: 1px solid $line; }
-        QFrame#composer { background: $field; border: 1px solid $line; border-radius: 20px; }
+        QFrame#composer { background: $field; border: 1px solid $strong; border-radius: 22px; }
         QFrame#composer[focused="true"] { border-color: $strong; }
         QFrame#headerLine { background: $line; max-height: 1px; border: none; }
         QScrollArea#timeline, QWidget#timelineCanvas, QFrame#reply { background: $canvas; border: none; }
@@ -116,7 +120,7 @@ def apply_theme(app, name):
         QToolButton#activity { font-size: 12px; color: $muted; padding: 2px 6px; border-radius: 6px; }
         QLabel { background: transparent; }
         QLabel#brand { font-size: 15px; font-weight: 650; }
-        QLabel#heading { font-size: 26px; font-weight: 600; color: $ink; }
+        QLabel#heading { font-size: 28px; font-weight: 500; color: $ink; }
         QLabel#subheading { font-size: 13px; color: $muted; }
         QLabel#title { font-weight: 600; }
         QLabel#panelTitle { font-weight: 600; font-size: 13px; }
@@ -128,7 +132,7 @@ def apply_theme(app, name):
         QPushButton:pressed, QToolButton:pressed, QToolButton:checked { background: $selected; }
         QPushButton:focus, QToolButton:focus { outline: none; }
         QPushButton:disabled { color: $muted; }
-        QPushButton#nav { text-align: left; padding: 7px 10px; color: $secondary; }
+        QPushButton#nav { text-align: left; min-height: 22px; padding: 4px 8px; color: $ink; }
         QPushButton#nav:hover { color: $ink; }
         QPushButton#quiet { color: $muted; text-align: left; font-size: 12px; padding: 4px 8px; }
         QPushButton#quiet:hover { color: $ink; }
@@ -146,9 +150,10 @@ def apply_theme(app, name):
         QDialog QPushButton { border: 1px solid $line; padding: 6px 14px; }
         QDialog QPushButton#primary, QDialog QPushButton#quiet, QDialog QPushButton#rowAction { border: none; }
         QPushButton#rowAction { padding: 2px; border-radius: 6px; }
-        QPushButton#round { border: 1px solid $line; border-radius: 15px; padding: 0; }
+        QPushButton#round { border: none; border-radius: 14px; padding: 0; }
         QPushButton#round:hover { border-color: $strong; }
-        QPushButton#send { background: $ink; border-radius: 16px; padding: 0; }
+        QPushButton#send, QPushButton#stopRound { background: $ink; border-radius: 14px; padding: 0; }
+        QPushButton#recipient { color: $secondary; padding: 3px 6px; font-size: 12px; }
         QPushButton#send:hover { background: $secondary; }
         QPushButton#send:disabled { background: $line; }
         QToolButton#model { text-align: left; padding: 3px 4px 3px 6px; font-size: 13px; font-weight: 500; border-radius: 8px; }
@@ -178,10 +183,10 @@ def apply_theme(app, name):
         QTextBrowser { selection-background-color: $selected; }
 
         QListWidget, QTreeWidget { background: transparent; outline: none; }
-        QListWidget#slashMenu { background: $field; border: 1px solid $strong; border-radius: 10px; padding: 4px; }
+        QListWidget#slashMenu { background: $field; border: 1px solid $strong; border-radius: 14px; padding: 4px; }
         QTreeWidget::item { height: 30px; padding-left: 2px; color: $secondary; }
         QTreeWidget::item:hover { background: $hover; color: $ink; }
-        QTreeWidget::item:selected { background: $selected; color: $ink; }
+        QTreeWidget::item:selected { background: transparent; color: $ink; }
         QTreeWidget::branch { background: transparent; }
         QTreeWidget::branch:has-children:closed { image: url($branch_closed); }
         QTreeWidget::branch:has-children:open { image: url($branch_open); }
@@ -190,7 +195,7 @@ def apply_theme(app, name):
         QListWidget::item:selected { background: $selected; color: $ink; }
 
         QMenu, QMenuBar { color: $ink; background: $canvas; }
-        QMenu { border: 1px solid $line; border-radius: 12px; padding: 6px; }
+        QMenu { background: $field; border: 1px solid $strong; border-radius: 12px; padding: 5px; }
         QMenu::item { padding: 7px 22px 7px 12px; border-radius: 7px; min-width: 120px; }
         QMenu::icon { padding-left: 10px; }
         QMenu::indicator { width: 14px; height: 14px; padding-left: 6px; }

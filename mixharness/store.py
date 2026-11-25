@@ -11,19 +11,23 @@ from .reasoning import LEVELS
 
 
 SCOPES = ("engineering", "verification", "report")
+CHAT_JOBS = {"gemini": "gemini_chat", "openai": "gpt_chat"}
 DEPENDS = {
     "plan": (),
     "proposal": (),
     "goal_check": (),
     "side": (),
+    **dict.fromkeys(CHAT_JOBS.values(), ()),
     "engineering": ("engineering",),
     "verification": ("engineering", "verification"),
     "report": SCOPES,
     "section": SCOPES,
 }
-PROVIDERS = {"plan": "gemini", "report": "gemini", "section": "gemini", "engineering": "openai",
+PROVIDERS = {**{kind: provider for provider, kind in CHAT_JOBS.items()},
+             "plan": "gemini", "report": "gemini", "section": "gemini", "engineering": "openai",
              "verification": "openai", "proposal": "openai", "goal_check": "openai", "side": "openai"}
-LABELS = {"plan": "解析需求", "engineering": "开发与研究", "verification": "验证", "report": "撰写报告",
+LABELS = {**dict.fromkeys(CHAT_JOBS.values(), "直接对话"),
+          "plan": "解析需求", "engineering": "开发与研究", "verification": "验证", "report": "撰写报告",
           "section": "撰写章节", "proposal": "制定计划", "goal_check": "核对目标", "side": "侧边问答"}
 MODES = {"default": "默认模式", "plan": "计划模式", "goal": "目标模式"}
 MODE_TITLES = {**MODES, "side": "侧边问答"}
@@ -47,6 +51,8 @@ def new_id():
 
 
 def accepts_guidance(job):
+    if job["kind"] in CHAT_JOBS.values():
+        return False
     return job["status"] in ("running", "waiting") or (
         job["status"] in ("ready", "needs_key") and (job["guide_seq"] > 0 or job["approval_epoch"] > 0 or job["kind"] != "plan"))
 
@@ -426,9 +432,10 @@ class Store:
         return self.session(sid)
 
     def enqueue(self, session, kind, payload=None, title=None):
-        if session["mode"] == "plan" and kind != "proposal":
+        chat = kind in CHAT_JOBS.values()
+        if session["mode"] == "plan" and kind != "proposal" and not chat:
             raise ValueError("请先退出计划模式或选择执行计划")
-        if session["mode"] == "side" and kind != "side":
+        if session["mode"] == "side" and kind != "side" and not chat:
             raise ValueError("侧边聊天只支持问答，切换到默认模式即可执行任务")
         jid = new_id()
         basis = {key: session["versions"][key] for key in DEPENDS[kind]}
@@ -438,7 +445,7 @@ class Store:
             (jid, session["id"], kind, title or LABELS[kind], session[provider], session["efforts"].get(provider, ""),
              pack(basis), pack(payload or {}), now()),
         )
-        if session.get("paused_work"):
+        if session.get("paused_work") and not chat:
             self.db.execute("UPDATE sessions SET paused_work=NULL WHERE id=?", (session["id"],))
         return jid
 
@@ -464,15 +471,24 @@ class Store:
                             "FROM sessions WHERE id=?", (branch, name, str(workspace or original["workspace"]), now(), project, mode,
                             objective, goal_status, note, speed, sid))
             inputs = report_inputs(self.task_summaries(sid, with_output=False))
+            copied_prompts = {}
             for event in self.db.execute("SELECT seq,kind,actor,body,meta,at FROM events WHERE sid=? AND kind='message' ORDER BY seq", (sid,)):
-                meta = event["meta"] if event["actor"] == "user" else "{}"
-                if event["actor"] == "openai":
-                    original_meta = json.loads(event["meta"])
+                original_meta = json.loads(event["meta"])
+                meta = {}
+                if event["actor"] == "user":
+                    meta = original_meta
+                elif original_meta.get("recipient"):
+                    meta = {k: original_meta[k] for k in ("recipient", "kind", "model", "effort", "backend") if k in original_meta}
+                    if original_meta.get("reply_to") in copied_prompts:
+                        meta["reply_to"] = copied_prompts[original_meta["reply_to"]]
+                elif event["actor"] == "openai":
                     scope = report_input_kind(original_meta, inputs)
                     if scope:
-                        meta = pack({"report_input": scope, "model": original_meta.get("model")})
+                        meta = {"report_input": scope, "model": original_meta.get("model")}
                 seq = self.db.execute("INSERT INTO events(sid,kind,actor,body,meta,at) VALUES(?,?,?,?,?,?)",
-                                      (branch, event["kind"], event["actor"], event["body"], meta, event["at"])).lastrowid
+                                      (branch, event["kind"], event["actor"], event["body"], pack(meta), event["at"])).lastrowid
+                if event["actor"] == "user" and meta.get("recipient"):
+                    copied_prompts[event["seq"]] = seq
                 self.db.execute("INSERT INTO message_inputs SELECT ?,item FROM message_inputs WHERE seq=? ORDER BY rowid",
                                 (seq, event["seq"]))
             if not side and self.current_proposal(sid):
@@ -486,23 +502,42 @@ class Store:
         with self.db:
             return self._message(sid, body, client_id, draft, attachments)
 
+    def record_prompt(self, session, body, meta, client_id, draft, attachments):
+        staged = self.inputs.metadata(draft) if draft else []
+        if not body.strip() and not attachments and not staged:
+            raise ValueError("请输入消息或添加附件")
+        sid = session["id"]
+        seq = self.event(sid, "message", "user", body, meta, client_id)
+        self.inputs.commit_message(seq, draft, attachments)
+        if session["title"] == "新会话" and not self.db.execute(
+                "SELECT 1 FROM events WHERE sid=? AND actor='user' AND seq<? LIMIT 1", (sid, seq)).fetchone():
+            title = body.strip().splitlines()[0] if body.strip() else (staged[0]["name"] if staged else attachments[0].name)
+            self.db.execute("UPDATE sessions SET title=? WHERE id=?", (title[:36], sid))
+        return seq
+
+    def chat_message(self, sid, provider, body, client_id, draft, attachments):
+        if provider not in CHAT_JOBS:
+            raise ValueError("请选择 Gemini 或 GPT")
+        with self.db:
+            session = self.session(sid)
+            sent = self.rows("SELECT seq FROM events WHERE sid=? AND client_id=?", sid, client_id)
+            if sent:
+                return sent[0]["seq"], False
+            if not session[provider]:
+                raise ValueError("请先选择对话模型")
+            seq = self.record_prompt(session, body, {"direct": True, "recipient": provider}, client_id, draft, attachments)
+            self.enqueue(session, CHAT_JOBS[provider], {"message_seq": seq, "read_only": True})
+        return seq, True
+
     def _message(self, sid, body, client_id, draft=None, attachments=()):
         session = self.session(sid)
         sent = self.rows("SELECT seq FROM events WHERE sid=? AND client_id=?", sid, client_id)
         if sent:
             return sent[0]["seq"]
         self.db.execute("UPDATE sessions SET paused_work=NULL WHERE id=? AND paused_work IS NOT NULL", (sid,))
-        staged = self.inputs.metadata(draft) if draft else []
-        if not body.strip() and not attachments and not staged:
-            raise ValueError("请输入消息或添加附件")
         rev = session["revision"] + 1
-        seq = self.event(sid, "message", "user", body, {"revision": rev}, client_id)
-        self.inputs.commit_message(seq, draft, attachments)
-        title = session["title"]
-        if rev == 1 and title == "新会话":
-            title = (body.strip().splitlines()[0] if body.strip() else
-                     (staged[0]["name"] if staged else attachments[0].name))[:36]
-        self.db.execute("UPDATE sessions SET revision=?,title=? WHERE id=?", (rev, title, sid))
+        seq = self.record_prompt(session, body, {"revision": rev}, client_id, draft, attachments)
+        self.db.execute("UPDATE sessions SET revision=? WHERE id=?", (rev, sid))
         self.db.execute("UPDATE jobs SET status='obsolete' WHERE sid=? AND kind IN ('plan','proposal','goal_check','side') "
                         "AND status NOT IN ('done','obsolete','stopped')", (sid,))
         if session["mode"] in ("plan", "side"):
@@ -545,8 +580,8 @@ class Store:
             if not jobs:
                 return 0
             session = self.session(sid)
-            checkpoint = {field: session[field] for field in ("mode", "goal_status", "planned")}
-            checkpoint["jobs"] = [{"id": j["id"], "status": j["status"]} for j in jobs]
+            checkpoint = session["paused_work"] or {field: session[field] for field in ("mode", "goal_status", "planned")}
+            checkpoint.setdefault("jobs", []).extend({"id": j["id"], "status": j["status"]} for j in jobs)
             self.db.execute("UPDATE sessions SET paused_work=? WHERE id=?", (pack(checkpoint), sid))
             self.db.executemany("UPDATE jobs SET approval_epoch=approval_epoch+1 WHERE id=?", [(j["id"],) for j in jobs])
         else:
@@ -688,9 +723,10 @@ class Store:
             self.event(sid, "models", "system", "已更新模型设置", {**models, "efforts": selected,
                                                             "daybreak": old["daybreak"] if daybreak is None else daybreak})
 
-    def switch_backend(self, sid, backend, models, efforts=None):
-        if backend not in ("api", "clients") or not all(models.get(p) for p in ("gemini", "openai")):
-            raise ValueError("请选择执行方式和对应的两个模型")
+    def switch_backend(self, sid, backend, models, efforts=None, *, recipient=None):
+        required = (recipient,) if recipient else CHAT_JOBS
+        if backend not in ("api", "clients") or not all(models.get(p) for p in required):
+            raise ValueError("请选择执行方式和对应的模型")
         with self.db:
             session = self.session(sid)
             if session["backend"] == backend:
@@ -817,6 +853,8 @@ class Store:
         for call in self.rows("SELECT * FROM calls WHERE child=? AND result IS NULL", job["id"]):
             self.tool_result(call, result)
         kind = "artifact" if job["kind"] == "section" else "message"
+        if job["kind"] in CHAT_JOBS.values():
+            result = dict(result, reply_to=job["payload"]["message_seq"], recipient=PROVIDERS[job["kind"]])
         self.event(job["sid"], kind if success else "failure", PROVIDERS[job["kind"]], text,
                    {"job": job["id"], "model": job["model"], "effort": job["effort"],
                     "backend": job.get("backend"), "kind": job["kind"], "basis": job["basis"], **result})
@@ -825,7 +863,8 @@ class Store:
                                       "WHERE id=? AND mode='goal' AND goal_status='active'", (text, job["sid"]))
             if blocked.rowcount:
                 self.stop_jobs(job["sid"])
-        self.wake(job["sid"])
+        if job["kind"] not in CHAT_JOBS.values():
+            self.wake(job["sid"])
 
     def pending_work(self, sid):
         return self.db.execute(
@@ -852,7 +891,8 @@ class Store:
                 self.db.execute("UPDATE jobs SET status='ready' WHERE id=?", (job["id"],))
         session = self.session(sid)
         if session["mode"] == "goal" and session["goal_status"] == "active" and not self.db.execute(
-                "SELECT 1 FROM jobs WHERE sid=? AND status IN ('ready','running','needs_key','waiting') LIMIT 1", (sid,)).fetchone():
+                "SELECT 1 FROM jobs WHERE sid=? AND kind NOT IN ('gemini_chat','gpt_chat') "
+                "AND status IN ('ready','running','needs_key','waiting') LIMIT 1", (sid,)).fetchone():
             self.enqueue(session, "goal_check", {"revision": session["revision"]})
 
     def task_summaries(self, sid, *, with_output=True):

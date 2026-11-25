@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 import sys
 import tempfile
@@ -57,6 +58,58 @@ class WorkflowTests(unittest.TestCase):
             self.store.apply_plan(old, {"engineering": text}, "")
         self.assertEqual(self.store.session(self.sid)["revision"], 2)
         self.assertEqual(len(self.store.snapshot(self.sid)["events"]), 2)
+
+    def test_direct_questions_keep_their_own_prompt_and_the_ongoing_plan(self):
+        engine = Engine(self.store, self.base, self.project)
+        sid = self.sid
+        request = "请检查 pyproject.toml 声明的 Python 版本。"
+        engine.submit(sid, request, new_id())
+        planner = self.start_job("plan")
+        first, second = "你能解释这条版本要求吗？", "如何用命令查看当前版本？"
+        client_id = new_id()
+        seq, _ = engine.submit(sid, first, client_id, recipient="gemini")
+        self.assertEqual(engine.submit(sid, first, client_id, recipient="gemini"), (seq, False))
+        engine.submit(sid, second, new_id(), recipient="gemini")
+        session = self.store.session(sid)
+        jobs = self.store.rows("SELECT *, 'api' AS backend FROM jobs WHERE sid=? ORDER BY rowid", sid)
+        self.assertEqual([j["kind"] for j in jobs], ["plan", "gemini_chat", "gemini_chat"])
+        self.assertTrue(all(j["guide_seq"] == 0 for j in jobs))
+        self.assertEqual((session["revision"], session["planned"]), (1, 0))
+        planning = json.loads(engine.turn_input(jobs[0], session, [])[2])
+        self.assertEqual(planning["待处理用户消息"], [request])
+        self.assertEqual([e["text"] for e in planning["共享记录"]], [request])
+        first_input = json.loads(engine.chat_input(jobs[1], session)[2])
+        self.assertEqual(first_input["本次提问"], first)
+        self.assertNotIn(second, str(first_input))
+        version = (self.project / "pyproject.toml").read_text(encoding="utf-8").split("requires-python = ")[1].splitlines()[0]
+        with self.store.db:
+            self.store.finish(jobs[1], version, {})
+        second_input = json.loads(engine.chat_input(jobs[2], session)[2])
+        self.assertEqual(second_input["本次提问"], second)
+        self.assertIn(version, [e["text"] for e in second_input["共享记录"]])
+        branch = self.store.fork_session(sid, "")
+        copied = self.store.snapshot(branch["id"])["events"]
+        question = next(e for e in copied if e["body"] == first)
+        answer = next(e for e in copied if e["actor"] == "gemini" and e["kind"] == "message")
+        self.assertEqual((answer["meta"]["reply_to"], answer["meta"]["model"]), (question["seq"], session["gemini"]))
+        engine.store.apply_plan(planner, {"engineering": request, "engineering_mode": "inspect"}, "")
+        self.assertEqual(self.store.session(sid)["brief"]["engineering"], request)
+
+    def test_direct_chat_during_a_pause_keeps_the_resume_checkpoint(self):
+        engine = Engine(self.store, self.base, self.project)
+        sid = self.sid
+        engine.submit(sid, "请规划项目的语法检查。", new_id())
+        with self.store.db:
+            self.store.stop_jobs(sid, user_requested=True)
+        paused = self.store.session(sid)["paused_work"]
+        engine.submit(sid, "这个项目用什么语言？", new_id(), recipient="gemini")
+        self.assertEqual(self.store.session(sid)["paused_work"], paused)
+        with self.store.db:
+            self.store.stop_jobs(sid, user_requested=True)
+        self.assertEqual(len(self.store.session(sid)["paused_work"]["jobs"]), 2)
+        self.assertEqual(engine.continue_session(sid), 2)
+        self.assertEqual([j["kind"] for j in self.store.active_jobs(sid)], ["plan", "gemini_chat"])
+        self.assertEqual(self.store.session(sid)["planned"], paused["planned"])
 
     def test_plan_revision_requires_explicit_implementation(self):
         store = self.store

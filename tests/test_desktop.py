@@ -196,6 +196,48 @@ class DesktopTests(unittest.TestCase):
         self.assertIn("|---|---|", view.toPlainText())
         self.assertNotIn("<table>", markdown(example))
 
+    def test_recipient_layout_drafts_and_history_navigation(self):
+        scratch = ROOT / ".work/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as folder:
+            root = Path(folder)
+            settings = QSettings(str(root / "desktop.ini"), QSettings.Format.IniFormat)
+            with open_engine(root, root / "data") as engine:
+                window = Window(engine, settings)
+                window.show()
+                try:
+                    window.resize(1440, 900)
+                    self.app.processEvents()
+                    self.assertEqual(window.header.height(), 46)
+                    self.assertEqual(window.composer.width(), 768)
+                    self.assertEqual(window.sidebar.width(), 275)
+                    window.editor.setPlainText("能帮我解释同一会话的消息记录吗？")
+                    QTest.mouseClick(window.recipient_button, Qt.MouseButton.LeftButton)
+                    menu = self.app.activePopupWidget()
+                    choice = next(a for a in menu.actions() if a.text() == "Gemini")
+                    QTest.mouseClick(menu, Qt.MouseButton.LeftButton, pos=menu.actionGeometry(choice).center())
+                    self.assertIn("消息记录", window.editor.toPlainText())
+                    QTest.keyClick(window.editor, Qt.Key.Key_Return)
+                    sid = window.sid
+                    self.assertEqual(window.recipient, "gemini")
+                    self.assertEqual([j["kind"] for j in window.state["tasks"]], ["gemini_chat"])
+                    window.editor.setPlainText("待发送的追问")
+                    window.new_standalone()
+                    self.assertEqual(window.recipient, "")
+                    window.go_back.click()
+                    self.assertEqual((window.sid, window.recipient, window.editor.toPlainText()), (sid, "gemini", "待发送的追问"))
+                    window.resize(700, 490)
+                    window.select_recipient("")
+                    self.app.processEvents()
+                    for control in (window.recipient_button, window.compact_models, window.send_button):
+                        self.assertTrue(control.isVisible())
+                        self.assertTrue(window.composer.rect().contains(control.mapTo(window.composer, control.rect().center())))
+                    self.assertEqual(window.backend_box.itemText(1), "本机客户端")
+                    window.go_forward.click()
+                    self.assertIsNone(window.sid)
+                finally:
+                    window.close()
+
     def test_conversation_and_model_choices_survive_reopening(self):
         scratch = ROOT / ".work" / "tests"
         scratch.mkdir(parents=True, exist_ok=True)
@@ -203,6 +245,7 @@ class DesktopTests(unittest.TestCase):
             project = Path(temp)
             home = project / ".mixharness"
             settings = QSettings(str(project / "desktop.ini"), QSettings.Format.IniFormat)
+            settings.setValue("theme", "light")
             with open_engine(project, home) as engine:
                 window = Window(engine, settings)
                 window.show()
@@ -251,7 +294,7 @@ class DesktopTests(unittest.TestCase):
                 dialog.reject()
                 window.toggle_theme()
                 rgb = self.app.palette().color(QPalette.ColorRole.Window)
-                self.assertEqual((rgb.red(), rgb.green(), rgb.blue()), (22, 22, 22))
+                self.assertEqual(rgb.name(), "#181818")
                 window.editor.setPlainText("补充说明版本来源。")
                 window.new_session(directory=ROOT)
                 self.assertIsNone(window.sid)

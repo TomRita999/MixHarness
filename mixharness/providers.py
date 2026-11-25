@@ -89,6 +89,7 @@ FUNCTIONS = {
     "draft_section": (WritingTask, "并行起草已有足够资料的独立章节。"),
 }
 TOOLS = {
+    "gemini_chat": [], "gpt_chat": [],
     "side": ["list_files", "read_file", "read_artifact"],
     "proposal": ["list_files", "read_file", "read_artifact", "ask_clarification"],
     "goal_check": ["list_files", "read_file", "read_artifact", "assess_goal"],
@@ -99,6 +100,8 @@ TOOLS = {
 }
 
 PROMPTS = {
+    "gemini_chat": "你是 Gemini，正在和用户直接对话。根据共享聊天记录、附件和本次提问自然回答，必要时直接向用户追问。用普通文字或 Markdown 回复。",
+    "gpt_chat": "你是 GPT，正在和用户直接对话。根据共享聊天记录、附件和本次提问自然回答，必要时直接向用户追问。用普通文字或 Markdown 回复。",
     "side": "你在独立的侧边聊天中。将继承的对话当作背景，只回答用户最后提出的问题。需要时只读查看项目，直接用中文回答。",
     "proposal": "你正在计划模式中。只读检查项目，和用户讨论可执行的步骤、验收条件和必要的取舍。"
                 "先了解项目再写计划。遇到决定方案的关键信息缺口时用 ask_clarification 提问。用中文给出计划，等待用户选择执行。",
@@ -133,7 +136,7 @@ interpretation 面向用户，简述你理解的交付要求和待确认的前�
 
 def instructions(job):
     text = PROMPTS[job["kind"]]
-    if job.get("payload", {}).get("read_only"):
+    if job.get("payload", {}).get("read_only") and job["kind"] not in ("gemini_chat", "gpt_chat"):
         text += "\n本次只读核对已有资料。写明所查文件和支持结论的配置项、函数名或行号。"
     return text
 
@@ -175,7 +178,10 @@ async def google_turn(key, job, context, results, preview):
         inputs.append({"type": "user_input", "content": content})
         if job["cursor"]:
             options["previous_interaction_id"] = job["cursor"]
-        stream = await client.interactions.create(**options, tools=declarations(job["kind"]), input=inputs, stream=True)
+        tools = declarations(job["kind"])
+        if tools:
+            options["tools"] = tools
+        stream = await client.interactions.create(**options, input=inputs, stream=True)
         interaction_id = None
         async with stream:
             async for event in stream:
@@ -214,6 +220,8 @@ async def openai_turn(key, job, context, results, preview, register_steer):
     functions = [dict(tool, strict=False) for tool in declarations(job["kind"], job.get("payload"))]
     options = {"model": job["model"], "input": inputs, "instructions": instructions(job),
                "store": True, "tools": [*functions, {"type": "web_search"}]}
+    if job["kind"] == "gpt_chat":
+        options.pop("tools")
     if job["effort"]:
         options["reasoning"] = {"effort": job["effort"]}
     if job["cursor"]:

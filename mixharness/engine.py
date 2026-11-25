@@ -15,7 +15,7 @@ from .catalog import ModelCatalog
 from .clients import CLIENTS, ClientCatalog, CodexTurnError, private_directory, workflow_turn
 from .providers import FUNCTIONS, tool_names, google_turn, openai_turn
 from .reasoning import api_levels, group_for, model_available, resolve_choice, select_daybreak_model
-from .store import PROVIDERS, Store, Superseded, accepts_guidance, new_id, now, pack
+from .store import CHAT_JOBS, PROVIDERS, Store, Superseded, accepts_guidance, new_id, now, pack
 
 
 @contextmanager
@@ -121,13 +121,21 @@ class Engine:
             raise ValueError(model + " 不支持思考强度 " + effort)
         return model, effort or ""
 
-    def resolve_models(self, backend, models, efforts):
-        choices = {p: self.model_choice(backend, p, models[p], (efforts or {}).get(p)) for p in CLIENTS}
+    def resolve_models(self, backend, models, efforts, *, recipient=None):
+        if recipient and recipient not in CHAT_JOBS:
+            raise ValueError("请选择 Gemini 或 GPT")
+        choices = {}
+        for provider in CLIENTS:
+            model = models[provider]
+            if backend == "clients" and recipient and provider != recipient and model not in self.client_catalogs[provider].labels:
+                choices[provider] = ("", "")
+            else:
+                choices[provider] = self.model_choice(backend, provider, model, (efforts or {}).get(provider))
         return {p: m for p, (m, _) in choices.items()}, {p: e for p, (_, e) in choices.items()}
 
     def create_session(self, gemini, openai, directory=None, *, project_id=None, standalone=False, backend="api",
-                       efforts=None, permission="ask", speed="standard", mode="default", daybreak=False):
-        models, efforts = self.resolve_models(backend, {"gemini": gemini, "openai": openai}, efforts)
+                       efforts=None, permission="ask", speed="standard", mode="default", daybreak=False, recipient=None):
+        models, efforts = self.resolve_models(backend, {"gemini": gemini, "openai": openai}, efforts, recipient=recipient)
         self.check_daybreak(backend, models["openai"], daybreak)
         self.validate_access(backend, models["openai"], permission, speed)
         sid = new_id()
@@ -307,17 +315,21 @@ class Engine:
         return {alias: workspace.check_commands(root / "mixharness.toml", self.commands)
                 for alias, root in sources.folders.items()}
 
-    def submit(self, sid, text, client_id, *, draft=None, attachments=(), intent="auto"):
+    def submit(self, sid, text, client_id, *, draft=None, attachments=(), intent="auto", recipient=None):
         if len(text) > 120000:
             raise ValueError("单条消息上限为 120,000 字符")
         store = self.store
+        if recipient:
+            result = store.chat_message(sid, recipient, text, client_id, draft, attachments)
+            self.notify(sid)
+            return result
         with store.db:
             duplicate = store.rows("SELECT seq FROM events WHERE sid=? AND client_id=?", sid, client_id)
             if duplicate:
                 return duplicate[0]["seq"], False
             resumed = intent != "revise" and store.continue_jobs(sid)
-            jobs = store.active_jobs(sid)
-            guide = resumed or intent == "steer" or intent == "auto" and any(accepts_guidance(j) for j in jobs)
+            jobs = [j for j in store.active_jobs(sid) if j["kind"] not in CHAT_JOBS.values()]
+            guide = bool(resumed and jobs) or intent == "steer" or intent == "auto" and any(accepts_guidance(j) for j in jobs)
             if (resumed and intent == "auto" and text.strip().casefold() in ("继续", "继续任务", "continue")
                     and not attachments and not (draft and store.inputs.metadata(draft))):
                 guide = False
@@ -361,15 +373,19 @@ class Engine:
         self.store.set_models(sid, **models, efforts=efforts)
         self.notify(sid)
 
-    def switch_backend(self, sid, backend, models, efforts=None):
-        models, efforts = self.resolve_models(backend, models, efforts)
+    def switch_backend(self, sid, backend, models, efforts=None, *, recipient=None):
+        if recipient and any(j["kind"] != CHAT_JOBS.get(recipient) for j in self.store.active_jobs(sid)):
+            recipient = None
+        models, efforts = self.resolve_models(backend, models, efforts, recipient=recipient)
         if backend == "clients":
             for provider, catalog in self.client_catalogs.items():
+                if recipient and provider != recipient and not models[provider]:
+                    continue
                 if models.get(provider) not in catalog.labels:
                     raise ValueError(catalog.error or catalog.view()["client"] + " 没有提供所选模型")
         if self.store.session(sid)["backend"] != backend:
             self.check_daybreak(backend, models["openai"], False)
-        self.store.switch_backend(sid, backend, models, efforts)
+        self.store.switch_backend(sid, backend, models, efforts, recipient=recipient)
         self.notify(sid)
 
     def retry(self, sid, jid, *, read_only=False):
@@ -381,14 +397,16 @@ class Engine:
         if read_only and job["kind"] not in ("engineering", "verification"):
             raise ValueError("只读重试适用于调研和验证任务")
         s = self.store.session(sid)
-        if (s["mode"] == "plan") != (job["kind"] == "proposal"):
+        chat = job["kind"] in CHAT_JOBS.values()
+        if not chat and (s["mode"] == "plan") != (job["kind"] == "proposal"):
             raise ValueError("当前模式无法重试这项任务")
-        if (s["mode"] == "side") != (job["kind"] == "side"):
+        if not chat and (s["mode"] == "side") != (job["kind"] == "side"):
             raise ValueError("当前模式无法重试这项任务")
         if job["kind"] == "goal_check" and (s["mode"] != "goal" or s["goal_status"] != "active"):
             raise ValueError("请先继续目标，再核对进度")
         with self.store.db:
-            self.store.db.execute("UPDATE sessions SET paused_work=NULL WHERE id=? AND paused_work IS NOT NULL", (sid,))
+            if not chat:
+                self.store.db.execute("UPDATE sessions SET paused_work=NULL WHERE id=? AND paused_work IS NOT NULL", (sid,))
             if read_only and not job["payload"].get("read_only"):
                 self.store.db.execute("UPDATE jobs SET payload=?,cursor=NULL,seen=0 WHERE id=?",
                                       (pack(dict(job["payload"], read_only=True)), jid))
@@ -608,7 +626,7 @@ class Engine:
                         task.cancel()
                 ready = self.store.rows(
                     "SELECT j.*,s.backend FROM jobs j JOIN sessions s ON s.id=j.sid "
-                    "WHERE j.status IN ('ready','needs_key') AND (j.kind IN ('plan','goal_check') OR s.planned=s.revision) "
+                    "WHERE j.status IN ('ready','needs_key') AND (j.kind IN ('plan','goal_check','gemini_chat','gpt_chat') OR s.planned=s.revision) "
                     "ORDER BY (j.kind='plan') DESC,j.rowid"
                 )
                 for job in ready:
@@ -618,6 +636,10 @@ class Engine:
                     if job["backend"] == "api" and not self.keys[provider]:
                         if job["status"] != "needs_key":
                             self.set_status(job, "needs_key")
+                        continue
+                    if job["kind"] in CHAT_JOBS.values() and self.store.db.execute(
+                            "SELECT 1 FROM jobs WHERE sid=? AND kind IN ('gemini_chat','gpt_chat') AND status='running'",
+                            (job["sid"],)).fetchone():
                         continue
                     if job["kind"] == "verification" and self.store.rows(
                         "SELECT id FROM jobs WHERE sid=? AND kind='engineering' AND status IN ('ready','running')",
@@ -655,11 +677,13 @@ class Engine:
     async def gate(self, job):
         while True:
             session = self.store.guard(job)
-            if job["kind"] in ("plan", "goal_check") or session["revision"] == session["planned"]:
+            if job["kind"] in ("plan", "goal_check", *CHAT_JOBS.values()) or session["revision"] == session["planned"]:
                 return session
             await asyncio.sleep(0.1)
 
     def turn_input(self, job, session, calls):
+        if job["kind"] in CHAT_JOBS.values():
+            return self.chat_input(job, session)
         # 只有产生此轮工具调用的 API 和模型可以接收原来的调用编号。
         resume = ((calls or (not self.settings.context_window and not session["context_after"])) and job["cursor"] is not None
                   and job["backend"] == job["cursor_backend"] == "api"
@@ -671,11 +695,16 @@ class Engine:
         sid = job["sid"]
         entries = self.store.rows("SELECT seq,kind,actor,body,meta FROM events WHERE sid=? AND seq>? ORDER BY seq",
                                   sid, request["seen"])
+        # 正在执行的工作只在用户下一次提交协作要求后读入期间的直聊。
+        last_instruction = self.store.db.execute("SELECT max(seq) FROM events WHERE sid=? AND actor='user' "
+                                                "AND json_extract(meta,'$.recipient') IS NULL", (sid,)).fetchone()[0] or 0
+        entries = [e for e in entries if not e["meta"].get("recipient") or e["seq"] < last_instruction]
         # 当前需求始终完整传入，较长的输出可通过持久化成果按需取回。
         history = [{"seq": e["seq"], "from": e["actor"], "type": e["kind"],
                     "text": e["body"] if e["actor"] == "user" else e["body"][:4200], "details": e["meta"]}
                    for e in entries if e["seq"] > session["context_after"]]
-        works = self.store.rows("SELECT id,kind,status,title,error FROM jobs WHERE sid=? AND status!='obsolete'", sid)
+        works = self.store.rows("SELECT id,kind,status,title,error FROM jobs WHERE sid=? AND status!='obsolete' "
+                                "AND kind NOT IN ('gemini_chat','gpt_chat')", sid)
         assets = self.store.rows("SELECT id,name,digest,meta FROM artifacts WHERE sid=? ORDER BY rowid DESC LIMIT 80", sid)
         draft = self.store.rows("SELECT draft FROM jobs WHERE sid=? AND kind='report' AND draft!='' AND status NOT IN ('obsolete','stopped') "
                                 "ORDER BY rowid DESC LIMIT 1", sid)
@@ -726,6 +755,34 @@ class Engine:
             retained = {e["seq"] for e in json.loads(text)["共享记录"]}
             request["images"] = self.image_inputs([items for seq, items in attached.items() if seq == latest or seq in retained])
         return request, results, text, seen
+
+    def chat_input(self, job, session):
+        sid, seq = job["sid"], job["payload"]["message_seq"]
+        prompt = self.store.one("SELECT body FROM events WHERE sid=? AND seq=?", sid, seq)["body"]
+        entries = self.store.rows("SELECT seq,actor,body,json_extract(meta,'$.model') AS model "
+                                  "FROM events WHERE sid=? AND kind='message' AND seq>? "
+                                  "AND (seq<? OR json_extract(meta,'$.reply_to')<?) ORDER BY seq",
+                                  sid, session["context_after"], seq, seq)
+        attached = self.store.inputs.for_session(sid, min(seq - 1, session["context_after"]))
+        authors = {"user": "用户", "openai": "GPT", "gemini": "Gemini"}
+        history = [{"seq": e["seq"], "from": authors.get(e["actor"], e["actor"]), "text": e["body"],
+                    **({"model": e["model"]} if e["model"] else {})} for e in entries]
+        for entry in history:
+            if entry["seq"] in attached:
+                entry["附件"] = self.describe_inputs(attached[entry["seq"]])
+        context = {"共享记录": history, "本次提问": prompt}
+        if session["context_summary"]:
+            context["历史摘要"] = session["context_summary"]
+        if seq in attached:
+            context["当前消息附件"] = self.describe_inputs(attached[seq])
+        if job["payload"].get("interrupted_turn"):
+            context["中断前的进度"] = job["payload"]["interrupted_turn"]
+        _, text = shared_input(context, [], self.settings.context_window)
+        kept = [e["seq"] for e in json.loads(text)["共享记录"]]
+        images = self.image_inputs([attached[i] for i in [*kept, seq] if i in attached])
+        request = dict(job, cursor=None, images=images, permission="ask", speed=session["speed"],
+                       daybreak=session["daybreak"], context_window=self.settings.context_window)
+        return request, [], text, seq
 
     def route_is_current(self, job):
         return self.store.db.execute(
@@ -849,6 +906,8 @@ class Engine:
                     self.store.db.execute("UPDATE jobs SET status=? WHERE id=?", (status, jid))
                     self.store.event(sid, "progress", "gemini", "等待工程或验证结果" if status == "waiting"
                                      else "已收到 GPT 的任务结果，正在更新报告", {"job": jid})
+                elif job["kind"] in CHAT_JOBS.values():
+                    self.store.finish(job, reply.text, {})
                 else:
                     meta = {"kind": job["kind"], "basis": job["basis"], "sources": reply.sources}
                     if job["kind"] == "verification":

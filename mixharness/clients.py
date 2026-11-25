@@ -17,7 +17,7 @@ from .attachments import Attachment, MAX_REFERENCE, image_parts
 from .client_rpc import ClientError, Rpc, executable
 from .providers import FUNCTIONS, PROMPTS, Plan, Turn, declarations, instructions, tool_names
 from .reasoning import antigravity_groups, model_available, model_group
-from .store import PROVIDERS, new_id, pack
+from .store import CHAT_JOBS, PROVIDERS, new_id, pack
 
 
 CLIENTS = {"gemini": "antigravity", "openai": "codex"}
@@ -427,6 +427,8 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                 engine.set_activity(job, "Codex 已开始生成")
             elif method == "item/agentMessage/delta":
                 fragments.append(params["delta"])
+                if job["kind"] == "gpt_chat":
+                    engine.previews[job["id"]] = "".join(fragments)
             elif method == "item/completed" and params["item"]["type"] == "agentMessage":
                 final = params["item"]["text"]
             elif method == "item/completed" and params["item"]["type"] == "plan":
@@ -506,21 +508,26 @@ class PlanQuestion(Exception):
 async def antigravity_turn(engine, job, cwd, prompt):
     # 一个主会话只关联一条独立存储的 Antigravity 会话；并行的报告和章节顺序续接。
     sid, model, permission = job["sid"], job["model"], job["permission"]
+    direct = job["kind"] == "gemini_chat"
     profile = private_directory(engine.home, sid)
-    async with engine.client_locks.setdefault(sid, asyncio.Lock()), connection("antigravity", private=profile, permission=permission) as rpc:
+    if direct:
+        profile = str(Path(profile) / "chat")
+    lock = asyncio.Lock() if direct else engine.client_locks.setdefault(sid, asyncio.Lock())
+    async with lock, connection("antigravity", private=profile, permission=permission) as rpc:
         info = await rpc.initialize("antigravity")
         if job.get("images") and not info.get("agentCapabilities", {}).get("promptCapabilities", {}).get("image"):
             raise ClientError("当前 Antigravity 客户端不支持图片输入")
         rpc.handle_request = lambda method, params: client_approval(engine, job, method, params)
-        bound = engine.store.session(sid)["antigravity_session"]
+        bound = None if direct else engine.store.session(sid)["antigravity_session"]
         spec = {"cwd": str(cwd), "mcpServers": []}
         if bound:
             state = await rpc.request("session/load", dict(spec, sessionId=bound))
         else:
             state = await rpc.request("session/new", spec)
             bound = state["sessionId"]
-            with engine.store.db:
-                engine.store.db.execute("UPDATE sessions SET antigravity_session=? WHERE id=?", (bound, sid))
+            if not direct:
+                with engine.store.db:
+                    engine.store.db.execute("UPDATE sessions SET antigravity_session=? WHERE id=?", (bound, sid))
         if permission != "full":
             mode = "auto" if permission == "auto" else "default"
             if state.get("modes", {}).get("currentModeId") != mode:
@@ -538,6 +545,8 @@ async def antigravity_turn(engine, job, cwd, prompt):
             engine.set_activity(job, "Antigravity 正在处理请求")
             if update.get("sessionUpdate") == "agent_message_chunk":
                 fragments.append(update["content"].get("text", ""))
+                if job["kind"] == "gemini_chat":
+                    engine.previews[job["id"]] = "".join(fragments)
             elif update.get("sessionUpdate") in ("tool_call", "tool_call_update"):
                 key = update["toolCallId"]
                 if update.get("kind") == "read":
@@ -564,6 +573,13 @@ async def antigravity_turn(engine, job, cwd, prompt):
 
 async def workflow_turn(engine, job, context, cwd):
     kind, sid = job["kind"], job["sid"]
+    if kind in CHAT_JOBS.values():
+        prompt = PROMPTS[kind] + "\n共享会话\n" + context
+        if kind == "gemini_chat":
+            text = await antigravity_turn(engine, job, cwd, prompt)
+        else:
+            text = await codex_turn(engine, job, cwd, prompt, None)
+        return Turn(new_id(), text)
     if kind == "proposal":
         prompt = PROMPTS[kind] + " 必要时使用客户端的提问功能。\n共享会话\n" + context
         try:
