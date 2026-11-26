@@ -1133,21 +1133,33 @@ class Engine:
                 source, self.home / "runs" / sid, commands[args["name"]], invocation=invocation,
                 project=originals.folders[alias], python=self.check_python, subdirectory=subdirectory, isolated_compile=isolated_compile)
             result.update(source=version, folder=alias)
+        elif name == "run_command":
+            alias = args["folder"] or next(iter(originals.folders))
+            if alias not in originals.folders:
+                raise ValueError("请选择当前项目的来源文件夹")
+            cwd = originals.folders[alias]
+            detail = str(cwd) + "\n" + args["command"]
+            await self.authorize_tool(job, call, "执行命令", detail, routine=False)
+            self.set_activity(job, "正在执行命令")
+            result = await workspace.run_shell_command(cwd, args["command"])
+            result["folder"] = alias
         await self.gate(job)
         with st.db:
             if name == "read_file":
                 st.event(sid, "progress", PROVIDERS[job["kind"]], "已读取 " + args["path"],
                          {"job": jid, "files_read": [args["path"]], "source": "MixHarness"})
-            if name in ("run_check", "save_section", "edit_file") or (name == "read_file" and job["kind"] == "verification"):
+            if name in ("run_check", "run_command", "save_section", "edit_file") or (name == "read_file" and job["kind"] == "verification"):
                 if name == "save_section":
                     title, content = args["title"] + ".md", args["markdown"]
                 elif name == "run_check":
                     title, content = args["name"] + ".log", result["output"]
+                elif name == "run_command":
+                    title, content = "command.log", result["output"]
                 else:
                     title = args["path"]
                     content = args["content"] if name == "edit_file" else result["text"]
                 meta = {"kind": name, "basis": job["basis"]}
-                for field in ("source", "folder", "sha256", "exit_code", "error", "argv", "log", "bytes"):
+                for field in ("source", "folder", "sha256", "exit_code", "error", "argv", "command", "cwd", "log", "bytes"):
                     if field in result:
                         meta[field] = result[field]
                 if "source" in job["payload"]:

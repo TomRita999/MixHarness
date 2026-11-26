@@ -1,0 +1,4 @@
+[checks]
+python-tests = ["@python", "-m", "unittest", "discover", "-s", "tests", "-v"]
+build-desktop = ["@python", "packaging/build_desktop.py"]
+check-desktop = ["@python", "packaging/check_desktop.py"]

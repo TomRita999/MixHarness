@@ -376,7 +376,7 @@ async def codex_turn(engine, job, cwd, prompt, schema):
     mode = job["permission"]
     speed = job["speed"]
     proposal = job["kind"] == "proposal"
-    readonly = (is_dot_model(model) or proposal or job["kind"] in ("goal_check", "side")
+    readonly = (proposal or job["kind"] in ("goal_check", "side")
                 or job["payload"].get("review") or job["payload"].get("read_only"))
     async with connection("codex") as rpc:
         await rpc.initialize("codex", experimental=True)
@@ -587,9 +587,6 @@ def client_prompt(job, context):
     extra = ""
     if kind in CHAT_JOBS.values():
         extra += "\n将面向用户的文字或 Markdown 写在 text 中。"
-    if kind in ("engineering", "verification") and is_dot_model(job["model"]) and not job["payload"].get("read_only"):
-        extra += ("\nCodex 在只读环境中分析项目。需要修改文件或运行验证时，在 calls 中提出已列出的 MixHarness 工具请求。"
-                  "MixHarness 按当前会话权限审批并执行。收到工具回执后再报告实际结果。")
     prompt = (instructions(job) + "\n请严格返回符合下方 JSON Schema 的 JSON 对象。"
               "需要调用 MixHarness 工具时，在 calls 中填写工具名与 JSON 字符串 arguments，结果会在下一轮返回。"
               + extra + "\n输出格式\n" + pack(schema) + "\n可用工具\n" + pack(tools) + "\n共享会话\n" + context)

@@ -43,7 +43,7 @@ def check_command(argv, python, log):
 
 def main(args=None):
     run, snapshot, seconds, python, subdirectory, *argv = sys.argv[1:] if args is None else args
-    run_dir, source, timeout = Path(run), Path(snapshot), int(seconds)
+    run_dir, source, timeout = Path(run), Path(snapshot), int(seconds) or None
     receipt = run_dir / "result.json"
     with FileLock(run_dir / "execution.lock"):
         if receipt.exists():

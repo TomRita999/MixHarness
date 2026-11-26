@@ -267,7 +267,7 @@ def clear_git_context(environment):
             del environment[key]
 
 
-async def run_check(source, runs, argv, timeout=180, invocation=None, project=None, python=None, subdirectory=".", isolated_compile=False):
+async def run_check(source, runs, argv, timeout=None, invocation=None, project=None, python=None, subdirectory=".", isolated_compile=False):
     run_dir = runs / (invocation or new_id())
     run_dir.mkdir(parents=True, exist_ok=True)
     receipt = run_dir / "result.json"
@@ -282,7 +282,7 @@ async def run_check(source, runs, argv, timeout=180, invocation=None, project=No
         python = "@harness-compile"
     elif not python:
         python = str(venv) if venv.is_file() else ("" if frozen else sys.executable)
-    command = [sys.executable, runner, str(run_dir), str(source), str(timeout), python, subdirectory, *argv]
+    command = [sys.executable, runner, str(run_dir), str(source), str(timeout or 0), python, subdirectory, *argv]
     env = {k: v for k, v in os.environ.items() if not any(word in k.upper() for word in ("KEY", "TOKEN", "PASSWORD", "SECRET"))}
     clear_git_context(env)
     launching = asyncio.create_task(asyncio.create_subprocess_exec(
@@ -310,6 +310,37 @@ async def run_check(source, runs, argv, timeout=180, invocation=None, project=No
     if code:
         raise subprocess.CalledProcessError(code, command)
     return json.loads(receipt.read_text(encoding="utf-8"))
+
+
+async def run_shell_command(cwd, command):
+    """在真实项目目录中运行构建、打包或测试命令，支持随时取消。"""
+    env = {k: v for k, v in os.environ.items() if not any(word in k.upper() for word in ("KEY", "TOKEN", "PASSWORD", "SECRET"))}
+    clear_git_context(env)
+    launching = asyncio.create_task(asyncio.create_subprocess_shell(
+        command, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        start_new_session=os.name != "nt",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
+    try:
+        process = await asyncio.shield(launching)
+        raw, _ = await process.communicate()
+    except asyncio.CancelledError:
+        process = await launching
+        if process.returncode is None:
+            if os.name == "nt":
+                killer = await asyncio.create_subprocess_exec("taskkill", "/T", "/F", "/PID", str(process.pid),
+                                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                             creationflags=subprocess.CREATE_NO_WINDOW)
+                await killer.wait()
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        await process.wait()
+        raise
+    output = (raw or b"").decode("utf-8", errors="replace")
+    return {"command": command, "cwd": str(cwd), "exit_code": process.returncode, "output": output}
 
 
 def remove_session_evidence(home, sid, private_profile):

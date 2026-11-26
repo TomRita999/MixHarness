@@ -52,6 +52,11 @@ class RunCheck(Arguments):
     folder: str | None = Field(default=None, description="多目录项目中指定要运行验证的目录名称，省略时使用主目录。")
 
 
+class RunCommand(Arguments):
+    command: str = Field(min_length=1, description="要在项目目录中执行的 shell 命令，例如打包应用、构建项目或运行测试。")
+    folder: str | None = Field(default=None, description="多目录项目中指定工作目录名称，省略时使用主目录。")
+
+
 class ReadArtifact(Arguments):
     id: str
     offset: int = Field(default=0, ge=0)
@@ -98,7 +103,8 @@ FUNCTIONS = {
     "list_files": (Arguments, "列出项目文件与已注册的验证命令。"),
     "read_file": (ReadFile, "读取 UTF-8 文件内容与 SHA256 摘要。"),
     "edit_file": (EditFile, "编辑 UTF-8 文件，传入读取时的摘要与完整新内容（新建文件摘要传空字符串）。"),
-    "run_check": (RunCheck, "在项目快照中运行验证命令，记录退出码、日志与文件版本。"),
+    "run_check": (RunCheck, "在项目快照中运行已注册的验证命令，记录退出码、日志与文件版本。"),
+    "run_command": (RunCommand, "在真实项目目录中执行构建、打包或测试命令，返回退出码与输出日志。"),
     "read_artifact": (ReadArtifact, "按编号读取本会话的报告、日志或章节，offset 为字符偏移。"),
     "request_verification": (Verify, "把需要实测或核实的问题交给 GPT 验证，拿到结果后继续写作。"),
     "save_section": (Section, "保存已完成的报告章节。"),
@@ -110,8 +116,8 @@ TOOLS = {
     "proposal": ["list_files", "read_file", "read_artifact", "ask_clarification"],
     "goal_check": ["list_files", "read_file", "read_artifact", "assess_goal"],
     "supervision": ["read_file", "read_artifact", "submit_supervision"],
-    "engineering": ["list_files", "read_file", "edit_file", "run_check", "read_artifact"],
-    "verification": ["list_files", "read_file", "run_check", "read_artifact"],
+    "engineering": ["list_files", "read_file", "edit_file", "run_check", "run_command", "read_artifact"],
+    "verification": ["list_files", "read_file", "run_check", "run_command", "read_artifact"],
     "report": ["read_artifact", "save_section", "draft_section", "request_verification"],
     "section": ["read_artifact", "save_section", "request_verification"],
 }
