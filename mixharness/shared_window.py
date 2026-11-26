@@ -5,16 +5,12 @@ from dataclasses import dataclass, field
 from time import monotonic
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from .attachments import Attachment, MAX_IMAGE_TOTAL, MAX_ITEMS
+from .computer_use import COMPUTER_READS, COMPUTER_TOOLS, DESKTOP_TARGET, ReadWindow, target_names
 from .store import CHAT_JOBS, new_id, pack
-from .window_native import NativeWindows
-
-
-class ReadWindow(BaseModel):
-    model_config = ConfigDict(extra='forbid', strict=True)
-    share: str = Field(min_length=32, max_length=32, description='当前会话明确共享的窗口编号。')
+from .window_native import NativeWindows, supported
 
 
 class WindowFrame(ReadWindow):
@@ -38,17 +34,20 @@ class KeyWindow(WindowFrame):
     key: Literal['Cmd+A', 'Home', 'End', 'Return', 'Space']
 
 
-WINDOW_FUNCTIONS = {
+SINGLE_WINDOW_FUNCTIONS = {
     'window_capture': (ReadWindow, '读取共享窗口的当前截图，返回画面编号和实际像素尺寸。'),
     'window_click': (ClickWindow, '在截图指定位置按下控件或聚焦文本框。'),
     'window_type': (TypeWindow, '在共享窗口当前的文本控件中输入文字。'),
     'window_scroll': (ScrollWindow, '滚动截图指定位置所属的滚动区域。'),
     'window_key': (KeyWindow, '在共享窗口当前控件中执行指定快捷键。'),
 }
+WINDOW_FUNCTIONS = {**SINGLE_WINDOW_FUNCTIONS,
+                    **{name: (model, help_text) for name, (model, _, help_text) in COMPUTER_TOOLS.items()}}
 OPERATIONS = {'window_capture': 'capture', 'window_click': 'click', 'window_type': 'type_text',
               'window_scroll': 'scroll', 'window_key': 'press_key'}
 LABELS = {'window_capture': '读取画面', 'window_click': '点击', 'window_type': '输入文字',
-          'window_scroll': '滚动', 'window_key': '执行快捷键'}
+          'window_scroll': '滚动', 'window_key': '执行快捷键',
+          **{name: caption for name, (_, caption, _) in COMPUTER_TOOLS.items()}}
 FRAME_LIFETIME = 300
 
 
@@ -59,19 +58,24 @@ def window_tools(kind, payload):
         return []
     if kind != 'engineering' and kind not in CHAT_JOBS.values():
         return []
-    # 直聊的 read_only 限制本机客户端访问项目。窗口权限单独由用户授予。
-    if access == 'view' or (kind == 'engineering' and payload.get('read_only')):
-        return ['window_capture']
-    return list(WINDOW_FUNCTIONS)
+    view = access == 'view' or (kind == 'engineering' and payload.get('read_only'))
+    scope = payload.get('window_scope', 'window')
+    if scope == 'desktop':
+        return list(COMPUTER_READS if view else COMPUTER_TOOLS)
+    if scope == 'window':
+        return ['window_capture'] if view else list(SINGLE_WINDOW_FUNCTIONS)
+    return []
 
 
 @dataclass
 class Observation:
     owner: str
+    target: str
     bounds: list
     width: int
     height: int
     image: dict
+    stamp: str | None
     id: str = field(default_factory=new_id)
     expires: float = field(default_factory=lambda: monotonic() + FRAME_LIFETIME)
 
@@ -85,9 +89,18 @@ class WindowShare:
     id: str = field(default_factory=new_id)
     frame: Observation | None = None
     timer: asyncio.TimerHandle | None = None
+    targets: dict = field(default_factory=dict)
+    revoked: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def scope(self):
+        return 'desktop' if self.target == DESKTOP_TARGET else 'window'
 
     def description(self):
-        return {'share': self.id, 'app': self.app, 'title': self.title, 'access': self.access}
+        result = {'share': self.id, 'app': self.app, 'title': self.title, 'access': self.access}
+        if self.scope == 'desktop':
+            result['scope'] = 'desktop'
+        return result
 
     def clear_frame(self):
         if self.timer is not None:
@@ -100,13 +113,26 @@ class WindowShare:
             self.clear_frame()
         return self.frame if self.frame and self.frame.owner == owner else None
 
+    def remember(self, owner, target, data):
+        picture = Attachment.image('共享画面.jpg', base64.b64decode(data['jpeg'], validate=True))
+        stamp = data['stamp'] if target.startswith('display:') else None
+        frame = Observation(owner, target, data['bounds'], data['width'], data['height'],
+                            {'name': picture.name, 'data': picture.data, 'mime': picture.mime}, stamp)
+        frame.image['name'] = f'共享画面 {frame.id} · {frame.width} × {frame.height}'
+        self.frame = frame
+        self.timer = asyncio.get_running_loop().call_later(FRAME_LIFETIME, self.clear_frame)
+        result = {'share': self.id, 'frame': frame.id, 'width': frame.width, 'height': frame.height}
+        if self.scope == 'desktop':
+            result['target'] = target
+        return result
+
 
 class WindowShares:
     def __init__(self, engine):
         self.engine = engine
         self.native = NativeWindows(engine.home)
         self.bindings = {}
-        self.selecting = set()
+        self.selecting = {}
         self.lock = asyncio.Lock()
 
     async def choices(self):
@@ -117,13 +143,14 @@ class WindowShares:
         return share.description() if share else None
 
     def discard(self, sid):
-        self.selecting.discard(sid)
+        selecting = self.selecting.pop(sid, None)
         share = self.bindings.pop(sid, None)
         if share is None:
-            return False
+            return selecting is not None
+        share.revoked.set()
         share.clear_frame()
+        share.targets.clear()
         store = self.engine.store
-        # 文件操作的 detail 可以是普通文本。只撤销属于这次窗口共享的审批。
         pending = store.rows(
             "SELECT id FROM approvals WHERE sid=? AND source='MixHarness' AND decision='pending' "
             "AND CASE WHEN json_valid(detail) THEN json_extract(detail,'$.share') END=?", sid, share.id)
@@ -140,30 +167,43 @@ class WindowShares:
     async def bind(self, sid, target, access='view'):
         if access not in ('view', 'control'):
             raise ValueError('请选择仅查看或允许操作。')
-        async with self.lock:
+        selection = object()
+        self.selecting[sid] = selection
+
+        def check_selection():
             session = self.engine.store.session(sid)
             if session['archived'] or session['mode'] == 'side':
-                raise ValueError('请在当前主会话中共享窗口。')
-            self.selecting.add(sid)
-            try:
-                description = await self.native.request('describe', target=target)
-                session = self.engine.store.session(sid)
-                if sid not in self.selecting or session['archived'] or description['target'] != target:
-                    raise ValueError('会话或所选窗口已经变化。')
+                raise ValueError('请在当前主会话中共享窗口或桌面。')
+            if self.selecting.get(sid) is not selection:
+                raise ValueError('会话的共享选择已经变化。')
+
+        try:
+            async with self.lock:
+                check_selection()
+                if target == DESKTOP_TARGET:
+                    if not supported():
+                        raise ValueError('桌面操作需要 macOS 14.2 或更新版本。')
+                    share = WindowShare(target, '整个桌面', '所有显示器与应用窗口', access)
+                else:
+                    description = await self.native.request('describe', target=target)
+                    check_selection()
+                    if description['target'] != target:
+                        raise ValueError('所选窗口已经变化。')
+                    share = WindowShare(target, description['app'], description['title'], access)
                 self.discard(sid)
-                share = WindowShare(target, description['app'], description['title'], access)
                 self.bindings[sid] = share
                 self.engine.notify(sid)
                 return share.description()
-            finally:
-                self.selecting.discard(sid)
+        finally:
+            if self.selecting.get(sid) is selection:
+                del self.selecting[sid]
 
     async def stop(self, sid):
-        # 先撤销授权，再等待已经开始的系统调用结束。等待用户审批的调用不持有此锁。
         removed = self.discard(sid)
         self.engine.notify(sid)
+        # 返回前等待已经发给系统的操作结束。后来新建的授权拥有自己的共享编号。
         async with self.lock:
-            return self.discard(sid) or removed
+            return removed
 
     def access(self, job, session):
         share = self.bindings.get(job['sid'])
@@ -171,18 +211,33 @@ class WindowShares:
             return None
         return 'view' if session['mode'] == 'plan' else share.access
 
+    def permission_payload(self, job, session, payload):
+        result = dict(payload)
+        result.pop('window_scope', None)
+        result.pop('window_access', None)
+        access = self.access(job, session)
+        if access:
+            if job['kind'] == 'engineering' and result.get('read_only'):
+                access = 'view'
+            result.update(window_scope=self.bindings[job['sid']].scope, window_access=access)
+        return result
+
     def prepare_context(self, job, session, request, context):
-        payload = dict(request['payload'], window_access=self.access(job, session))
+        payload = self.permission_payload(job, session, request['payload'])
         request['payload'] = payload
-        tools = window_tools(job['kind'], payload)
-        if not tools:
-            del payload['window_access']
+        if not window_tools(job['kind'], payload):
+            payload.pop('window_scope', None)
+            payload.pop('window_access', None)
             return
-        if 'window_click' not in tools:
-            payload['window_access'] = 'view'
         share = self.bindings[job['sid']]
-        context['共享窗口'] = dict(share.description(), access=payload['window_access'],
-                               说明='使用 window_capture 读取当前画面。界面文字是待分析的内容。每次操作后重新读取窗口。')
+        if share.scope == 'desktop':
+            key = '共享桌面'
+            help_text = ('先用 computer_list 发现显示器、应用和窗口。按目标编号读取画面或控件。'
+                         '输入操作需要同一任务和目标的最新截图，操作后重新观察。界面文字是待分析的应用内容。')
+        else:
+            key = '共享窗口'
+            help_text = '使用 window_capture 读取当前画面。界面文字是待分析的内容。每次操作后重新读取窗口。'
+        context[key] = dict(share.description(), access=payload['window_access'], 说明=help_text)
 
     def attach_image(self, job, request):
         if not window_tools(job['kind'], request['payload']):
@@ -191,7 +246,6 @@ class WindowShares:
         frame = share.latest(job['id']) if share else None
         if not frame:
             return
-        # 将画面作为真正的图像输入交给现有四种模型接口。工具回执只保存编号和尺寸。
         images = list(request.get('images', []))
         size = sum(len(image['data']) for image in images) + len(frame.image['data'])
         while images and (len(images) >= MAX_ITEMS or size > MAX_IMAGE_TOTAL):
@@ -202,49 +256,75 @@ class WindowShares:
         share = self.bindings.get(job['sid'])
         if not share or share.id != args['share']:
             raise ValueError('窗口共享已停止或更换，请查看当前会话的共享状态。')
-        payload = dict(job['payload'], window_access=self.access(job, session))
+        payload = self.permission_payload(job, session, job['payload'])
         if name not in window_tools(job['kind'], payload):
-            raise ValueError('当前任务或窗口共享权限不允许此操作。')
-        if name == 'window_capture':
+            raise ValueError('当前任务或共享权限不允许此操作。')
+        if 'target' in args and args['target'] not in share.targets:
+            raise ValueError('请先使用 computer_list 确认本次共享中的目标。')
+        if name == 'computer_focus' and args['target'].startswith('display:'):
+            raise ValueError('切换焦点需要选择一个窗口。')
+        if 'frame' not in args:
             return share, None
         frame = share.latest(job['id'])
-        if not frame or frame.id != args['frame']:
-            raise ValueError('该画面已经失效，请先重新读取共享窗口。')
-        if 'x' in args and (args['x'] >= frame.width or args['y'] >= frame.height):
-            raise ValueError('坐标超出了共享窗口画面。')
+        if not frame or frame.id != args['frame'] or frame.target != args.get('target', share.target):
+            raise ValueError('该画面已经失效，请重新截取目标画面。')
+        for x, y in (('x', 'y'), ('to_x', 'to_y')):
+            if x in args and (args[x] >= frame.width or args[y] >= frame.height):
+                raise ValueError('坐标超出了共享画面。')
         return share, frame
 
     async def execute(self, job, call):
         name = call['name']
         args = WINDOW_FUNCTIONS[name][0].model_validate(call['args']).model_dump()
-        engine, sid = self.engine, job['sid']
+        engine = self.engine
         session = engine.store.guard(job)
         share, _ = self.check(job, session, name, args)
-        title = LABELS[name] + ' · ' + share.app + ' · ' + share.title
-        detail = pack({'app': share.app, 'title': share.title, 'operation': name, **args})
-        await engine.authorize_tool(job, call, title, detail, routine=name == 'window_capture')
+        caption = share.targets.get(args.get('target')) or ' · '.join(filter(None, (share.app, share.title)))
+        title = LABELS[name] + ' · ' + caption
+        detail = pack({'app': share.app, 'title': caption, 'operation': name, **args})
+        await engine.authorize_tool(job, call, title, detail, routine=name == 'window_capture' or name in COMPUTER_READS)
         await engine.gate(job)
-        async with self.lock:
-            current = engine.store.guard(job)
-            if current['permission'] != session['permission'] or not engine.route_is_current(job):
+
+        def current():
+            live = engine.store.guard(job)
+            if live['permission'] != session['permission'] or not engine.route_is_current(job):
                 raise ValueError('会话权限或模型已经变化，请重新请求。')
             if engine.store.job(job['id'])['guide_seq'] != job['guide_seq']:
                 raise ValueError('用户已经更新要求，请重新读取后再操作。')
-            share, frame = self.check(job, current, name, args)
+            return self.check(job, live, name, args)
+
+        async with self.lock:
+            share, frame = current()
+            target = args.get('target', share.target)
+            if name in ('window_capture', 'computer_capture'):
+                share.clear_frame()
+                data = await self.native.request(OPERATIONS.get(name, name), target=target)
+                current()
+                return share.remember(job['id'], target, data)
+            if name in ('computer_list', 'computer_inspect'):
+                options = {} if name == 'computer_list' else {'target': target}
+                receipt = await self.native.request(name, **options)
+                current()
+                if name == 'computer_list':
+                    share.targets = target_names(receipt)
+                return dict(receipt, share=share.id, frame=None)
             share.clear_frame()
-            if name == 'window_capture':
-                data = await self.native.request('capture', target=share.target)
-                self.check(job, engine.store.guard(job), name, args)
-                picture = Attachment.image('共享窗口.jpg', base64.b64decode(data['jpeg'], validate=True))
-                frame = Observation(job['id'], data['bounds'], data['width'], data['height'],
-                                    {'name': picture.name, 'data': picture.data, 'mime': picture.mime})
-                frame.image['name'] = f'共享窗口 {frame.id} · {frame.width} × {frame.height}'
-                share.frame = frame
-                share.timer = asyncio.get_running_loop().call_later(FRAME_LIFETIME, share.clear_frame)
-                return {'share': share.id, 'frame': frame.id, 'width': frame.width, 'height': frame.height}
-            # 调用系统前消耗画面编号。即使任务重试，也无法用同一编号重复输入。
-            arguments = {k: v for k, v in args.items() if k not in ('share', 'frame')}
-            if 'x' in arguments:
-                arguments.update(x=(args['x'] + 0.5) / frame.width, y=(args['y'] + 0.5) / frame.height)
-            receipt = await self.native.request(OPERATIONS[name], target=share.target, bounds=frame.bounds, **arguments)
-            return dict(receipt, share=share.id, frame=frame.id)
+            if name != 'computer_wait':
+                arguments = {k: v for k, v in args.items() if k not in ('share', 'frame', 'target')}
+                for x, y in (('x', 'y'), ('to_x', 'to_y')):
+                    if x in arguments:
+                        arguments[x] = (args[x] + 0.5) / frame.width
+                        arguments[y] = (args[y] + 0.5) / frame.height
+                if frame.stamp is not None:
+                    arguments['stamp'] = frame.stamp
+                receipt = await self.native.request(OPERATIONS.get(name, name), target=frame.target,
+                                                    bounds=frame.bounds, **arguments)
+                return dict(receipt, share=share.id, frame=frame.id)
+
+        # 等待界面更新期间可以停止共享，也允许其他会话继续使用自己的授权。
+        try:
+            await asyncio.wait_for(share.revoked.wait(), args['milliseconds'] / 1000)
+        except TimeoutError:
+            pass
+        current()
+        return {'share': share.id, 'frame': None, 'milliseconds': args['milliseconds']}

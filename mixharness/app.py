@@ -6,24 +6,30 @@ from typing import Literal
 from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .attachments import Attachment, MAX_IMAGE, MAX_ITEMS
+from .attachments import Attachment, InputLibrary, MAX_IMAGE, MAX_ITEMS, MAX_VIDEO, MAX_VIDEO_TOTAL, VIDEO_TYPES, video_mime
 from .chat_snapshot import markdown
 from .engine import open_engine
 from .commands import control_server
 from .providers import MODELS
 from .store import pack
 from .usage import plan_usage
+from .web_media import document_media, local_video, router as media_router, video_document
 
 
 def view_state(store, sid):
     state = store.snapshot(sid)
     for event in state["events"]:
-        if event["kind"] == "message" and event["actor"] != "user":
+        if event["kind"] != "message" or event["actor"] == "user":
+            continue
+        if event["actor"] in ("openai", "gemini"):
+            event["html"], event["videos"] = document_media(
+                sid, 'messages', event['seq'], event['body'], state['session']['workspace'])
+        else:
             event["html"] = markdown(event["body"])
     return state
 
@@ -79,11 +85,24 @@ class ImageInput(BaseModel):
     data: str = Field(max_length=4 * ((MAX_IMAGE + 2) // 3))
 
 
+class VideoInput(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    data: str = Field(max_length=4 * ((MAX_VIDEO + 2) // 3))
+
+
 class Message(BaseModel):
     text: str = Field(default="", max_length=120000)
     intent: Literal["auto", "steer", "revise"] = "auto"
     images: list[ImageInput] = Field(default_factory=list, max_length=MAX_ITEMS)
+    videos: list[VideoInput] = Field(default_factory=list, max_length=MAX_ITEMS)
     client_id: str = Field(min_length=1, max_length=100)
+
+    def attachments(self):
+        media = [('image', item) for item in self.images] + [('video', item) for item in self.videos]
+        InputLibrary.validate([{'kind': kind, 'size': len(item.data) * 3 // 4 - item.data[-2:].count('=')}
+                               for kind, item in media])
+        constructors = {'image': Attachment.image, 'video': Attachment.video}
+        return [constructors[kind](item.name, base64.b64decode(item.data, validate=True)) for kind, item in media]
 
 
 class ModelChoice(BaseModel):
@@ -110,6 +129,7 @@ def create_app(project=None, home=None):
 
     app = FastAPI(title="MixHarness", lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]"])
+    app.include_router(media_router)
 
     @app.middleware("http")
     async def local_origin(request: Request, call_next):
@@ -128,6 +148,8 @@ def create_app(project=None, home=None):
         catalogs = {p: c.view() for p, c in e.catalogs.items()}
         return {"models": {p: c["models"] for p, c in catalogs.items()}, "catalogs": catalogs,
                 "keys": {k: bool(v) for k, v in e.keys.items()},
+                "video_upload": {"formats": VIDEO_TYPES, "max_items": MAX_ITEMS,
+                                 "max_bytes": MAX_VIDEO, "max_total": MAX_VIDEO_TOTAL},
                 "project": str(project), "workspace": str(e.workspace) if e.workspace else None}
 
     @app.post("/api/config/reload")
@@ -277,11 +299,11 @@ def create_app(project=None, home=None):
 
     @app.post("/api/sessions/{sid}/messages", status_code=202)
     async def message(sid: str, data: Message):
-        text = data.text.strip()
         e = app.state.engine
+        e.store.session(sid)
         try:
-            images = [Attachment.image(i.name, base64.b64decode(i.data, validate=True)) for i in data.images]
-            seq, _ = e.submit(sid, text, data.client_id, attachments=images, intent=data.intent)
+            attachments = await asyncio.to_thread(data.attachments)
+            seq, _ = e.submit(sid, data.text.strip(), data.client_id, attachments=attachments, intent=data.intent)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         return {"seq": seq}
@@ -333,12 +355,24 @@ def create_app(project=None, home=None):
 
     @app.get("/api/sessions/{sid}/artifacts/{aid}")
     async def artifact(sid: str, aid: str, download: bool = False):
-        data = app.state.engine.store.one("SELECT * FROM artifacts WHERE id=? AND sid=?", aid, sid)
+        store = app.state.engine.store
+        data = store.one("SELECT * FROM artifacts WHERE id=? AND sid=?", aid, sid)
+        filename = data['name']
         if not download:
-            if data["name"].lower().endswith(".md"):
-                data["html"] = markdown(data["content"])
+            html, videos = document_media(sid, 'artifacts', aid, data['content'], store.session(sid)['workspace'], filename)
+            data['videos'] = videos
+            if filename.lower().endswith('.md'):
+                data['html'] = html
             return data
-        name = Path(data["name"]).name
+        if video_mime(filename):
+            workspace = store.session(sid)['workspace']
+            path = local_video(filename, workspace)
+            if path is None:
+                raise HTTPException(404, '成果中没有此本地视频文件')
+            prefix = f'/api/sessions/{sid}/artifacts/{aid}/videos/'
+            _, paths = video_document(data['content'], workspace, prefix, filename)
+            return RedirectResponse(prefix + str(paths.index(path)) + '?download=true')
+        name = Path(filename).name
         if data["meta"].get("log"):
             return FileResponse(data["meta"]["log"], filename=name, media_type="text/plain")
         return Response(data["content"], media_type="text/plain",

@@ -106,8 +106,9 @@ def compact(engine, session):
     lines = [ROLE_NAMES.get(e["actor"], e["actor"]) + "　" + e["body"][:320] for e in recent]
     summary = "\n".join(([previous[-1000:]] if previous else []) + lines)
     with engine.store.db:
-        engine.store.db.execute("UPDATE sessions SET context_after=?,context_summary=? WHERE id=?",
-                                (events[-1]["seq"], summary, sid))
+        engine.store.db.execute(
+            "UPDATE sessions SET context_after=?,context_summary=?,antigravity_session=NULL,antigravity_seen=0 WHERE id=?",
+            (events[-1]["seq"], summary, sid))
     engine.notify(sid)
     return f"已压缩 {len(events)} 条消息（原记录仍保留）"
 

@@ -19,6 +19,7 @@ from mixharness.desktop_clients import ClientHistory
 from mixharness.engine import open_engine
 from mixharness.store import new_id
 from tests.qt_app import application
+from tests.test_video_media import recording
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +66,27 @@ class InputTests(unittest.TestCase):
             store.delete_session(branch)
             self.assertEqual(store.rows("SELECT id FROM input_items"), [])
 
+    def test_video_only_message_supplies_metadata_to_workflow_and_direct_chats(self):
+        data = recording('.mp4')
+        item = Attachment.video('项目演示.mp4', data)
+        models = {provider: choices[0] for provider, choices in MODELS.items()}
+        with open_engine(self.root, self.home) as engine:
+            store = engine.store
+            for recipient in (None, 'gemini', 'openai'):
+                with self.subTest(recipient=recipient):
+                    sid = engine.create_session(**models, standalone=True)['id']
+                    draft = 'drafts/' + sid
+                    store.inputs.stage(draft, [item])
+                    seq, _ = engine.submit(sid, '', new_id(), draft=draft, recipient=recipient)
+                    job = store.one('SELECT j.*,s.backend FROM jobs j JOIN sessions s ON j.sid=s.id WHERE j.sid=?', sid)
+                    request, _, context, _ = engine.turn_input(job, store.session(sid), [])
+                    description, = json.loads(context)['当前消息附件']
+                    self.assertEqual(description, {'类型': '视频', '名称': item.name, '媒体类型': 'video/mp4',
+                                                   '字节数': len(data), '附件编号': item.id})
+                    self.assertEqual(request['images'], [])
+                    saved, = store.inputs.for_session(sid)[seq]
+                    self.assertEqual(store.inputs.data(saved['id']), data)
+
     def test_composer_paste_remove_restore_and_reference(self):
         app = application()
         app.setQuitOnLastWindowClosed(False)
@@ -76,7 +98,7 @@ class InputTests(unittest.TestCase):
                 window.add_input.click()
                 menu = app.activePopupWidget()
                 self.assertEqual({a.text() for a in menu.actions() if not a.isSeparator()},
-                                 {"添加图片…", "与 AI 共享窗口…", "引用会话…", "引用工具…", "使用技能…"})
+                                 {"添加图片或视频…", "与 AI 共享窗口…", "引用会话…", "引用工具…", "使用技能…"})
                 QTest.keyClick(menu, Qt.Key.Key_Escape)
                 mime = QMimeData()
                 mime.setImageData(QImage(str(ICON)))

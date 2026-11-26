@@ -16,6 +16,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxkbcommon-x11-0 xauth xvfb
       - run: python -m pip install -e ".[build]"
       - run: python -m unittest discover -s tests -v
+        env:
+          MIXHARNESS_TEST_ISOLATED_DESKTOP: ${{ runner.os == 'macOS' && '1' || '0' }}
       - run: python packaging/build_desktop.py
       - if: runner.os == 'Linux'
         run: xvfb-run -a python packaging/check_desktop.py

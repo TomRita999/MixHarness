@@ -11,23 +11,23 @@ from mixharness.catalog import MODELS
 from mixharness.clients import ClientReply, client_prompt
 from mixharness.engine import open_engine
 from mixharness.providers import declarations
-from mixharness.shared_window import ClickWindow, KeyWindow, ReadWindow, WINDOW_FUNCTIONS
+from mixharness.shared_window import ClickWindow, KeyWindow, ReadWindow
 from mixharness.store import CHAT_JOBS, new_id
 
 
 ROOT = Path(__file__).resolve().parents[1]
+WINDOW_NAMES = {'window_capture', 'window_click', 'window_type', 'window_scroll', 'window_key'}
 
 
 class WindowAccessTests(unittest.IsolatedAsyncioTestCase):
     def test_engineering_and_verification_tool_declarations(self):
-        names = set(WINDOW_FUNCTIONS)
-
         def declared(kind, **payload):
-            return names.intersection(tool['name'] for tool in declarations(kind, payload))
+            return {tool['name'] for tool in declarations(kind, payload)
+                    if tool['name'].startswith(('window_', 'computer_'))}
 
         self.assertEqual(declared('engineering'), set())
         self.assertEqual(declared('engineering', window_access='view'), {'window_capture'})
-        self.assertEqual(declared('engineering', window_access='control'), names)
+        self.assertEqual(declared('engineering', window_access='control'), WINDOW_NAMES)
         self.assertEqual(declared('engineering', window_access='control', review=True), set())
         self.assertEqual(declared('engineering', window_access='control', read_only=True), {'window_capture'})
         for kind in ('verification', 'report', 'section', 'side', 'goal_check', 'proposal'):
@@ -52,7 +52,7 @@ class WindowAccessTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(request['payload']['read_only'])
                         self.assertIsNone(client_prompt(request, context)[1])
                         self.assertEqual(declarations(kind, request['payload']), [])
-                        for access, expected in [('view', {'window_capture'}), ('control', set(WINDOW_FUNCTIONS))]:
+                        for access, expected in [('view', {'window_capture'}), ('control', WINDOW_NAMES)]:
                             payload = dict(request['payload'], window_access=access)
                             prompt, schema = client_prompt(dict(request, payload=payload), context)
                             self.assertEqual(schema, ClientReply.model_json_schema())
@@ -91,7 +91,6 @@ class WindowAccessTests(unittest.IsolatedAsyncioTestCase):
                         request, _, context, _ = engine.turn_input(job, session, [])
                         self.assertNotIn('共享窗口', json.loads(context))
                         self.assertEqual(request.get('images'), [])
-                        # 即使把真实会话编号传给截图工具，也没有获得该会话的窗口授权。
                         call = {'name': 'window_capture', 'cid': new_id(), 'cursor': new_id(), 'args': {'share': sid}}
                         with self.assertRaisesRegex(ValueError, '窗口共享已停止或更换'):
                             async with asyncio.timeout(2):

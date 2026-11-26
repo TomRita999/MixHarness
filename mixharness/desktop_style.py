@@ -59,12 +59,12 @@ class Glyph(QIconEngine):
 
 
 THEMES = {
-    "light": dict(canvas="#ffffff", side="#f8f7f6", hover="#eeeceb", selected="#e9e7e5", field="#ffffff", composer="#f5f5f5",
-                  line="#ededed", strong="#dfdfdf", ink="#0d0d0d", secondary="#505050", muted="#737373",
-                  inverse="#ffffff", bubble="#f3f3f3", link="#0969da", shadow="#19000000"),
-    "dark": dict(canvas="#181818", side="#222121", hover="#302f2f", selected="#393939", field="#292929", composer="#353535",
-                 line="#323131", strong="#444444", ink="#f1f1f1", secondary="#d2d2d2", muted="#a3a1a1",
-                 inverse="#181818", bubble="#303030", link="#75b6ff", shadow="#30000000"),
+    "light": dict(canvas="#ffffff", side="#f7f7f8", hover="#ececef", selected="#e4e5e9", field="#ffffff", composer="#f4f4f6",
+                  line="#e8e8ec", strong="#d6d7de", ink="#111114", secondary="#4c4d54", muted="#747680",
+                  inverse="#ffffff", bubble="#f1f2f5", link="#0969da", shadow="#19000000"),
+    "dark": dict(canvas="#181818", side="#1f1f22", hover="#2b2b30", selected="#34343b", field="#232327", composer="#27272c",
+                 line="#2c2c32", strong="#3e3e47", ink="#f3f3f5", secondary="#cfcfd6", muted="#9898a3",
+                 inverse="#181818", bubble="#2a2a30", link="#7bb8ff", shadow="#30000000"),
 }
 
 
@@ -112,15 +112,15 @@ def apply_theme(app, name):
         QMainWindow, QDialog, QWidget#main, QWidget#content, QTextBrowser, QPlainTextEdit { background: $canvas; }
         QFrame#sidebar { background: $side; border-right: 1px solid $line; }
         QFrame#inspector { background: $side; border-left: 1px solid $line; }
-        QFrame#composer { background: $composer; border: 1px solid $strong; border-radius: 22px; }
+        QFrame#composer { background: $composer; border: 1px solid $line; border-radius: 20px; }
         QFrame#composer[focused="true"] { border-color: $strong; }
         QFrame#headerLine { background: $line; max-height: 1px; border: none; }
         QScrollArea#timeline, QWidget#timelineCanvas, QFrame#reply { background: $canvas; border: none; }
-        QFrame#userBubble { background: $bubble; border-radius: 16px; }
-        QFrame#trace { background: $field; border-left: 2px solid $strong; }
+        QFrame#userBubble { background: $bubble; border: 1px solid $line; border-radius: 16px; }
+        QFrame#trace { background: $field; border-left: 2px solid $strong; border-radius: 0 10px 10px 0; }
         QTextBrowser#messageText { background: transparent; border: none; padding: 0; font-size: 14px; }
         QLabel#messageAuthor { font-size: 12px; color: $muted; font-weight: 600; }
-        QToolButton#activity { font-size: 12px; color: $muted; padding: 2px 6px; border-radius: 6px; }
+        QToolButton#activity { font-size: 12px; color: $muted; padding: 3px 8px; border-radius: 7px; }
         QLabel { background: transparent; }
         QLabel#brand { font-size: 15px; font-weight: 650; }
         QLabel#heading { font-size: 28px; font-weight: 500; color: $ink; }
@@ -224,8 +224,8 @@ def apply_theme(app, name):
         QTabBar::tab:hover { color: $ink; }
         QTabBar::tab:selected { color: $ink; background: $selected; }
 
-        QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
-        QScrollBar::handle:vertical { background: $strong; min-height: 28px; border-radius: 2px; }
+        QScrollBar:vertical { background: transparent; width: 6px; margin: 2px; }
+        QScrollBar::handle:vertical { background: $strong; min-height: 28px; border-radius: 3px; }
         QScrollBar::handle:vertical:hover { background: $muted; }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }

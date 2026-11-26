@@ -513,10 +513,10 @@ class PlanQuestion(Exception):
 async def antigravity_turn(engine, job, cwd, prompt, *, preview_text=True):
     # 一个主会话只关联一条独立存储的 Antigravity 会话；并行的报告和章节顺序续接。
     sid, model, permission = job["sid"], job["model"], job["permission"]
-    direct = job["kind"] == "gemini_chat"
+    direct = job["kind"] in ("gemini_chat", "supervision")
     profile = private_directory(engine.home, sid)
     if direct:
-        profile = str(Path(profile) / "chat")
+        profile = str(Path(profile) / ("supervise" if job["kind"] == "supervision" else "chat"))
     lock = asyncio.Lock() if direct else engine.client_locks.setdefault(sid, asyncio.Lock())
     async with lock, connection("antigravity", private=profile, permission=permission) as rpc:
         info = await rpc.initialize("antigravity")
@@ -586,7 +586,7 @@ def client_prompt(job, context):
     schema = (Plan if kind == "plan" else ClientReply).model_json_schema()
     extra = ""
     if kind in CHAT_JOBS.values():
-        extra += "\n将面向用户的文字或 Markdown 写在 text 中。通过列出的窗口工具访问用户所选的窗口。"
+        extra += "\n将面向用户的文字或 Markdown 写在 text 中。"
     if kind in ("engineering", "verification") and is_dot_model(job["model"]) and not job["payload"].get("read_only"):
         extra += ("\nCodex 在只读环境中分析项目。需要修改文件或运行验证时，在 calls 中提出已列出的 MixHarness 工具请求。"
                   "MixHarness 按当前会话权限审批并执行。收到工具回执后再报告实际结果。")

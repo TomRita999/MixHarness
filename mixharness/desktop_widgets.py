@@ -18,9 +18,10 @@ from PySide6.QtWidgets import (
 from .desktop_style import Glyph
 from .desktop_markdown import link_plain_text, render_markdown
 from .markdown_links import HASH_LINE
-from .attachments import TYPES
+from .attachments import TYPES, inspect_video, video_mime
 from .store import LABELS, PROVIDERS
 from .reasoning import LEVEL_NAMES, api_group, group_for, model_available, resolve_choice
+from .video_links import local_video, video_link_tokens
 
 
 ALIGN = Qt.AlignmentFlag
@@ -183,9 +184,9 @@ class HistoryTree(QTreeWidget):
         self.update_actions()
 
     def leaveEvent(self, event):
-        super().leaveEvent(event)
         self.hover_id = None
         self.update_actions()
+        super().leaveEvent(event)
 
     def update_actions(self):
         current = self.currentItem()
@@ -638,6 +639,11 @@ class Document(QTextBrowser):
                 if not file.is_file():
                     raise ValueError("文件不存在：" + str(file))
                 with file.open("rb") as stream:
+                    if video_mime(file):
+                        from .desktop_video import VideoPreview
+                        inspect_video(file.name, stream)
+                        VideoPreview(self.window(), file).open()
+                        return
                     data = stream.read(4 * 1024 * 1024 + 1)
                 if len(data) > 4 * 1024 * 1024 or b"\0" in data:
                     raise ValueError("此文件无法作为文本预览：" + str(file))
@@ -1180,7 +1186,6 @@ class SettingsDialog(QDialog):
         layout.addSpacing(8)
         path = label("配置文件：" + str(engine.project / ".env"), "caption")
         path.setWordWrap(True)
-        path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(path)
         def agent_settings():
             from .desktop_agent import AgentDialog
@@ -1216,15 +1221,22 @@ class ArtifactDialog(QDialog):
     def __init__(self, parent, asset, workspace=None):
         super().__init__(parent)
         self.asset = asset
+        self.video_file = local_video(asset["name"], workspace)
         self.setWindowTitle(asset["name"])
         self.resize(700, 530)
         layout = QVBoxLayout(self)
         text = Document(workspace)
+        layout.addWidget(text)
         if asset["name"].lower().endswith(".md"):
             text.show_markdown(asset["content"])
         else:
             text.setPlainText(asset["content"])
-        layout.addWidget(text)
+            _, paths = video_link_tokens(asset["content"], workspace, asset["name"])
+            for path in paths:
+                url = QUrl.fromLocalFile(str(path))
+                play = button("播放 " + path.name, lambda checked=False, target=url: text.follow_link(target))
+                play.setToolTip(str(path))
+                layout.addWidget(play, 0, ALIGN.AlignLeft)
         actions = QHBoxLayout()
         actions.addStretch()
         actions.addWidget(button("另存为…", self.choose_path))
@@ -1235,7 +1247,7 @@ class ArtifactDialog(QDialog):
         dialog = QFileDialog(self, "保存成果")
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
-        dialog.selectFile(Path(self.asset["name"]).name)
+        dialog.selectFile(self.video_file.name if self.video_file else Path(self.asset["name"]).name)
         dialog.fileSelected.connect(self.export)
         dialog.open()
 
@@ -1245,10 +1257,10 @@ class ArtifactDialog(QDialog):
             QMessageBox.warning(self, "无法保存", target.errorString())
             return
         try:
-            source = self.asset["meta"].get("log")
+            source = self.video_file or self.asset["meta"].get("log")
             if source:
-                with Path(source).open("rb") as log:
-                    for chunk in iter(lambda: log.read(1024 * 1024), b""):
+                with Path(source).open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                         if target.write(chunk) != len(chunk):
                             raise OSError(target.errorString())
             else:

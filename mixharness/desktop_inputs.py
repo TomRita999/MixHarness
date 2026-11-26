@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 
 from . import clients
 from .agent_settings import skill_catalog
-from .attachments import Attachment, MAX_ITEMS, TYPES
+from .attachments import Attachment, MAX_ITEMS, TYPES, VIDEO_TYPES
 from .desktop_clients import ClientHistory
 from .desktop_widgets import Document, button, label
 from .desktop_windows import ACCESS_NAMES, WindowPicker, window_caption
@@ -83,12 +83,16 @@ def attachment_button(parent, library, item, *, large=False):
     control.setToolTip(caption + ("\n" + item["source"] if item["source"] else ""))
 
     def preview():
+        data = library.data(item["id"])
+        if item["kind"] == "video":
+            from .desktop_video import VideoPreview
+            VideoPreview(parent.window(), item["name"], data=data).open()
+            return
         dialog = QDialog(parent)
         dialog.setWindowTitle(caption)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.resize(650, 450)
         layout = QVBoxLayout(dialog)
-        data = library.data(item["id"])
         if item["kind"] == "image":
             scroll = QScrollArea()
             picture = QLabel()
@@ -124,7 +128,7 @@ class ComposerInputs(QScrollArea):
         window.closed.connect(self.share_timer.stop)
         self.share_timer.start()
         self.setObjectName("composerInputs")
-        self.setAccessibleName("附件与共享窗口")
+        self.setAccessibleName("附件与屏幕共享")
         self.viewport().setAutoFillBackground(False)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setWidgetResizable(True)
@@ -150,7 +154,7 @@ class ComposerInputs(QScrollArea):
             sharing = label('正在共享 · ' + self.fontMetrics().elidedText(caption, Qt.TextElideMode.ElideMiddle, 300), 'caption')
             sharing.setTextFormat(Qt.TextFormat.PlainText)
             sharing.setToolTip(caption)
-            sharing.setAccessibleName('正在共享窗口 · ' + caption)
+            sharing.setAccessibleName('正在共享 · ' + caption)
             layout.addWidget(sharing)
             layout.addWidget(button('停止共享', self.stop_sharing))
         for item in self.items:
@@ -200,7 +204,7 @@ class ComposerInputs(QScrollArea):
                 raise ValueError(f"每次最多添加 {MAX_ITEMS} 项")
             self.stage([Attachment.from_file(p) for p in paths])
         except (OSError, ValueError) as exc:
-            QMessageBox.warning(self.window, "无法添加图片", str(exc))
+            QMessageBox.warning(self.window, "无法添加附件", str(exc))
 
     def paste_image(self, data):
         try:
@@ -212,7 +216,7 @@ class ComposerInputs(QScrollArea):
         menu = QMenu(self.window)
         menu.setAccessibleName("添加附件或引用")
         menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        menu.addAction("添加图片…", self.choose_images)
+        menu.addAction("添加图片或视频…", self.choose_files)
         menu.addAction("与 AI 共享窗口…", self.choose_window)
         menu.addSeparator()
         menu.addAction("引用会话…", self.choose_chat)
@@ -221,11 +225,13 @@ class ComposerInputs(QScrollArea):
         control = self.window.add_input
         menu.popup(control.mapToGlobal(QPoint(0, -menu.sizeHint().height() - 3)))
 
-    def choose_images(self):
-        dialog = QFileDialog(self.window, "添加图片")
+    def choose_files(self):
+        dialog = QFileDialog(self.window, "添加图片或视频")
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
-        dialog.setNameFilter("图片 (*.png *.jpg *.jpeg *.webp *.PNG *.JPG *.JPEG *.WEBP)")
+        extensions = ('.png', '.jpg', '.jpeg', '.webp', *VIDEO_TYPES)
+        patterns = ' '.join('*' + suffix for ext in extensions for suffix in (ext, ext.upper()))
+        dialog.setNameFilter(f'图片和视频 ({patterns})')
         dialog.filesSelected.connect(self.add_files)
         dialog.open()
 

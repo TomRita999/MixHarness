@@ -51,6 +51,16 @@ static void checkLiveWindow(SCWindow *window, NSString *key) {
         !CGRectEqualToRect(frame, window.frame)) fail(@"共享窗口已关闭、隐藏或移动，请重新读取窗口。");
 }
 
+static void sendPicture(CGImageRef image, CGRect rect, NSString *stamp) {
+    NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithCGImage:image];
+    NSData *jpeg = [bitmap representationUsingType:NSBitmapImageFileTypeJPEG properties:@{NSImageCompressionFactor:@0.88}];
+    if (!jpeg.length) fail(@"无法编码截图。");
+    NSMutableDictionary *result = [@{@"width":@(CGImageGetWidth(image)), @"height":@(CGImageGetHeight(image)),
+                                     @"bounds":bounds(rect), @"jpeg":[jpeg base64EncodedStringWithOptions:0]} mutableCopy];
+    if (stamp) result[@"stamp"] = stamp;
+    reply(result);
+}
+
 static void capture(SCWindow *window, NSString *key) API_AVAILABLE(macos(14.2));
 static void capture(SCWindow *window, NSString *key) {
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:window];
@@ -65,11 +75,7 @@ static void capture(SCWindow *window, NSString *key) {
     [SCScreenshotManager captureImageWithFilter:filter configuration:config completionHandler:^(CGImageRef image, NSError *error) {
         if (!image || error) fail(error.localizedDescription ?: @"无法读取共享窗口画面。");
         checkLiveWindow(window, key);
-        NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithCGImage:image];
-        NSData *jpeg = [bitmap representationUsingType:NSBitmapImageFileTypeJPEG properties:@{NSImageCompressionFactor:@0.88}];
-        if (!jpeg.length) fail(@"无法编码窗口画面。");
-        reply(@{@"width":@(CGImageGetWidth(image)), @"height":@(CGImageGetHeight(image)),
-                @"bounds":bounds(window.frame), @"jpeg":[jpeg base64EncodedStringWithOptions:0]});
+        sendPicture(image, window.frame, nil);
     }];
 }
 
@@ -199,6 +205,8 @@ static void control(NSDictionary *request, SCWindow *target, NSArray<SCWindow *>
     reply(@{@"performed":op});
 }
 
+#import "computer_use.h"
+
 static void run(NSDictionary *request) API_AVAILABLE(macos(14.2));
 static void run(NSDictionary *request) {
     NSString *op = request[@"op"];
@@ -209,10 +217,16 @@ static void run(NSDictionary *request) {
         reply(@{@"screen":[NSNumber numberWithBool:CGPreflightScreenCaptureAccess()],
                 @"accessibility":[NSNumber numberWithBool:AXIsProcessTrusted()]});
     }
-    if (![@[@"list", @"describe", @"capture", @"click", @"scroll", @"type_text", @"press_key"] containsObject:op]) fail(@"未知窗口请求。");
+    BOOL desktop = [computerOperations() containsObject:op];
+    if (!desktop && ![@[@"list", @"describe", @"capture", @"click", @"scroll", @"type_text", @"press_key"] containsObject:op])
+        fail(@"未知窗口请求。");
+    if (desktop && ![op isEqual:@"computer_list"] &&
+        (![request[@"target"] isKindOfClass:NSString.class] || ![request[@"target"] length]))
+        fail(@"请指定显示器或窗口编号。");
     if (!CGPreflightScreenCaptureAccess()) fail(@"读取窗口需要 macOS 的屏幕录制权限。请打开系统设置中的“隐私与安全性 → 屏幕与系统音频录制”。");
     [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES completionHandler:^(SCShareableContent *content, NSError *error) {
         if (error || !content) fail(error.localizedDescription ?: @"无法列出可共享窗口。");
+        if (desktop) { runComputer(request, content); return; }
         NSMutableArray *choices = [NSMutableArray array];
         for (SCWindow *window in content.windows) {
             NSString *key = windowKey(window);
@@ -238,7 +252,7 @@ int main(void) {
         if (![request isKindOfClass:NSDictionary.class] || ![request[@"op"] isKindOfClass:NSString.class])
             fail(error.localizedDescription ?: @"窗口请求格式错误。");
         if (@available(macOS 14.2, *)) run(request);
-        else fail(@"共享窗口需要 macOS 14.2 或更新版本。");
+        else fail(@"共享窗口与桌面操作需要 macOS 14.2 或更新版本。");
     }
     return 0;
 }

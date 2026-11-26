@@ -1,3 +1,5 @@
+import {encodeVideos, videoFigure, VideoDrafts} from './video.js';
+
 const $ = (selector) => document.querySelector(selector);
 document.querySelectorAll("i.ic").forEach((glyph) => glyph.setAttribute("aria-hidden", "true"));
 const content = $("#content");
@@ -13,7 +15,9 @@ let projects = [];
 const catalogRequests = {gemini: 0, openai: 0};
 let sessions = [], panelTab = "tasks", live = {}, epoch = 0, sending = false, savingModels = false, switching = false;
 let toastTimer;
+let messageRows = new Map();
 const retryIds = new Map();
+const videoDrafts = new VideoDrafts($('#composer'), () => current, updateSend, previewFile, showError);
 
 function el(tag, className, text) {
   const element = document.createElement(tag);
@@ -70,6 +74,11 @@ function modal(title, ...nodes) {
   $("#dialog-title").textContent = title;
   $("#dialog-body").replaceChildren(...nodes);
   if (!$("#dialog").open) $("#dialog").showModal();
+}
+function previewFile(file, mime) {
+  const url = URL.createObjectURL(file);
+  $('#dialog').addEventListener('close', () => URL.revokeObjectURL(url), {once: true});
+  modal(file.name, videoFigure({name: file.name, mime, url}));
 }
 function connection(online) {
   $("#connection").classList.toggle("online", online);
@@ -185,6 +194,7 @@ function drawConfig() {
   const ready = config.keys.gemini && config.keys.openai;
   $("#key-state").classList.toggle("ready", ready);
   $("#key-state b").textContent = ready ? "API 密钥已配置" : "配置 API 密钥";
+  videoDrafts.configure(config.video_upload);
   drawModels();
 }
 function settings() {
@@ -250,7 +260,9 @@ async function saveModel(provider, value, effort) {
   }
 }
 function updateSend() {
-  $("#send").disabled = !current || sending || switching || !promptBox.value.trim();
+  const disabled = !current || sending || switching;
+  videoDrafts.add.disabled = disabled;
+  $("#send").disabled = disabled || (!promptBox.value.trim() && !videoDrafts.files(current).length);
 }
 function fillPrompt(value) {
   promptBox.value = value;
@@ -273,7 +285,8 @@ function buildSuggestions() {
   }
 }
 function chat() {
-  const transcript = document.createDocumentFragment();
+  const transcript = [];
+  const nextRows = new Map();
   function appendTrace(parent, event) {
     if (!event.trace?.length) return;
     const details = el("dl", "trace");
@@ -284,14 +297,33 @@ function chat() {
   }
   for (const event of state.events) {
     if (event.kind === "message") {
+      const key = current + '/' + event.seq;
+      const signature = JSON.stringify(event);
+      const saved = messageRows.get(key);
+      if (saved?.signature === signature) {
+        nextRows.set(key, saved);
+        transcript.push(saved.article);
+        continue;
+      }
       const article = el("article", "entry " + event.actor);
       const header = el("div", "entry-head");
       header.append(el("span", "", roleNames[event.actor]), el("time", "", localTime(event.at)));
-      const body = el("div", "body markdown");
-      rich(body, event.html, event.body);
       article.append(header);
       appendTrace(article, event);
-      article.append(body); transcript.append(article);
+      if (event.body || event.html) {
+        const body = el("div", "body markdown");
+        rich(body, event.html, event.body);
+        article.append(body);
+      }
+      for (const item of event.attachments || []) {
+        if (item.kind === 'video') {
+          const url = '/api/' + sessionPath('/attachments/' + encodeURIComponent(item.id));
+          article.append(videoFigure({name: item.name, mime: item.mime, url}));
+        }
+      }
+      for (const video of event.videos || []) article.append(videoFigure(video));
+      nextRows.set(key, {signature, article});
+      transcript.push(article);
     } else if (["verification", "failure", "progress", "requirements"].includes(event.kind)) {
       const line = el("div", "notice" + (event.kind === "failure" ? " error" : ""));
       if (event.kind === "requirements") {
@@ -311,9 +343,10 @@ function chat() {
         if (["engineering", "verification"].includes(event.meta.kind)) line.append(button("只读重试 GPT", "quiet", () => api(url + "?read_only=true", "POST")));
         line.append(button("重试", "quiet", () => api(url, "POST")));
       }
-      transcript.append(line);
+      transcript.push(line);
     }
   }
+  messageRows = nextRows;
   for (const request of state.approvals || []) {
     const path = sessionPath("/approvals/" + request.id);
     const detail = el("details", "notice");
@@ -321,15 +354,15 @@ function chat() {
       el("pre", "artifact-text", request.detail),
       button("允许", "quiet", () => api(path, "POST", {allow: true})),
       button("拒绝", "quiet", () => api(path, "POST", {allow: false})));
-    transcript.append(detail);
+    transcript.push(detail);
   }
-  if (transcript.childNodes.length) {
+  if (transcript.length) {
     const waiting = state.tasks.filter((t) => t.status === "needs_key");
-    if (waiting.length) transcript.append(el("div", "notice", "等待配置 API 密钥后继续执行。"));
+    if (waiting.length) transcript.push(el("div", "notice", "等待配置 API 密钥后继续执行。"));
     const active = state.tasks.filter((t) => t.status === "running" || t.status === "waiting");
-    if (active.length) transcript.append(el("div", "notice", active.map((t) => t.title + " · " + statusNames[t.status]).join("　")));
+    if (active.length) transcript.push(el("div", "notice", active.map((t) => t.title + " · " + statusNames[t.status]).join("　")));
   }
-  const preview = el("div", "live"); preview.id = "live"; transcript.append(preview);
+  const preview = el("div", "live"); preview.id = "live"; transcript.push(preview);
   return transcript;
 }
 function drawLive() {
@@ -364,8 +397,10 @@ function tasks() {
   return group;
 }
 async function showArtifact(id) {
+  const sid = current;
   const path = sessionPath("/artifacts/" + id);
   const item = await api(path);
+  if (sid !== current) return;
   const text = el("div", item.html ? "markdown" : "artifact-text");
   rich(text, item.html, item.content);
   const link = el("a", "quiet", "下载文件");
@@ -374,7 +409,7 @@ async function showArtifact(id) {
   const details = [];
   if (item.meta.argv) details.push(el("p", "", "验证命令　" + item.meta.argv.join(" ") + "　·　退出码 " + item.meta.exit_code));
   if (item.meta.source) details.push(el("p", "", "项目版本　" + item.meta.source.slice(0, 16)));
-  modal(item.name, ...details, text, actions);
+  modal(item.name, ...details, text, ...(item.videos || []).map(videoFigure), actions);
 }
 function files() {
   if (!state.artifacts.length) return empty("暂无成果", "生成的文件与验证日志会显示在这里。", "files");
@@ -395,7 +430,17 @@ function drawContent(forceScroll = false) {
   $("#welcome").hidden = !starting;
   $("#suggestions").hidden = !starting;
   promptBox.placeholder = starting ? "输入消息…" : "继续输入或补充要求…";
-  content.replaceChildren(chat());
+  // 会话更新时让原有视频留在文档中，保留播放位置和浏览器解码状态。
+  const rows = chat();
+  const keep = new Set(rows);
+  for (const child of Array.from(content.childNodes)) {
+    if (!keep.has(child)) child.remove();
+  }
+  let next = content.firstChild;
+  for (const row of rows) {
+    if (row === next) next = next.nextSibling;
+    else content.insertBefore(row, next);
+  }
   drawLive();
   content.scrollTop = forceScroll || atBottom ? content.scrollHeight : oldScroll;
   if (!$("#inspector").hidden) drawInspector();
@@ -446,7 +491,9 @@ async function selectSession(id, projectId = state?.session.project_id) {
     }
     const next = await api("sessions/" + id);
     if (request !== epoch) return;
+    if (id !== current && $('#dialog').open) $('#dialog').close();
     current = id; live = {};
+    videoDrafts.render();
     localStorage.setItem("mixharness-session", id);
     promptBox.value = sessionStorage.getItem("mixharness-draft-" + id) || "";
     applyState(next, true); resizePrompt();
@@ -458,6 +505,8 @@ async function selectSession(id, projectId = state?.session.project_id) {
     source.addEventListener("deleted", async () => {
       if (request !== epoch) return;
       source.close();
+      videoDrafts.set(id, []);
+      retryIds.delete(id);
       sessionStorage.removeItem("mixharness-draft-" + id);
       try {
         const sessions = await api("sessions");
@@ -480,14 +529,20 @@ async function newSession() {
 $("#composer").addEventListener("submit", async (e) => {
   e.preventDefault();
   const text = promptBox.value.trim(), sid = current;
-  if (!text || sending || switching || !sid) return;
+  const files = videoDrafts.files(sid);
+  if ((!text && !files.length) || sending || switching || !sid) return;
   let attempt = retryIds.get(sid);
-  if (!attempt || attempt.text !== text) attempt = {text, client_id: crypto.randomUUID()};
+  if (!attempt || attempt.text !== text || attempt.files !== files) {
+    attempt = {text, files, client_id: crypto.randomUUID()};
+  }
   retryIds.set(sid, attempt);
   sending = true; updateSend();
   try {
-    await api(sessionPath("/messages"), "POST", attempt);
+    const message = {text, client_id: attempt.client_id};
+    if (files.length) message.videos = await encodeVideos(files);
+    await api('sessions/' + sid + '/messages', 'POST', message);
     retryIds.delete(sid);
+    videoDrafts.remove(sid, files);
     if (sid === current && promptBox.value.trim() === text) fillPrompt("");
     else if ((sessionStorage.getItem("mixharness-draft-" + sid) || "").trim() === text) sessionStorage.removeItem("mixharness-draft-" + sid);
   } catch (error) { showError(error); }
@@ -551,6 +606,7 @@ $("#search-toggle").onclick = () => {
 };
 $("#search").oninput = drawHistory;
 $("#close-dialog").onclick = () => $("#dialog").close();
+$('#dialog').addEventListener('close', () => { if (!$('#dialog').open) $('#dialog-body').replaceChildren(); });
 $("#dialog").addEventListener("click", (e) => {
   if (e.target !== $("#dialog")) return;
   const rect = e.target.getBoundingClientRect();

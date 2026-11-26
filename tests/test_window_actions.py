@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import plistlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from mixharness.catalog import MODELS
 from mixharness.engine import open_engine
 from mixharness.store import CHAT_JOBS, new_id
 from mixharness.window_native import supported
+from tests.qt_app import requires_isolated_desktop
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +22,8 @@ DOCUMENT = ROOT / 'README.md'
 
 
 @unittest.skipUnless(supported(), '真实窗口交互需要 macOS 14.2 或更新版本')
-class WindowActionTests(unittest.IsolatedAsyncioTestCase):
+@requires_isolated_desktop
+class WindowTargetCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         scratch = ROOT / '.work' / 'tests'
         scratch.mkdir(parents=True, exist_ok=True)
@@ -28,59 +31,67 @@ class WindowActionTests(unittest.IsolatedAsyncioTestCase):
         library = self.root / 'library'
         library.mkdir()
         self.engine = self.enterContext(open_engine(library, self.root / 'data'))
-        bundle = self.root / 'WindowTarget.app'
-        executable = bundle / 'Contents' / 'MacOS' / 'WindowTarget'
-        executable.parent.mkdir(parents=True)
-        with (bundle / 'Contents' / 'Info.plist').open('wb') as stream:
-            plistlib.dump({'CFBundlePackageType': 'APPL', 'CFBundleExecutable': executable.name,
-                          'CFBundleName': 'WindowTarget', 'CFBundleVersion': '1',
-                          'CFBundleIdentifier': 'local.mixharness.tests.window-' + new_id()}, stream)
+        self.binary = self.root / 'WindowTarget'
         env = dict(os.environ, TMPDIR=str(self.root), TEMP=str(self.root), TMP=str(self.root),
                    CLANG_MODULE_CACHE_PATH=str(self.root / 'module-cache'))
         await asyncio.to_thread(subprocess.run, ['/usr/bin/clang', '-fobjc-arc', '-mmacosx-version-min=14.2',
                                 Path(__file__).with_name('shared_window_target.m'), '-framework', 'AppKit',
-                                '-o', executable], cwd=self.root, env=env, check=True, timeout=60)
+                                '-o', self.binary], cwd=self.root, env=env, check=True, timeout=60)
         self.permissions = await self.engine.windows.native.request('permissions')
         if not self.permissions['screen']:
             self.skipTest('系统未授予屏幕录制权限，未启动或截取测试窗口')
-        # LaunchServices 提供窗口标识所需的进程启动时间。每次只启动本次目录里的测试应用。
         self.sequence = 0
-        self.launcher = await asyncio.create_subprocess_exec('/usr/bin/open', '-n', '-g', '-W', str(bundle),
-                                                            '--args', str(self.root), str(DOCUMENT), cwd=self.root)
-        self.addAsyncCleanup(self.close_target)
+        self.primary = await self.launch_target(self.root)
         self.initial = await self.state()
 
-    def send_command(self, action):
-        self.sequence += 1
-        staging = self.root / 'command.new'
-        staging.write_text(json.dumps({'seq': self.sequence, 'action': action}), encoding='utf-8')
-        staging.replace(self.root / 'command.json')
+    async def launch_target(self, directory):
+        bundle = directory / 'WindowTarget.app'
+        executable = bundle / 'Contents' / 'MacOS' / 'WindowTarget'
+        executable.parent.mkdir(parents=True)
+        shutil.copy2(self.binary, executable)
+        with (bundle / 'Contents' / 'Info.plist').open('wb') as stream:
+            plistlib.dump({'CFBundlePackageType': 'APPL', 'CFBundleExecutable': executable.name,
+                          'CFBundleName': 'WindowTarget', 'CFBundleVersion': '1',
+                          'CFBundleIdentifier': 'local.mixharness.tests.window-' + new_id()}, stream)
+        # 每个测试应用拥有独立的包标识、进程和命令目录。
+        launcher = await asyncio.create_subprocess_exec('/usr/bin/open', '-n', '-g', '-W', str(bundle),
+                                                        '--args', str(directory), str(DOCUMENT), cwd=directory)
+        self.addAsyncCleanup(self.close_target, directory, launcher)
+        return directory, launcher
 
-    async def state(self, action='inspect'):
-        self.send_command(action)
-        reply = self.root / 'reply.json'
+    def send_command(self, directory, action):
+        self.sequence += 1
+        staging = directory / 'command.new'
+        staging.write_text(json.dumps({'seq': self.sequence, 'action': action}), encoding='utf-8')
+        staging.replace(directory / 'command.json')
+        return self.sequence
+
+    async def state(self, action='inspect', target=None):
+        directory, launcher = target or self.primary
+        seq = self.send_command(directory, action)
+        reply = directory / 'reply.json'
         async with asyncio.timeout(12):
             while True:
-                if self.launcher.returncode is not None:
-                    self.fail(f'测试窗口在返回状态前退出，open 退出码为 {self.launcher.returncode}')
+                if launcher.returncode is not None:
+                    self.fail(f'测试窗口在返回状态前退出，open 退出码为 {launcher.returncode}')
                 if reply.is_file():
                     state = json.loads(reply.read_bytes())
-                    if state['seq'] == self.sequence:
+                    if state['seq'] == seq:
                         return state
                 await asyncio.sleep(0.04)
 
-    async def wait_state(self, predicate):
+    async def wait_state(self, predicate, target=None):
         async with asyncio.timeout(5):
             while True:
-                state = await self.state()
+                state = await self.state(target=target)
                 if predicate(state):
                     return state
 
-    async def close_target(self):
-        if self.launcher.returncode is None:
-            self.send_command('quit')
-            await asyncio.wait_for(self.launcher.wait(), 12)
-        self.assertEqual(self.launcher.returncode, 0)
+    async def close_target(self, directory, launcher):
+        if launcher.returncode is None:
+            self.send_command(directory, 'quit')
+            await asyncio.wait_for(launcher.wait(), 12)
+        self.assertEqual(launcher.returncode, 0)
 
     def new_job(self, permission, provider='openai'):
         models = {name: choices[0] for name, choices in MODELS.items()}
@@ -128,6 +139,17 @@ class WindowActionTests(unittest.IsolatedAsyncioTestCase):
         x, y = self.initial[control]
         return {'x': int(frame['width'] * x), 'y': int(frame['height'] * y)}
 
+    def captured_image(self, job, frame):
+        store = self.engine.store
+        request, _, _, _ = self.engine.turn_input(job, store.session(job['sid']), store.calls(job))
+        picture, = request['images']
+        self.assertEqual(picture['mime'], 'image/jpeg')
+        decoded = QImage.fromData(picture['data'])
+        self.assertEqual((decoded.width(), decoded.height()), (frame['width'], frame['height']))
+        return decoded
+
+
+class WindowActionTests(WindowTargetCase):
     async def test_capture_approval_pixels_session_scope_and_revocation(self):
         job = self.new_job('ask')
         windows = self.engine.windows
@@ -142,16 +164,11 @@ class WindowActionTests(unittest.IsolatedAsyncioTestCase):
         frame = await self.invoke(job, 'window_capture', args, 'allow')
         self.assertEqual(set(frame), {'share', 'frame', 'width', 'height'})
         self.assertEqual((frame['width'], frame['height']), (self.initial['width'], self.initial['height']))
-        store = self.engine.store
-        request, _, _, _ = self.engine.turn_input(job, store.session(job['sid']), store.calls(job))
-        picture, = request['images']
-        self.assertEqual(picture['mime'], 'image/jpeg')
-        decoded = QImage.fromData(picture['data'])
-        self.assertEqual((decoded.width(), decoded.height()), (frame['width'], frame['height']))
+        decoded = self.captured_image(job, frame)
         point = self.coordinates(frame, 'swatch')
         color = decoded.pixelColor(point['x'], point['y'])
         self.assertGreater(color.green(), max(color.red(), color.blue()) + 45)
-        self.assertEqual(store.rows('SELECT id FROM input_items'), [])
+        self.assertEqual(self.engine.store.rows('SELECT id FROM input_items'), [])
         click = dict(args, frame=frame['frame'], **self.coordinates(frame, 'button'))
         with self.assertRaisesRegex(ValueError, '不允许此操作'):
             await self.invoke(job, 'window_click', click)
@@ -161,7 +178,7 @@ class WindowActionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, '已拒绝'):
             await self.invoke(job, 'window_capture', args, 'stop')
         self.assertIsNone(windows.status(job['sid']))
-        request, _, _, _ = self.engine.turn_input(job, store.session(job['sid']), [])
+        request, _, _, _ = self.engine.turn_input(job, self.engine.store.session(job['sid']), [])
         self.assertEqual(request['images'], [])
 
     async def test_control_approval_click_scroll_text_shortcut_and_sibling_focus(self):

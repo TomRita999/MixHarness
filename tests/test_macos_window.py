@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.qt_app import requires_isolated_desktop
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -85,6 +87,7 @@ def read_window(work, library):
 
 
 @unittest.skipUnless(sys.platform == "darwin", "需要 macOS AppKit")
+@requires_isolated_desktop
 class MacWindowTests(unittest.TestCase):
     def test_window_attachment_can_read_chats_and_selections(self):
         scratch = ROOT / ".work/tests"
@@ -92,10 +95,12 @@ class MacWindowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=scratch) as folder:
             work = Path(folder)
             library = work / "window.dylib"
+            env = dict(os.environ, TMPDIR=str(work), TEMP=str(work), TMP=str(work),
+                       CLANG_MODULE_CACHE_PATH=str(work / "module-cache"))
             subprocess.run(["clang", "-fobjc-arc", "-dynamiclib", Path(__file__).with_name("macos_window.m"),
-                            "-framework", "AppKit", "-o", library], check=True, timeout=60)
+                            "-framework", "AppKit", "-o", library], cwd=work, env=env, check=True, timeout=60)
             subprocess.run([sys.executable, "-m", "tests.test_macos_window", work, library], cwd=ROOT,
-                           env=dict(os.environ, QT_QPA_PLATFORM="cocoa"), check=True, timeout=30)
+                           env=dict(env, QT_QPA_PLATFORM="cocoa"), check=True, timeout=30)
 
 
 if __name__ == "__main__":

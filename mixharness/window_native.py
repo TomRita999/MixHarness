@@ -23,19 +23,22 @@ def supported():
 
 def build_window_helper(directory):
     source = (RESOURCES / 'shared_window.m').read_bytes()
+    desktop = (RESOURCES / 'computer_use.h').read_bytes()
     flags = ['-x', 'objective-c', '-fobjc-arc', '-O2', '-mmacosx-version-min=14.2',
              '-framework', 'AppKit', '-framework', 'ApplicationServices', '-framework', 'ScreenCaptureKit']
-    digest = hashlib.sha256(source + repr((flags, platform.machine())).encode()).hexdigest()
-    release = Path(directory) / digest
+    checksum = hashlib.sha256(source + b'\0' + desktop + b'\0' + repr((flags, platform.machine())).encode())
+    release = Path(directory) / checksum.hexdigest()
     release.mkdir(mode=0o700, parents=True, exist_ok=True)
     executable = release / HELPER_NAME
     if executable.is_file():
         return executable
     with tempfile.TemporaryDirectory(dir=release) as scratch:
         staged = Path(scratch) / HELPER_NAME
+        # 编译时使用参与摘要计算的同一份头文件。
+        (staged.parent / 'computer_use.h').write_bytes(desktop)
         env = dict(os.environ, TMPDIR=scratch, TEMP=scratch, TMP=scratch, CLANG_MODULE_CACHE_PATH=scratch)
         try:
-            built = subprocess.run(['/usr/bin/clang', *flags, '-', '-o', str(staged)], input=source,
+            built = subprocess.run(['/usr/bin/clang', *flags, '-iquote', scratch, '-', '-o', str(staged)], input=source,
                                    capture_output=True, env=env, cwd=scratch, timeout=90)
         except subprocess.TimeoutExpired as exc:
             raise ValueError('编译窗口辅助程序超时。') from exc
@@ -55,7 +58,7 @@ class NativeWindows:
 
     async def binary(self):
         if not supported():
-            raise ValueError('共享窗口需要 macOS 14.2 或更新版本。')
+            raise ValueError('共享窗口与桌面操作需要 macOS 14.2 或更新版本。')
         async with self.build_lock:
             if self.executable is None:
                 if getattr(sys, 'frozen', False):

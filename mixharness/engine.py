@@ -9,7 +9,7 @@ from dotenv import dotenv_values
 from filelock import FileLock
 
 from . import workspace
-from .attachments import MAX_IMAGE_TOTAL, MAX_ITEMS, TYPES
+from .attachments import MAX_IMAGE_TOTAL, MAX_ITEMS
 from .agent_settings import (AUTO_CLIENT_CONTEXT_WINDOW, AgentSettings, PERMISSIONS, SPEEDS,
                              available_speeds, selected_skills, shared_input, skill_catalog)
 from .catalog import ModelCatalog
@@ -540,13 +540,7 @@ class Engine:
                 await self.cleanup_signal.wait()
 
     def describe_inputs(self, items):
-        descriptions = []
-        for item in items:
-            desc = {"类型": TYPES[item["kind"]], "名称": item["name"]}
-            if item["kind"] != "image":
-                desc.update(来源=item["source"], 标识=item["target"], 内容=self.store.inputs.data(item["id"]).decode())
-            descriptions.append(desc)
-        return descriptions
+        return self.store.inputs.describe(items)
 
     def image_inputs(self, groups):
         # 优先保留最近消息的图片，同一张图在同一次请求里只传一份。
@@ -688,14 +682,19 @@ class Engine:
     def turn_input(self, job, session, calls):
         if job["kind"] in CHAT_JOBS.values():
             return self.chat_input(job, session, calls)
+        if job["kind"] == "supervision":
+            return self.supervision_input(job, session, calls)
         # 只有产生此轮工具调用的 API 和模型可以接收原来的调用编号。
         resume = ((calls or (not self.settings.context_window and not session["context_after"])) and job["cursor"] is not None
                   and job["backend"] == job["cursor_backend"] == "api"
                   and job["model"] == job["cursor_model"])
+        client_resume = (job["backend"] == "clients" and PROVIDERS[job["kind"]] == "gemini"
+                         and bool(session.get("antigravity_session"))
+                         and (session.get("antigravity_seen") or 0) > session["context_after"])
         request = dict(job, permission=session["permission"], speed=session["speed"], daybreak=session["daybreak"],
                        context_window=self.settings.context_window)
         if not resume:
-            request.update(cursor=None, seen=0)
+            request.update(cursor=None, seen=session["antigravity_seen"] if client_resume else 0)
         sid = job["sid"]
         entries = self.store.rows("SELECT seq,kind,actor,body,meta FROM events WHERE sid=? AND seq>? ORDER BY seq",
                                   sid, request["seen"])
@@ -707,16 +706,21 @@ class Engine:
         history = [{"seq": e["seq"], "from": e["actor"], "type": e["kind"],
                     "text": e["body"] if e["actor"] == "user" else e["body"][:4200], "details": e["meta"]}
                    for e in entries if e["seq"] > session["context_after"]]
-        works = self.store.rows("SELECT id,kind,status,title,error FROM jobs WHERE sid=? AND status!='obsolete' "
-                                "AND kind NOT IN ('gemini_chat','gpt_chat')", sid)
-        assets = self.store.rows("SELECT id,name,digest,meta FROM artifacts WHERE sid=? ORDER BY rowid DESC LIMIT 80", sid)
+        works = [{"id": w["id"], "kind": w["kind"], "status": w["status"], "title": w["title"],
+                  "error": (w["error"] or "")[:600]}
+                 for w in reversed(self.store.rows(
+                     "SELECT id,kind,status,title,error FROM jobs WHERE sid=? AND status!='obsolete' "
+                     "AND kind NOT IN ('gemini_chat','gpt_chat') ORDER BY rowid DESC LIMIT 20", sid))]
+        assets = self.store.rows("SELECT id,name,digest,meta FROM artifacts WHERE sid=? ORDER BY rowid DESC LIMIT 24", sid)
         draft = self.store.rows("SELECT draft FROM jobs WHERE sid=? AND kind='report' AND draft!='' AND status NOT IN ('obsolete','stopped') "
                                 "ORDER BY rowid DESC LIMIT 1", sid)
         # 将当前消息、引导、草稿与技能放在前面，大段历史记录放在末尾，避免下游按尾部截断时丢失最新输入。
         context = {"当前需求": session["brief"], "需求版本": session["versions"], "本次任务": job["payload"]}
         if job["kind"] == "plan":
-            context["待处理用户消息"] = [e["body"] for e in entries if e["actor"] == "user"
-                                         and not e["meta"].get("direct") and e["meta"].get("revision", 0) > session["planned"]]
+            pending_msgs = self.store.rows(
+                "SELECT body FROM events WHERE sid=? AND actor='user' AND NOT COALESCE(json_extract(meta,'$.direct'),0) "
+                "AND COALESCE(json_extract(meta,'$.revision'),0)>? ORDER BY seq", sid, session["planned"])
+            context["待处理用户消息"] = [e["body"] for e in pending_msgs]
         if job["guide_seq"]:
             context["用户对本任务的引导"] = [e["body"] for e in self.store.rows(
                 "SELECT body FROM events WHERE sid=? AND seq>? AND seq<=? AND json_extract(meta,'$.guide')=1 "
@@ -813,6 +817,39 @@ class Engine:
         self.windows.attach_image(job, request)
         return request, results, text, seq
 
+    def supervision_input(self, job, session, calls=()):
+        # 独立干净的监工上下文：只传原始需求、施工红线、真实 git diff 与验证记录，避免被对话历史或 GPT 自我解释带偏。
+        sid = job["sid"]
+        payload = job["payload"]
+        context = {
+            "原始需求": session["brief"],
+            "施工红线": payload.get("constraints", []),
+            "审查轮次": payload.get("review_round", 0) + 1,
+            "真实代码改动": payload.get("git_changes", {}),
+            "GPT 交付说明": (payload.get("engineering_output") or "")[:3000],
+            "共享记录": [],
+        }
+        verifications = self.store.rows(
+            "SELECT id,name,meta FROM artifacts WHERE sid=? AND json_extract(meta,'$.kind')='verification' "
+            "ORDER BY rowid DESC LIMIT 6", sid)
+        if verifications:
+            context["可读取的成果"] = verifications
+        request = dict(job, cursor=None, permission="ask", speed=session["speed"],
+                       daybreak=session["daybreak"], context_window=self.settings.context_window)
+        resume = (calls and job["backend"] == job["cursor_backend"] == "api"
+                  and job["model"] == job["cursor_model"])
+        if resume:
+            request["cursor"] = job["cursor"]
+        elif job["cursor"]:
+            context["本次任务的工具记录"] = self.store.rows(
+                "SELECT name,args,result FROM calls WHERE job=? ORDER BY rowid", job["id"])
+        limit = self.settings.context_window
+        strict = bool(limit)
+        if not limit and job["backend"] == "clients":
+            limit = AUTO_CLIENT_CONTEXT_WINDOW
+        results, text = shared_input(context, calls if resume else [], limit, strict=strict)
+        return request, results, text, 0
+
     def route_is_current(self, job):
         return self.store.db.execute(
             "SELECT 1 FROM jobs j JOIN sessions s ON s.id=j.sid WHERE j.id=? AND j.model=? AND j.effort=? AND s.backend=?",
@@ -902,15 +939,32 @@ class Engine:
             if self.store.job(jid)["guide_seq"] > request["guide_seq"]:
                 self.set_status(job, "ready")
                 return
+            if (job["backend"] == "clients" and PROVIDERS[job["kind"]] == "gemini"
+                    and job["kind"] not in ("gemini_chat", "supervision") and seen > 0):
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE sessions SET antigravity_seen=MAX(antigravity_seen, ?) "
+                        "WHERE id=? AND antigravity_session IS NOT NULL", (seen, sid))
             if job["kind"] == "plan":
                 self.store.apply_plan(job, reply.model_dump(), reply.reply)
                 return
             if job["kind"] == "goal_check" and not reply.calls:
                 raise ValueError("目标核对没有返回完成依据或下一步，请恢复目标以重新核对")
+            if job["kind"] == "supervision" and not reply.calls:
+                raise ValueError("监工审查未调用 submit_supervision 提交结论")
             if not reply.calls and not reply.text.strip():
                 raise ValueError("模型没有返回正文或工具调用")
             if job["kind"] == "report" and not reply.calls:
                 await self.check_report_sources(job, session)
+            supervise_diff = None
+            if (job["kind"] == "engineering" and not reply.calls
+                    and job["payload"].get("supervise") and not job["payload"].get("read_only")):
+                try:
+                    supervise_diff = await self.file_operation(
+                        sid, asyncio.to_thread(workspace.review_changes, sources, self.home))
+                except Exception:
+                    supervise_diff = {}
+                await self.gate(job)
             if job["kind"] == "verification" and not reply.calls:
                 current = await self.scan_files(sid, workspace.fingerprint, self.sources(session), exclude=self.home)
                 await self.gate(job)
@@ -944,6 +998,14 @@ class Engine:
                     if job["kind"] == "verification":
                         evidence = [a for a in evidence if a["meta"].get("source") == job["payload"]["source"]]
                         meta["evidence_status"] = "已记录依据" if evidence or reply.sources else "证据不足"
+                    if supervise_diff is not None:
+                        review_round = job["payload"].get("review_round", 0)
+                        self.store.enqueue(self.store.session(sid), "supervision", {
+                            "git_changes": supervise_diff,
+                            "constraints": job["payload"].get("constraints", []),
+                            "review_round": review_round,
+                            "engineering_output": reply.text[:3000],
+                        }, f"监工审查（第 {review_round + 1} 轮）")
                     self.store.finish(job, reply.text, {"artifact_id": aid, "text": reply.text,
                                       "evidence": evidence, **meta})
         except Superseded:
@@ -983,10 +1045,11 @@ class Engine:
         name = call["name"]
         if name in WINDOW_FUNCTIONS:
             result = await self.windows.execute(job, call)
+            scope = "共享桌面" if name.startswith("computer_") else "共享窗口"
             with self.store.db:
                 self.store.guard(job)
                 self.store.tool_result(call, result)
-                self.store.event(job["sid"], "progress", PROVIDERS[job["kind"]], "共享窗口 · " + WINDOW_LABELS[name],
+                self.store.event(job["sid"], "progress", PROVIDERS[job["kind"]], scope + " · " + WINDOW_LABELS[name],
                                  {"job": job["id"], "tool": name, "frame": result["frame"]})
             self.notify(job["sid"])
             return
@@ -1000,6 +1063,11 @@ class Engine:
             with st.db:
                 st.tool_result(call, args)
                 st.assess_goal(job, args["status"], args["evidence"], args["next_step"])
+            raise Superseded()
+        if name == "submit_supervision":
+            with st.db:
+                st.tool_result(call, args)
+                st.apply_supervision(job, args["verdict"], args["summary"], args["issues"])
             raise Superseded()
         if name == "ask_clarification":
             with st.db:

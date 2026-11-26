@@ -20,6 +20,8 @@ dependencies = [
     "rich>=15,<16",
     "pygments>=2.19,<3",
     "PySide6-Essentials>=6.8,<7",
+    "PySide6-Addons>=6.8,<7",
+    "av>=14",
     "qasync>=0.28,<0.29",
     "pywinpty>=2,<4; sys_platform == 'win32'",
     "prompt-toolkit>=3.0.48,<4",

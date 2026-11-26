@@ -20,14 +20,17 @@ DEPENDS = {
     **dict.fromkeys(CHAT_JOBS.values(), ()),
     "engineering": ("engineering",),
     "verification": ("engineering", "verification"),
+    "supervision": ("engineering",),
     "report": SCOPES,
     "section": SCOPES,
 }
 PROVIDERS = {**{kind: provider for provider, kind in CHAT_JOBS.items()},
-             "plan": "gemini", "report": "gemini", "section": "gemini", "engineering": "openai",
-             "verification": "openai", "proposal": "openai", "goal_check": "openai", "side": "openai"}
+             "plan": "gemini", "report": "gemini", "section": "gemini", "supervision": "gemini",
+             "engineering": "openai", "verification": "openai", "proposal": "openai",
+             "goal_check": "openai", "side": "openai"}
 LABELS = {**dict.fromkeys(CHAT_JOBS.values(), "直接对话"),
-          "plan": "解析需求", "engineering": "开发与研究", "verification": "验证", "report": "撰写报告",
+          "plan": "解析需求", "engineering": "开发与研究", "verification": "验证",
+          "supervision": "监工审查", "report": "撰写报告",
           "section": "撰写章节", "proposal": "制定计划", "goal_check": "核对目标", "side": "侧边问答"}
 MODES = {"default": "默认模式", "plan": "计划模式", "goal": "目标模式"}
 MODE_TITLES = {**MODES, "side": "侧边问答"}
@@ -157,6 +160,8 @@ class Store:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN backend TEXT NOT NULL DEFAULT 'api'")
             if "antigravity_session" not in columns:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN antigravity_session TEXT")
+            if "antigravity_seen" not in columns:
+                self.db.execute("ALTER TABLE sessions ADD COLUMN antigravity_seen INTEGER NOT NULL DEFAULT 0")
             if "backend_models" not in columns:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN backend_models TEXT NOT NULL DEFAULT '{}'")
             if "permission" not in columns:
@@ -789,6 +794,12 @@ class Store:
                                                  s["id"], kind)
                             if previous and previous[0]["payload"].get("read_only"):
                                 payload["read_only"] = True
+                    if kind == "engineering":
+                        if changes.get("constraints"):
+                            payload["constraints"] = list(changes["constraints"])
+                        if changes.get("supervise") and not payload.get("read_only"):
+                            payload["supervise"] = True
+                            payload["review_round"] = 0
                     jid = self.enqueue(s, kind, payload)
                     if kind == "report" and changes.get("report_after_gpt") and self.pending_work(s["id"]):
                         self.db.execute("UPDATE jobs SET status='waiting' WHERE id=?", (jid,))
@@ -866,9 +877,36 @@ class Store:
         if job["kind"] not in CHAT_JOBS.values():
             self.wake(job["sid"])
 
+    def apply_supervision(self, job, verdict, summary, issues):
+        sid = job["sid"]
+        self.guard(job)
+        self.db.execute("UPDATE jobs SET status='done',draft=?,error='',model=?,effort=? WHERE id=?",
+                        (summary, job["model"], job["effort"], job["id"]))
+        review_round = job["payload"].get("review_round", 0)
+        if verdict == "pass":
+            self.event(sid, "progress", "gemini", "监工审查通过 · " + summary,
+                       {"job": job["id"], "kind": "supervision", "verdict": "pass"})
+        elif verdict == "reject" and review_round < 2:
+            self.event(sid, "progress", "gemini", f"监工打回（第 {review_round + 1} 轮）· {summary}",
+                       {"job": job["id"], "kind": "supervision", "verdict": "reject", "issues": issues})
+            session = self.session(sid)
+            rework_payload = {
+                "supervise": True,
+                "review_round": review_round + 1,
+                "constraints": job["payload"].get("constraints", []),
+                "supervision_feedback": {"summary": summary, "issues": issues},
+            }
+            self.enqueue(session, "engineering", rework_payload, f"返工修复（第 {review_round + 1} 轮）")
+        else:
+            prefix = "监工提醒（已达最大返工轮次，请确认）" if verdict == "reject" else "监工提醒（需要你拍板）"
+            lines = [f"{prefix}：{summary}", *(f"- {item}" for item in issues)]
+            self.event(sid, "message", "gemini", "\n".join(lines),
+                       {"job": job["id"], "kind": "supervision", "verdict": verdict, "issues": issues})
+        self.wake(sid)
+
     def pending_work(self, sid):
         return self.db.execute(
-            "SELECT 1 FROM jobs WHERE sid=? AND kind IN ('engineering','verification','section') "
+            "SELECT 1 FROM jobs WHERE sid=? AND kind IN ('engineering','verification','supervision','section') "
             "AND status IN ('ready','running','needs_key','waiting') LIMIT 1", (sid,),
         ).fetchone() is not None
 

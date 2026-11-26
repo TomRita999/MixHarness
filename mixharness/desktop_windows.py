@@ -1,6 +1,7 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QComboBox, QDialog, QHBoxLayout, QListWidget, QListWidgetItem, QVBoxLayout
 
+from .computer_use import DESKTOP_TARGET
 from .desktop_widgets import button, label
 from .window_native import supported
 
@@ -28,7 +29,7 @@ def session_for_share(host):
                                          recipient=host.recipient, efforts=efforts)
     sid = session['id']
     new_key = 'drafts/' + sid
-    # 用户可以在第一条消息发出前共享窗口，将输入框里的文字和附件一起移入新会话。
+    # 用户可以在第一条消息发出前选择共享范围，将文字和附件一起移入新会话。
     with host.engine.store.db:
         host.engine.store.db.execute('UPDATE draft_inputs SET draft=? WHERE draft=?', (new_key, old_key))
     host.settings.setValue(new_key, host.editor.toPlainText())
@@ -47,19 +48,19 @@ class WindowPicker(QDialog):
         self.pending = None
         self.dismissed = False
         self.permissions = {}
-        self.setWindowTitle('与 AI 共享窗口')
+        self.setWindowTitle('与 AI 共享窗口或桌面')
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.resize(550, 420)
         layout = QVBoxLayout(self)
-        notice = label('选择一个窗口。本次会话使用的模型可以按需读取该窗口的画面。')
-        notice.setWordWrap(True)
-        layout.addWidget(notice)
+        self.notice = label('选择要与当前会话共享的窗口或整个桌面。')
+        self.notice.setWordWrap(True)
+        layout.addWidget(self.notice)
         self.choices = QListWidget()
-        self.choices.setAccessibleName('可共享的窗口')
+        self.choices.setAccessibleName('可共享的窗口和桌面')
         layout.addWidget(self.choices, 1)
         self.access = QComboBox()
-        self.access.setAccessibleName('窗口共享权限')
+        self.access.setAccessibleName('共享权限')
         for value, caption in ACCESS_NAMES.items():
             self.access.addItem(caption, value)
         layout.addWidget(self.access)
@@ -83,18 +84,31 @@ class WindowPicker(QDialog):
         self.finished.connect(self.finish_picker)
         self.update_controls()
 
+    def selected_target(self):
+        items = self.choices.selectedItems()
+        return items[0].data(Qt.ItemDataRole.UserRole) if items else None
+
     def update_controls(self):
         idle = self.pending is None
+        target = self.selected_target()
+        desktop = target == DESKTOP_TARGET
         control = self.access.currentData() == 'control'
+        if desktop and control:
+            self.notice.setText('当前会话中的 AI 可以读取全部显示器，并按会话审批设置在多个应用窗口中点击、拖拽和输入。')
+        elif desktop:
+            self.notice.setText('当前会话中的 AI 可以列出应用和窗口，读取显示器或窗口截图，并在系统授权后读取界面控件。')
+        else:
+            self.notice.setText('选择要与当前会话共享的窗口或整个桌面。')
+        self.confirm.setText('共享整个桌面' if desktop else '共享所选窗口')
         self.reload_button.setEnabled(idle and supported())
         self.screen_button.setVisible(self.permissions.get('screen') is False)
-        self.control_button.setVisible(control and self.permissions.get('accessibility') is False)
+        self.control_button.setVisible((control or desktop) and self.permissions.get('accessibility') is False)
         self.screen_button.setEnabled(idle)
         self.control_button.setEnabled(idle)
         self.access.setEnabled(idle)
         self.choices.setEnabled(idle)
         allowed = self.permissions.get('screen') and (not control or self.permissions.get('accessibility'))
-        self.confirm.setEnabled(bool(idle and allowed and self.choices.selectedItems()))
+        self.confirm.setEnabled(bool(idle and allowed and target))
 
     def finish_picker(self):
         self.dismissed = True
@@ -119,7 +133,7 @@ class WindowPicker(QDialog):
 
     def reload(self, permission=None):
         if not supported():
-            self.status.setText('共享窗口需要 macOS 14.2 或更新版本。')
+            self.status.setText('共享窗口或桌面需要 macOS 14.2 或更新版本。')
             return
         async def load():
             self.choices.clear()
@@ -134,21 +148,25 @@ class WindowPicker(QDialog):
                 item = QListWidgetItem(window_caption(choice))
                 item.setData(Qt.ItemDataRole.UserRole, choice['target'])
                 self.choices.addItem(item)
-            self.status.setText('' if self.choices.count() else '当前没有可共享的窗口。')
+            desktop = QListWidgetItem('整个桌面 · 所有显示器与应用窗口')
+            desktop.setData(Qt.ItemDataRole.UserRole, DESKTOP_TARGET)
+            self.choices.addItem(desktop)
+            self.choices.setCurrentRow(-1)
+            self.choices.clearSelection()
+            self.status.clear()
         self.start(load)
 
     def bind(self):
-        selection = self.choices.selectedItems()
-        if not selection or not self.confirm.isEnabled():
+        target = self.selected_target()
+        if not target or not self.confirm.isEnabled():
             return
-        target = selection[0].data(Qt.ItemDataRole.UserRole)
         access = self.access.currentData()
         async def select():
             if self.host.draft_key() != self.owner:
-                raise ValueError('当前会话已经变化，请在目标会话中重新选择窗口。')
+                raise ValueError('当前会话已经变化，请在目标会话中重新选择共享范围。')
             sid = session_for_share(self.host)
             self.owner = self.host.draft_key()
-            self.status.setText('正在确认所选窗口…')
+            self.status.setText('正在确认共享范围…')
             await self.host.engine.windows.bind(sid, target, access)
             self.host.inputs.restore()
             self.pending = None

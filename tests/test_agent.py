@@ -242,3 +242,65 @@ class AgentTests(unittest.TestCase):
             relaxed = json.loads(compact_context(oversized, 128, strict=False))
             self.assertEqual(relaxed["本次提问"], oversized["本次提问"])
             self.assertEqual(relaxed["共享记录"], [])
+
+    def test_antigravity_incremental_seen_and_supervision_loop(self):
+        from mixharness.providers import instructions
+        with open_engine(self.root, self.home) as engine:
+            store = engine.store
+            sid = new_id()
+            with store.db:
+                store.create(sid, str(self.root), "gemini", "gpt", backend="clients")
+                store.event(sid, "message", "user", "第一轮旧消息")
+                first_seq = store.event(sid, "message", "gemini", "第一轮旧回复")
+                store.db.execute("UPDATE sessions SET antigravity_session='ag-1', antigravity_seen=? WHERE id=?",
+                                 (first_seq, sid))
+            engine.submit(sid, "请给项目加个新功能", new_id())
+            plan_job = store.one("SELECT j.*,s.backend FROM jobs j JOIN sessions s ON s.id=j.sid "
+                                 "WHERE j.sid=? AND j.kind='plan' ORDER BY j.rowid DESC LIMIT 1", sid)
+            _, _, plan_text, _ = engine.turn_input(plan_job, store.session(sid), [])
+            parsed = json.loads(plan_text)
+            self.assertEqual([e["text"] for e in parsed["共享记录"]], ["请给项目加个新功能"])
+            self.assertEqual(parsed["待处理用户消息"], ["请给项目加个新功能"])
+
+            # 监工打回 -> 触发带反馈的返工 -> 第二轮通过 -> 唤醒等待中的报告
+            store.db.execute("UPDATE jobs SET status='running' WHERE id=?", (plan_job["id"],))
+            store.db.commit()
+            store.apply_plan(plan_job, {
+                "engineering": "实现功能", "engineering_mode": "develop",
+                "report": "写变更总结", "report_after_gpt": True,
+                "constraints": ["禁止私自加硬编码超时"], "supervise": True,
+            }, "")
+            eng = store.one("SELECT * FROM jobs WHERE sid=? AND kind='engineering'", sid)
+            rep = store.one("SELECT * FROM jobs WHERE sid=? AND kind='report'", sid)
+            self.assertTrue(eng["payload"]["supervise"])
+            self.assertEqual(rep["status"], "waiting")
+            self.assertIn("禁止私自加硬编码超时", instructions(eng))
+
+            with store.db:
+                sup_id = store.enqueue(store.session(sid), "supervision", {
+                    "git_changes": {"diff": "+ timeout=420"}, "constraints": ["禁止私自加硬编码超时"],
+                    "review_round": 0, "engineering_output": "已加7分钟超时",
+                }, "监工审查（第 1 轮）")
+                store.db.execute("UPDATE jobs SET status='done' WHERE id=?", (eng["id"],))
+                store.db.execute("UPDATE jobs SET status='running' WHERE id=?", (sup_id,))
+            sup = store.one("SELECT j.*,s.backend FROM jobs j JOIN sessions s ON s.id=j.sid WHERE j.id=?", sup_id)
+            _, _, sup_text, _ = engine.turn_input(sup, store.session(sid), [])
+            self.assertIn("timeout=420", sup_text)
+            self.assertEqual(json.loads(sup_text)["共享记录"], [])
+
+            with store.db:
+                store.apply_supervision(sup, "reject", "发现私自添加7分钟超时", ["engine.py: 禁止硬编码 timeout=420"])
+            rework = store.one("SELECT * FROM jobs WHERE sid=? AND kind='engineering' ORDER BY rowid DESC LIMIT 1", sid)
+            self.assertEqual(rework["payload"]["review_round"], 1)
+            self.assertIn("禁止硬编码 timeout=420", instructions(rework))
+            self.assertEqual(store.job(rep["id"])["status"], "waiting")
+
+            with store.db:
+                sup2_id = store.enqueue(store.session(sid), "supervision", {
+                    "git_changes": {"diff": "- timeout=420"}, "constraints": ["禁止私自加硬编码超时"],
+                    "review_round": 1, "engineering_output": "已移除超时",
+                }, "监工审查（第 2 轮）")
+                store.db.execute("UPDATE jobs SET status='done' WHERE id=?", (rework["id"],))
+                store.db.execute("UPDATE jobs SET status='running' WHERE id=?", (sup2_id,))
+                store.apply_supervision(store.job(sup2_id), "pass", "已移除超时限制，无其他问题", [])
+            self.assertEqual(store.job(rep["id"])["status"], "ready")

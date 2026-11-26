@@ -11,6 +11,36 @@
 - (void)pressed:(id)sender { self.count += 1; }
 @end
 
+@interface GesturePad : NSView
+@property(nonatomic) NSInteger doubleClicks;
+@property(nonatomic) NSInteger drags;
+@property(nonatomic) NSPoint pressPosition;
+@property(nonatomic) BOOL moved;
+@end
+
+@implementation GesturePad
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+- (BOOL)isAccessibilityElement { return YES; }
+- (NSString *)accessibilityRole { return NSAccessibilityGroupRole; }
+- (void)drawRect:(NSRect)dirtyRect {
+    [[NSColor colorWithSRGBRed:0.12 green:0.75 blue:0.20 alpha:1.0] setFill];
+    NSRectFill(dirtyRect);
+}
+- (void)mouseDown:(NSEvent *)event {
+    self.pressPosition = event.locationInWindow;
+    self.moved = NO;
+    if (event.clickCount == 2) self.doubleClicks++;
+}
+- (void)mouseDragged:(NSEvent *)event {
+    NSPoint point = event.locationInWindow;
+    if (hypot(point.x - self.pressPosition.x, point.y - self.pressPosition.y) >= 3) self.moved = YES;
+}
+- (void)mouseUp:(NSEvent *)event {
+    if (self.moved) self.drags++;
+    self.moved = NO;
+}
+@end
+
 static NSWindow *windowAt(NSRect frame, NSString *title) {
     NSWindow *window = [[NSWindow alloc] initWithContentRect:frame styleMask:NSWindowStyleMaskTitled
                                                     backing:NSBackingStoreBuffered defer:NO];
@@ -52,11 +82,7 @@ int main(void) {
         NSButton *button = [NSButton buttonWithTitle:@"记录点击" target:counter action:@selector(pressed:)];
         button.frame = NSMakeRect(12, 188, 140, 34);
         [window.contentView addSubview:button];
-        NSBox *swatch = [[NSBox alloc] initWithFrame:NSMakeRect(215, 185, 110, 40)];
-        swatch.boxType = NSBoxCustom;
-        swatch.borderWidth = 0;
-        swatch.transparent = NO;
-        swatch.fillColor = [NSColor colorWithSRGBRed:0.12 green:0.75 blue:0.20 alpha:1.0];
+        GesturePad *swatch = [[GesturePad alloc] initWithFrame:NSMakeRect(215, 185, 110, 40)];
         [window.contentView addSubview:swatch];
         NSScrollView *scroll = [NSTextView scrollableTextView];
         scroll.frame = NSMakeRect(12, 12, 336, 158);
@@ -102,7 +128,9 @@ int main(void) {
             } else if (![action isEqual:@"inspect"]) { exit(2); }
             NSDictionary *state = @{@"seq":@(sequence), @"target":target, @"title":window.title,
                 @"width":@(NSWidth(window.frame)), @"height":@(NSHeight(window.frame)),
+                @"active":@(NSRunningApplication.currentApplication.active), @"keyWindow":@(window.isKeyWindow),
                 @"button":centerInCapture(button), @"swatch":centerInCapture(swatch),
+                @"doubleClicks":@(swatch.doubleClicks), @"drags":@(swatch.drags),
                 @"scrollArea":centerInCapture(scroll.contentView), @"scrollY":@(NSMinY(scroll.contentView.bounds)),
                 @"clicks":@(counter.count), @"text":editor.string, @"length":@(editor.string.length),
                 @"selected":@(editor.selectedRange.length), @"otherText":otherField.stringValue};
