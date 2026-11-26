@@ -256,6 +256,17 @@ def check_commands(config, inherited=None):
     return commands
 
 
+def clear_git_context(environment):
+    # Git 的命令行配置按数量、键和值成组传递，值中也可能包含凭据。
+    # 仓库、索引和对象目录必须由验证副本中的 Git 命令自行确定。
+    local = {"GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE",
+             "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"}
+    for key in tuple(environment):
+        name = key.upper()
+        if name in local or name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            del environment[key]
+
+
 async def run_check(source, runs, argv, timeout=180, invocation=None, project=None, python=None, subdirectory=".", isolated_compile=False):
     run_dir = runs / (invocation or new_id())
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -273,6 +284,7 @@ async def run_check(source, runs, argv, timeout=180, invocation=None, project=No
         python = str(venv) if venv.is_file() else ("" if frozen else sys.executable)
     command = [sys.executable, runner, str(run_dir), str(source), str(timeout), python, subdirectory, *argv]
     env = {k: v for k, v in os.environ.items() if not any(word in k.upper() for word in ("KEY", "TOKEN", "PASSWORD", "SECRET"))}
+    clear_git_context(env)
     launching = asyncio.create_task(asyncio.create_subprocess_exec(
         *command, env=env, stdin=subprocess.DEVNULL, start_new_session=os.name != "nt",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))

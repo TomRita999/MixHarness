@@ -76,7 +76,7 @@ class InputTests(unittest.TestCase):
                 window.add_input.click()
                 menu = app.activePopupWidget()
                 self.assertEqual({a.text() for a in menu.actions() if not a.isSeparator()},
-                                 {"添加图片…", "引用会话…", "引用工具…", "使用技能…"})
+                                 {"添加图片…", "与 AI 共享窗口…", "引用会话…", "引用工具…", "使用技能…"})
                 QTest.keyClick(menu, Qt.Key.Key_Escape)
                 mime = QMimeData()
                 mime.setImageData(QImage(str(ICON)))

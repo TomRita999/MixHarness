@@ -15,6 +15,7 @@ from .catalog import ModelCatalog
 from .clients import CLIENTS, ClientCatalog, CodexTurnError, private_directory, workflow_turn
 from .providers import FUNCTIONS, tool_names, google_turn, openai_turn
 from .reasoning import api_levels, group_for, model_available, resolve_choice, select_daybreak_model
+from .shared_window import LABELS as WINDOW_LABELS, WINDOW_FUNCTIONS, WindowShares
 from .store import CHAT_JOBS, PROVIDERS, Store, Superseded, accepts_guidance, new_id, now, pack
 
 
@@ -34,6 +35,7 @@ class Engine:
         self.store = store
         self.home = home
         self.project = project
+        self.windows = WindowShares(self)
         self.active = {}
         self.stopping = {}
         self.activity = {}
@@ -189,6 +191,9 @@ class Engine:
         with self.store.db:
             self.store.db.execute("UPDATE sessions SET permission=?,speed=? WHERE id=?", (mode, tier, sid))
             if mode != session["permission"]:
+                share = self.windows.bindings.get(sid)
+                if share:
+                    share.clear_frame()
                 self.store.db.execute("DELETE FROM approvals WHERE sid=? AND decision='pending'", (sid,))
                 for job, task in self.active.items():
                     if self.store.db.execute("UPDATE jobs SET status='ready' WHERE id=? AND sid=? AND status='running'",
@@ -375,6 +380,7 @@ class Engine:
                     raise ValueError(catalog.error or catalog.view()["client"] + " 没有提供所选模型")
         if self.store.session(sid)["backend"] != backend:
             self.check_daybreak(backend, models["openai"], False)
+            self.windows.discard(sid)
         self.store.switch_backend(sid, backend, models, efforts, recipient=recipient)
         self.notify(sid)
 
@@ -410,6 +416,9 @@ class Engine:
         self.notify(sid)
 
     def notify(self, sid):
+        if sid in self.windows.bindings and not self.store.db.execute(
+                "SELECT 1 FROM sessions WHERE id=? AND archived=0", (sid,)).fetchone():
+            self.windows.discard(sid)
         self.changes[sid] = self.changes.get(sid, 0) + 1
         self.signal.set()
 
@@ -422,6 +431,7 @@ class Engine:
         store = self.store
         with store.db:
             session = store.session(sid)
+            self.windows.discard(sid)
             jobs = store.active_jobs(sid)
             count = store.stop_jobs(sid, user_requested=True)
             if count and session["goal_status"] == "active":
@@ -459,6 +469,7 @@ class Engine:
 
     def delete_session(self, sid):
         jobs = self.store.delete_session(sid)
+        self.windows.discard(sid)
         def closed(task):
             self.closing_jobs[sid].discard(task)
             if not self.closing_jobs[sid]:
@@ -650,6 +661,8 @@ class Engine:
                 if not task.cancelling():
                     task.cancel()
             await asyncio.gather(cleanup, config, *self.active.values(), *self.stopping.values(), return_exceptions=True)
+            for sid in tuple(self.windows.bindings):
+                self.windows.discard(sid)
 
     def set_status(self, job, status):
         with self.store.db:
@@ -673,7 +686,7 @@ class Engine:
 
     def turn_input(self, job, session, calls):
         if job["kind"] in CHAT_JOBS.values():
-            return self.chat_input(job, session)
+            return self.chat_input(job, session, calls)
         # 只有产生此轮工具调用的 API 和模型可以接收原来的调用编号。
         resume = ((calls or (not self.settings.context_window and not session["context_after"])) and job["cursor"] is not None
                   and job["backend"] == job["cursor_backend"] == "api"
@@ -701,6 +714,7 @@ class Engine:
         context = {"当前需求": session["brief"], "需求版本": session["versions"], "本次任务": job["payload"],
                    "共享记录": history, "任务": works, "可读取的成果": assets,
                    "各来源文件夹的验证命令": self.checks(self.sources(session))}
+        self.windows.prepare_context(job, session, request, context)
         if job["guide_seq"]:
             context["用户对本任务的引导"] = [e["body"] for e in self.store.rows(
                 "SELECT body FROM events WHERE sid=? AND seq>? AND seq<=? AND json_extract(meta,'$.guide')=1 "
@@ -744,9 +758,10 @@ class Engine:
         if attached:
             retained = {e["seq"] for e in json.loads(text)["共享记录"]}
             request["images"] = self.image_inputs([items for seq, items in attached.items() if seq == latest or seq in retained])
+        self.windows.attach_image(job, request)
         return request, results, text, seen
 
-    def chat_input(self, job, session):
+    def chat_input(self, job, session, calls=()):
         sid, seq = job["sid"], job["payload"]["message_seq"]
         prompt = self.store.one("SELECT body FROM events WHERE sid=? AND seq=?", sid, seq)["body"]
         entries = self.store.rows("SELECT seq,actor,body,json_extract(meta,'$.model') AS model "
@@ -767,12 +782,21 @@ class Engine:
             context["当前消息附件"] = self.describe_inputs(attached[seq])
         if job["payload"].get("interrupted_turn"):
             context["中断前的进度"] = job["payload"]["interrupted_turn"]
-        _, text = shared_input(context, [], self.settings.context_window)
-        kept = [e["seq"] for e in json.loads(text)["共享记录"]]
-        images = self.image_inputs([attached[i] for i in [*kept, seq] if i in attached])
-        request = dict(job, cursor=None, images=images, permission="ask", speed=session["speed"],
+        request = dict(job, cursor=None, permission="ask", speed=session["speed"],
                        daybreak=session["daybreak"], context_window=self.settings.context_window)
-        return request, [], text, seq
+        self.windows.prepare_context(job, session, request, context)
+        resume = (calls and job["backend"] == job["cursor_backend"] == "api"
+                  and job["model"] == job["cursor_model"])
+        if resume:
+            request["cursor"] = job["cursor"]
+        elif job["cursor"]:
+            context["本次任务的工具记录"] = self.store.rows(
+                "SELECT name,args,result FROM calls WHERE job=? ORDER BY rowid", job["id"])
+        results, text = shared_input(context, calls if resume else [], self.settings.context_window)
+        kept = [e["seq"] for e in json.loads(text)["共享记录"]]
+        request["images"] = self.image_inputs([attached[i] for i in [*kept, seq] if i in attached])
+        self.windows.attach_image(job, request)
+        return request, results, text, seq
 
     def route_is_current(self, job):
         return self.store.db.execute(
@@ -942,6 +966,15 @@ class Engine:
 
     async def tool(self, job, call, sources):
         name = call["name"]
+        if name in WINDOW_FUNCTIONS:
+            result = await self.windows.execute(job, call)
+            with self.store.db:
+                self.store.guard(job)
+                self.store.tool_result(call, result)
+                self.store.event(job["sid"], "progress", PROVIDERS[job["kind"]], "共享窗口 · " + WINDOW_LABELS[name],
+                                 {"job": job["id"], "tool": name, "frame": result["frame"]})
+            self.notify(job["sid"])
+            return
         if name not in tool_names(job["kind"], job["payload"]):
             raise ValueError(f"当前任务无法使用工具 {name}")
         args = FUNCTIONS[name][0].model_validate(call["args"]).model_dump()

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from filelock import Timeout
 
-from .commands import control_server, dispatch, remote_command
+from .commands import control_server, dispatch, remote_command, window_command
 from .engine import open_engine
 
 
@@ -29,6 +29,19 @@ def parser():
         entry.add_argument("--backend", choices=("clients", "api"), default="clients")
         entry.add_argument("--project-id", help="项目编号")
         entry.add_argument("--permission", choices=("ask", "auto", "full"), default="ask")
+    window = sub.add_parser('window', help='与 AI 共享指定窗口')
+    operations = window.add_subparsers(dest='window_action', required=True)
+    operations.add_parser('list', help='列出可共享的窗口及目标编号')
+    permissions = operations.add_parser('permissions', help='查询系统权限，或请求指定权限')
+    permissions.add_argument('request', choices=('screen', 'accessibility'), nargs='?')
+    bind = operations.add_parser('bind', help='将选定窗口共享给持续运行的会话引擎')
+    bind.add_argument('id', help='会话编号')
+    bind.add_argument('target', help='window list 返回的 target')
+    bind.add_argument('--control', dest='access', action='store_const', const='control', default='view',
+                      help='允许 AI 在会话审批规则下操作窗口，默认仅查看')
+    for action, caption in (('status', '查看当前共享窗口'), ('stop', '停止共享窗口')):
+        command = operations.add_parser(action, help=caption)
+        command.add_argument('id', help='会话编号')
     sub.add_parser("projects", help="列出项目")
     sub.add_parser("connections", help="查看密钥配置状态")
     settings = sub.add_parser("settings", help="配置上下文窗口与技能")
@@ -110,6 +123,8 @@ async def execute(project, home, args):
             connected, result = await remote_command(home, {"command": "projects"} if interactive else args)
             if connected:
                 return await Terminal(remote, args).run() if interactive else result
+            if args['command'] == 'window':
+                return await window_command(args, home=home)
         manager = open_engine(project, home)
         try:
             engine = manager.__enter__()

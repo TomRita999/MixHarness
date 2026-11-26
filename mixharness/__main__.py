@@ -5,10 +5,19 @@ from pathlib import Path
 
 def main():
     args = sys.argv[1:]
-    if args and args[0] in ("cli", "--cli", "models", "usage", "chats", "history", "projects", "connections", "project-create", "new",
-                            "run", "send", "wait", "status", "serve", "chat", "command", "settings", "desktop", "--library", "--version"):
+    # 桌面端、Web 和 CLI 共用 --data-dir，由它后面的参数决定入口。
+    index = 0
+    while index < len(args) and args[index].partition("=")[0] == "--data-dir":
+        index += 2 if args[index] == "--data-dir" else 1
+    entry = args[index] if index < len(args) else ""
+    cli_entries = ("cli", "--cli", "models", "usage", "chats", "history", "projects", "connections", "project-create",
+                   "new", "run", "send", "wait", "status", "serve", "chat", "command", "settings", "window", "desktop",
+                   "--library", "--version")
+    if entry in cli_entries or entry.startswith("--library="):
         from .cli import main as cli
-        return cli(args[1:] if args[0] in ("cli", "--cli") else args)
+        if entry in ("cli", "--cli"):
+            args.pop(index)
+        return cli(args)
     web = "--web" in args or any(arg == "--port" or arg.startswith("--port=") for arg in args)
     if not web:
         from .desktop_main import main as desktop

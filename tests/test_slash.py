@@ -120,7 +120,7 @@ class SlashTests(unittest.TestCase):
         project = source / "子项目"
         project.mkdir(parents=True)
         def git(*args):
-            return subprocess.run(["git", "-C", str(source), *args], check=True, capture_output=True)
+            return subprocess.run(["git", "-C", str(source), *args], check=True, stdout=subprocess.PIPE)
         git("init")
         readme = project / "README.md"
         shutil.copyfile(ROOT / "README.md", readme)
@@ -130,7 +130,7 @@ class SlashTests(unittest.TestCase):
         readme.rename(project / "之前的说明.md")
         shutil.copyfile(ROOT / "pyproject.toml", project / "pyproject.toml")
         git("add", "子项目/pyproject.toml")
-        (project / ".env").write_text("EXCLUDED=1", encoding="utf-8")
+        (project / ".env").write_text("EXCLUDED=1\n", encoding="utf-8")
         with open_engine(self.root, self.root / "data") as engine:
             sid = engine.create_session(**{p: m[0] for p, m in MODELS.items()}, directory=project)["id"]
             engine.submit(sid, "请审查这次的项目调整", new_id())

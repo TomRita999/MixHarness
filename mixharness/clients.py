@@ -427,7 +427,7 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                 engine.set_activity(job, "Codex 已开始生成")
             elif method == "item/agentMessage/delta":
                 fragments.append(params["delta"])
-                if job["kind"] == "gpt_chat":
+                if job["kind"] == "gpt_chat" and schema is None:
                     engine.previews[job["id"]] = "".join(fragments)
             elif method == "item/completed" and params["item"]["type"] == "agentMessage":
                 final = params["item"]["text"]
@@ -505,7 +505,7 @@ class PlanQuestion(Exception):
     pass
 
 
-async def antigravity_turn(engine, job, cwd, prompt):
+async def antigravity_turn(engine, job, cwd, prompt, *, preview_text=True):
     # 一个主会话只关联一条独立存储的 Antigravity 会话；并行的报告和章节顺序续接。
     sid, model, permission = job["sid"], job["model"], job["permission"]
     direct = job["kind"] == "gemini_chat"
@@ -545,7 +545,7 @@ async def antigravity_turn(engine, job, cwd, prompt):
             engine.set_activity(job, "Antigravity 正在处理请求")
             if update.get("sessionUpdate") == "agent_message_chunk":
                 fragments.append(update["content"].get("text", ""))
-                if job["kind"] == "gemini_chat":
+                if direct and preview_text:
                     engine.previews[job["id"]] = "".join(fragments)
             elif update.get("sessionUpdate") in ("tool_call", "tool_call_update"):
                 key = update["toolCallId"]
@@ -571,33 +571,37 @@ async def antigravity_turn(engine, job, cwd, prompt):
         return "".join(fragments)
 
 
-async def workflow_turn(engine, job, context, cwd):
-    kind, sid = job["kind"], job["sid"]
-    if kind in CHAT_JOBS.values():
-        prompt = PROMPTS[kind] + "\n共享会话\n" + context
-        if kind == "gemini_chat":
-            text = await antigravity_turn(engine, job, cwd, prompt)
-        else:
-            text = await codex_turn(engine, job, cwd, prompt, None)
-        return Turn(new_id(), text)
+def client_prompt(job, context):
+    kind = job["kind"]
     if kind == "proposal":
-        prompt = PROMPTS[kind] + " 必要时使用客户端的提问功能。\n共享会话\n" + context
-        try:
-            return Turn(new_id(), await codex_turn(engine, job, cwd, prompt, None))
-        except PlanQuestion as question:
-            return Turn(new_id(), "", [{"cid": new_id(), "name": "ask_clarification", "args": {"question": str(question)}}])
-    schema = (Plan if kind == "plan" else ClientReply).model_json_schema()
+        return PROMPTS[kind] + " 必要时使用客户端的提问功能。\n共享会话\n" + context, None
     tools = declarations(kind, job["payload"]) if kind != "plan" else []
+    if kind in CHAT_JOBS.values() and not tools:
+        return PROMPTS[kind] + "\n共享会话\n" + context, None
+    schema = (Plan if kind == "plan" else ClientReply).model_json_schema()
     prompt = (instructions(job) + "\n请严格返回符合下方 JSON Schema 的 JSON 对象。"
               "需要调用 MixHarness 工具时，在 calls 中填写工具名与 JSON 字符串 arguments，结果会在下一轮返回。"
               "\n输出格式\n" + pack(schema) + "\n可用工具\n" + pack(tools) + "\n共享会话\n" + context)
+    if kind in CHAT_JOBS.values():
+        prompt += "\n将面向用户的文字或 Markdown 写在 text 中。通过列出的窗口工具访问用户所选的窗口。"
+    if kind in ("engineering", "verification") and is_dot_model(job["model"]) and not job["payload"].get("read_only"):
+        prompt += ("\nCodex 在只读环境中分析项目。需要修改文件或运行验证时，在 calls 中提出已列出的 MixHarness 工具请求。"
+                   "MixHarness 按当前会话权限审批并执行。收到工具回执后再报告实际结果。")
+    return prompt, schema
+
+
+async def workflow_turn(engine, job, context, cwd):
+    kind = job["kind"]
+    prompt, schema = client_prompt(job, context)
     if PROVIDERS[kind] == "openai":
-        if is_dot_model(job["model"]) and kind in ("engineering", "verification") and not job["payload"].get("read_only"):
-            prompt += ("\nCodex 在只读环境中分析项目。需要修改文件或运行验证时，在 calls 中提出已列出的 MixHarness 工具请求。"
-                       "MixHarness 按当前会话权限审批并执行。收到工具回执后再报告实际结果。")
-        raw = await codex_turn(engine, job, cwd, prompt, schema)
+        try:
+            raw = await codex_turn(engine, job, cwd, prompt, schema)
+        except PlanQuestion as question:
+            return Turn(new_id(), "", [{"cid": new_id(), "name": "ask_clarification", "args": {"question": str(question)}}])
     else:
-        raw = await antigravity_turn(engine, job, cwd, prompt)
+        raw = await antigravity_turn(engine, job, cwd, prompt, preview_text=schema is None)
+    if schema is None:
+        return Turn(new_id(), raw)
     raw = raw.strip()
     if raw.startswith("~~~") or raw.startswith(chr(96) * 3):
         blocks = MarkdownIt().parse(raw)

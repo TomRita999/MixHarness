@@ -11,6 +11,7 @@ from .agent_settings import skill_catalog
 from .attachments import Attachment, MAX_ITEMS, TYPES
 from .desktop_clients import ClientHistory
 from .desktop_widgets import Document, button, label
+from .desktop_windows import ACCESS_NAMES, WindowPicker, window_caption
 from .providers import FUNCTIONS
 
 
@@ -116,8 +117,14 @@ class ComposerInputs(QScrollArea):
         self.library = window.engine.store.inputs
         self.items = []
         self.dialog = None
+        self.shown_share = None
+        self.share_timer = QTimer(self)
+        self.share_timer.setInterval(350)
+        self.share_timer.timeout.connect(self.refresh_share)
+        window.closed.connect(self.share_timer.stop)
+        self.share_timer.start()
         self.setObjectName("composerInputs")
-        self.setAccessibleName("待发送的附件")
+        self.setAccessibleName("附件与共享窗口")
         self.viewport().setAutoFillBackground(False)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setWidgetResizable(True)
@@ -126,13 +133,26 @@ class ComposerInputs(QScrollArea):
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.hide()
 
+    def refresh_share(self):
+        if self.window.engine.windows.status(self.window.sid) != self.shown_share:
+            self.restore()
+
     def restore(self):
         self.items = self.library.metadata(self.window.draft_key())
+        self.shown_share = self.window.engine.windows.status(self.window.sid)
         row = QWidget()
         row.setObjectName("inputStrip")
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
+        if self.shown_share:
+            caption = window_caption(self.shown_share) + ' · ' + ACCESS_NAMES[self.shown_share['access']]
+            sharing = label('正在共享 · ' + self.fontMetrics().elidedText(caption, Qt.TextElideMode.ElideMiddle, 300), 'caption')
+            sharing.setTextFormat(Qt.TextFormat.PlainText)
+            sharing.setToolTip(caption)
+            sharing.setAccessibleName('正在共享窗口 · ' + caption)
+            layout.addWidget(sharing)
+            layout.addWidget(button('停止共享', self.stop_sharing))
         for item in self.items:
             preview = attachment_button(row, self.library, item, large=True)
             layout.addWidget(preview)
@@ -147,8 +167,22 @@ class ComposerInputs(QScrollArea):
         self.setFixedHeight(126 if any(item["kind"] == "image" for item in self.items) else 40)
         self.setWidget(row)
         row.setAutoFillBackground(False)
-        self.setVisible(bool(self.items))
+        self.setVisible(bool(self.items or self.shown_share))
         self.changed.emit()
+
+    def stop_sharing(self):
+        sid = self.window.sid
+        async def stop():
+            await self.window.engine.windows.stop(sid)
+            self.refresh_share()
+        self.window.run_task(stop())
+
+    def choose_window(self):
+        dialog = WindowPicker(self.window)
+        self.dialog = dialog
+        dialog.finished.connect(lambda _: setattr(self, 'dialog', None))
+        dialog.open()
+        dialog.reload()
 
     def remove(self, identifier):
         self.library.unstage(self.window.draft_key(), identifier)
@@ -179,6 +213,7 @@ class ComposerInputs(QScrollArea):
         menu.setAccessibleName("添加附件或引用")
         menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         menu.addAction("添加图片…", self.choose_images)
+        menu.addAction("与 AI 共享窗口…", self.choose_window)
         menu.addSeparator()
         menu.addAction("引用会话…", self.choose_chat)
         menu.addAction("引用工具…", lambda: self.choose_reference("tool"))

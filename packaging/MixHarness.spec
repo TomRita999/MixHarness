@@ -14,9 +14,14 @@ files = [(str(resources), "mixharness/resources"), (str(root / "mixharness/stati
 for dependency in ("google-genai", "openai", "PySide6-Essentials", "shiboken6", "qasync"):
     files += copy_metadata(dependency)
 
+binaries = collect_dynamic_libs("winpty", search_patterns=["*.dll", "*.exe"]) if windows else []
+if mac:
+    sys.path.insert(0, str(root))
+    from mixharness.window_native import build_window_helper
+    binaries.append((str(build_window_helper(build / "window-helper")), "mixharness/resources"))
+
 a = Analysis(
-    [str(root / "packaging/launch.py")], pathex=[str(root)], datas=files,
-    binaries=collect_dynamic_libs("winpty", search_patterns=["*.dll", "*.exe"]) if windows else [],
+    [str(root / "packaging/launch.py")], pathex=[str(root)], datas=files, binaries=binaries,
     hiddenimports=["compileall", "unittest.__main__", "websockets.asyncio.client", "tiktoken_ext.openai_public",
                    *collect_submodules("google.genai", filter=lambda name: not name.startswith("google.genai.tests")),
                    *collect_submodules("openai.resources.responses")],
@@ -29,7 +34,7 @@ bundle = COLLECT(exe, cli, a.binaries, a.datas, name="MixHarness", upx=False)
 if mac:
     app = BUNDLE(bundle, name="MixHarness.app", icon=str(icon), bundle_identifier="local.mixharness.desktop",
                  info_plist={"CFBundleDisplayName": "MixHarness", "CFBundleShortVersionString": "0.7.0",
-                             "CFBundleVersion": "23", "NSHighResolutionCapable": True,
+                             "CFBundleVersion": "24", "NSHighResolutionCapable": True,
                              # 包内同时有命令行程序，PyInstaller 会因此标记为后台程序；桌面应用需要出现在程序坞。
                              "LSBackgroundOnly": False, "LSUIElement": False,
                              "LSApplicationCategoryType": "public.app-category.developer-tools",

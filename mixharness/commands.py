@@ -13,6 +13,7 @@ from .catalog import MODELS
 from .reasoning import group_for, model_available, select_daybreak_model
 from .store import new_id
 from .usage import plan_usage
+from .window_native import NativeWindows
 
 
 async def settled(engine, sid, seconds, *, return_on_approval=False, keep_native=False):
@@ -68,12 +69,40 @@ async def new_session(engine, args):
     return session
 
 
+async def window_command(args, *, engine=None, home=None):
+    action = args['window_action']
+    if action in ('list', 'permissions'):
+        native = engine.windows.native if engine else NativeWindows(home)
+        if action == 'list':
+            return await native.request('list')
+        request = args.get('request')
+        if request not in (None, 'screen', 'accessibility'):
+            raise ValueError('请选择 screen 或 accessibility。')
+        return await native.request('permissions', **({'request': request} if request else {}))
+    sid = args['id']
+    if engine:
+        engine.store.session(sid)
+    if action == 'status':
+        return {'id': sid, 'share': engine.windows.status(sid) if engine else None}
+    if action == 'stop':
+        stopped = await engine.windows.stop(sid) if engine else False
+        return {'id': sid, 'stopped': stopped}
+    if action == 'bind':
+        if engine is None:
+            raise ValueError('共享窗口需要持续运行的引擎。请打开同一会话库的桌面端，或使用 mixharness serve 启动它。')
+        share = await engine.windows.bind(sid, args['target'], args.get('access', 'view'))
+        return {'id': sid, 'share': share}
+    raise ValueError('未知的窗口指令')
+
+
 async def dispatch(engine, args):
     cmd = args["command"]
     source = args.get("source", "mixharness")
     if cmd == "command":
         from .slash import execute_command
         return await execute_command(engine, args)
+    if cmd == 'window':
+        return await window_command(args, engine=engine)
     if cmd == "updates":
         sid = args["id"]
         try:

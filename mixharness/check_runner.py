@@ -64,6 +64,9 @@ def main(args=None):
             try:
                 command = check_command(argv, python, log)
                 if getattr(sys, "frozen", False) and command[0] != sys.executable:
+                    # PyInstaller 在启动时将这两个变量指向应用包。外部命令需要加载自己的 Qt。
+                    env.pop("QT_PLUGIN_PATH", None)
+                    env.pop("QML2_IMPORT_PATH", None)
                     if os.name == "nt":
                         import ctypes
                         ctypes.windll.kernel32.SetDllDirectoryW(None)
