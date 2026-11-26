@@ -22,12 +22,16 @@ def plan_details(meta, messages):
             title = "GPT · 只读调研" if kind == "engineering" else "GPT · 只读核对"
         elif task.get("after_gpt"):
             title += "（等 GPT 返回后撰写）"
+        elif task.get("supervise"):
+            title += "（完成后由 Gemini 监工审查）"
         lines.append((title + " · " + task["model"], brief[kind]))
+        if task.get("constraints"):
+            lines.append(("施工红线", "；".join(task["constraints"])))
     for kind in meta["changed"]:
         if not brief[kind]:
             lines.append((ASSIGNMENTS[kind], "已取消"))
     if not meta["assigned"] and not meta["changed"]:
-        lines.append(("任务分配", "本轮沿用已有分工。"))
+        lines.append(("级联直达", "由 Gemini 直接完成回复，未额外调用 GPT。"))
     return lines
 
 
