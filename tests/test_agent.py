@@ -10,7 +10,8 @@ from pathlib import Path
 
 import frontmatter
 
-from mixharness.agent_settings import AgentSettings, compact_context, encode_context, shared_input, skill_catalog, tokens
+from mixharness.agent_settings import (AUTO_CLIENT_CONTEXT_WINDOW, AgentSettings, compact_context,
+                                       encode_context, shared_input, skill_catalog, tokens)
 from mixharness.catalog import MODELS
 from mixharness.commands import dispatch
 from mixharness.engine import open_engine
@@ -204,3 +205,40 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), original)
             asyncio.run(exercise(True))
             self.assertEqual(path.read_text(encoding="utf-8"), replacement)
+
+    def test_clients_auto_context_places_latest_first_and_compacts_history(self):
+        with open_engine(self.root, self.home) as engine:
+            store = engine.store
+            sid = new_id()
+            with store.db:
+                store.create(sid, str(self.root), "gemini", "gpt", backend="clients")
+            chunk = "这是一段用于模拟超长历史记录的中文对话内容，用来验证自动上下文压缩不会把最新消息挤掉。" * 60
+            with store.db:
+                for i in range(40):
+                    store.event(sid, "message", "user" if i % 2 == 0 else "gemini", f"第{i}轮：{chunk}")
+            latest = "请只回答：我收到了这条最新消息。"
+            engine.submit(sid, latest, new_id(), recipient="gemini")
+            chat_job = store.one("SELECT j.*,s.backend FROM jobs j JOIN sessions s ON s.id=j.sid "
+                                 "WHERE j.sid=? AND j.kind='gemini_chat' ORDER BY j.rowid DESC LIMIT 1", sid)
+            _, _, chat_text, _ = engine.chat_input(chat_job, store.session(sid))
+            self.assertLess(chat_text.index('"本次提问"'), chat_text.index('"共享记录"'))
+            self.assertLessEqual(tokens(chat_text), AUTO_CLIENT_CONTEXT_WINDOW)
+            parsed_chat = json.loads(chat_text)
+            self.assertEqual(parsed_chat["本次提问"], latest)
+            self.assertLess(len(parsed_chat["共享记录"]), 40)
+
+            plan_msg = "请检查当前仓库里的测试文件并列出清单。"
+            engine.submit(sid, plan_msg, new_id())
+            plan_job = store.one("SELECT j.*,s.backend FROM jobs j JOIN sessions s ON s.id=j.sid "
+                                 "WHERE j.sid=? AND j.kind='plan' ORDER BY j.rowid DESC LIMIT 1", sid)
+            _, _, plan_text, _ = engine.turn_input(plan_job, store.session(sid), [])
+            self.assertLess(plan_text.index('"待处理用户消息"'), plan_text.index('"共享记录"'))
+            self.assertLessEqual(tokens(plan_text), AUTO_CLIENT_CONTEXT_WINDOW)
+            parsed_plan = json.loads(plan_text)
+            self.assertEqual(parsed_plan["待处理用户消息"], [plan_msg])
+            self.assertLess(len(parsed_plan["共享记录"]), 40)
+
+            oversized = {"本次提问": "超长固定内容" * 1500, "共享记录": [{"seq": 1, "text": "旧消息"}]}
+            relaxed = json.loads(compact_context(oversized, 128, strict=False))
+            self.assertEqual(relaxed["本次提问"], oversized["本次提问"])
+            self.assertEqual(relaxed["共享记录"], [])

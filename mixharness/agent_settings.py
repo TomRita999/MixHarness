@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PERMISSIONS = {"ask": "请求批准", "auto": "帮我批准", "full": "完全访问"}
 SPEEDS = {"standard": "标准", "fast": "Fast", "ultrafast": "Ultrafast"}
+AUTO_CLIENT_CONTEXT_WINDOW = 28000
 
 
 class AgentSettings(BaseModel):
@@ -99,7 +100,7 @@ def result_excerpt(result, limit):
     return brief
 
 
-def compact_context(context, limit):
+def compact_context(context, limit, *, strict=True):
     packed = encode_context(context)
     if not limit or tokens(packed) <= limit:
         return packed
@@ -107,7 +108,9 @@ def compact_context(context, limit):
     recent = {key: context[key] for key in ("共享记录", "本次任务的工具记录", "可读取的成果", "任务") if key in context}
     kept = {**context, **dict.fromkeys(recent, []), "历史说明": "早期消息已折叠，可按编号读取历史成果。"}
     if tokens(encode_context(kept)) > limit:
-        raise ValueError("当前需求、草稿或技能说明超出上下文窗口，请调大窗口或减少技能")
+        if strict:
+            raise ValueError("当前需求、草稿或技能说明超出上下文窗口，请调大窗口或减少技能")
+        return encode_context(kept)
     if "本次任务的工具记录" in recent:
         room = max(128, (limit - tokens(encode_context(kept))) // 2)
         recent["本次任务的工具记录"] = [
@@ -130,15 +133,17 @@ def compact_context(context, limit):
     return encode_context(kept)
 
 
-def shared_input(context, calls, limit):
+def shared_input(context, calls, limit, *, strict=True):
     if not limit or not calls:
-        return calls, compact_context(context, limit)
+        return calls, compact_context(context, limit, strict=strict)
     available = limit // (2 * len(calls))
     results = [dict(call, result=result_excerpt(call["result"], available)) for call in calls]
     room = limit - sum(tokens(encode_context(call["result"])) for call in results)
     if room < 1:
-        raise ValueError("工具结果超过上下文窗口，请增大窗口")
-    return results, compact_context(context, room)
+        if strict:
+            raise ValueError("工具结果超过上下文窗口，请增大窗口")
+        return results, compact_context(context, 1, strict=False)
+    return results, compact_context(context, room, strict=strict)
 
 
 def available_speeds(group):

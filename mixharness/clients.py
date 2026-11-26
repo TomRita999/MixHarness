@@ -400,9 +400,10 @@ async def codex_turn(engine, job, cwd, prompt, schema):
         options = {"model": model, "cwd": str(cwd), "ephemeral": True, "serviceTier": tier,
                    "sandbox": "danger-full-access" if mode == "full" else "workspace-write",
                    "approvalPolicy": "never" if mode == "full" else "on-request",
-                   "approvalsReviewer": "auto_review" if mode == "auto" else "user"}
+                   "approvalsReviewer": "auto_review" if mode == "auto" else "user",
+                   "config": {"sandbox_workspace_write.network_access": True}}
         if job["context_window"]:
-            options["config"] = {"model_context_window": job["context_window"]}
+            options["config"]["model_context_window"] = job["context_window"]
         if readonly:
             options.update(sandbox="read-only", approvalPolicy="never", approvalsReviewer="user")
             config = options.setdefault("config", {})
@@ -446,6 +447,10 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                 complete = params["turn"]
         params = {"threadId": tid, "model": model, "serviceTier": tier, "outputSchema": schema,
                   "input": [{"type": "text", "text": prompt}, *image_parts(job.get("images", []), "codex")]}
+        if readonly:
+            params["sandboxPolicy"] = {"type": "readOnly", "networkAccess": True}
+        elif mode != "full":
+            params["sandboxPolicy"] = {"type": "workspaceWrite", "networkAccess": True}
         if programs:
             params["cyberAccessProgram"] = "daybreakBlue" if daybreak else "standard"
         if effort:
@@ -579,14 +584,15 @@ def client_prompt(job, context):
     if kind in CHAT_JOBS.values() and not tools:
         return PROMPTS[kind] + "\n共享会话\n" + context, None
     schema = (Plan if kind == "plan" else ClientReply).model_json_schema()
+    extra = ""
+    if kind in CHAT_JOBS.values():
+        extra += "\n将面向用户的文字或 Markdown 写在 text 中。通过列出的窗口工具访问用户所选的窗口。"
+    if kind in ("engineering", "verification") and is_dot_model(job["model"]) and not job["payload"].get("read_only"):
+        extra += ("\nCodex 在只读环境中分析项目。需要修改文件或运行验证时，在 calls 中提出已列出的 MixHarness 工具请求。"
+                  "MixHarness 按当前会话权限审批并执行。收到工具回执后再报告实际结果。")
     prompt = (instructions(job) + "\n请严格返回符合下方 JSON Schema 的 JSON 对象。"
               "需要调用 MixHarness 工具时，在 calls 中填写工具名与 JSON 字符串 arguments，结果会在下一轮返回。"
-              "\n输出格式\n" + pack(schema) + "\n可用工具\n" + pack(tools) + "\n共享会话\n" + context)
-    if kind in CHAT_JOBS.values():
-        prompt += "\n将面向用户的文字或 Markdown 写在 text 中。通过列出的窗口工具访问用户所选的窗口。"
-    if kind in ("engineering", "verification") and is_dot_model(job["model"]) and not job["payload"].get("read_only"):
-        prompt += ("\nCodex 在只读环境中分析项目。需要修改文件或运行验证时，在 calls 中提出已列出的 MixHarness 工具请求。"
-                   "MixHarness 按当前会话权限审批并执行。收到工具回执后再报告实际结果。")
+              + extra + "\n输出格式\n" + pack(schema) + "\n可用工具\n" + pack(tools) + "\n共享会话\n" + context)
     return prompt, schema
 
 

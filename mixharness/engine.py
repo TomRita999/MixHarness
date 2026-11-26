@@ -10,7 +10,8 @@ from filelock import FileLock
 
 from . import workspace
 from .attachments import MAX_IMAGE_TOTAL, MAX_ITEMS, TYPES
-from .agent_settings import AgentSettings, PERMISSIONS, SPEEDS, available_speeds, selected_skills, shared_input, skill_catalog
+from .agent_settings import (AUTO_CLIENT_CONTEXT_WINDOW, AgentSettings, PERMISSIONS, SPEEDS,
+                             available_speeds, selected_skills, shared_input, skill_catalog)
 from .catalog import ModelCatalog
 from .clients import CLIENTS, ClientCatalog, CodexTurnError, private_directory, workflow_turn
 from .providers import FUNCTIONS, tool_names, google_turn, openai_turn
@@ -711,10 +712,11 @@ class Engine:
         assets = self.store.rows("SELECT id,name,digest,meta FROM artifacts WHERE sid=? ORDER BY rowid DESC LIMIT 80", sid)
         draft = self.store.rows("SELECT draft FROM jobs WHERE sid=? AND kind='report' AND draft!='' AND status NOT IN ('obsolete','stopped') "
                                 "ORDER BY rowid DESC LIMIT 1", sid)
-        context = {"当前需求": session["brief"], "需求版本": session["versions"], "本次任务": job["payload"],
-                   "共享记录": history, "任务": works, "可读取的成果": assets,
-                   "各来源文件夹的验证命令": self.checks(self.sources(session))}
-        self.windows.prepare_context(job, session, request, context)
+        # 将当前消息、引导、草稿与技能放在前面，大段历史记录放在末尾，避免下游按尾部截断时丢失最新输入。
+        context = {"当前需求": session["brief"], "需求版本": session["versions"], "本次任务": job["payload"]}
+        if job["kind"] == "plan":
+            context["待处理用户消息"] = [e["body"] for e in entries if e["actor"] == "user"
+                                         and not e["meta"].get("direct") and e["meta"].get("revision", 0) > session["planned"]]
         if job["guide_seq"]:
             context["用户对本任务的引导"] = [e["body"] for e in self.store.rows(
                 "SELECT body FROM events WHERE sid=? AND seq>? AND seq<=? AND json_extract(meta,'$.guide')=1 "
@@ -739,22 +741,28 @@ class Engine:
                         event["附件"] = descriptions
         if session["context_summary"]:
             context["历史摘要"] = session["context_summary"]
-        if job["kind"] == "plan":
-            context["待处理用户消息"] = [e["body"] for e in entries if e["actor"] == "user"
-                                         and not e["meta"].get("direct") and e["meta"].get("revision", 0) > session["planned"]]
         folders = self.sources(session).folders.values()
         skills = selected_skills(self.settings_for(folders), folders)
         if skills:
             context["用户启用的技能"] = skills
-        if not resume and job["cursor"]:
-            context["本次任务的工具记录"] = self.store.rows(
-                "SELECT name,args,result FROM calls WHERE job=? ORDER BY rowid", job["id"])
         if not resume and job["draft"]:
             context["已有草稿"] = job["draft"]
         elif draft and job["kind"] == "report" and not job["cursor"]:
             context["已有草稿"] = draft[0]["draft"]
+        context["各来源文件夹的验证命令"] = self.checks(self.sources(session))
+        self.windows.prepare_context(job, session, request, context)
+        if not resume and job["cursor"]:
+            context["本次任务的工具记录"] = self.store.rows(
+                "SELECT name,args,result FROM calls WHERE job=? ORDER BY rowid", job["id"])
+        context["共享记录"] = history
+        context["任务"] = works
+        context["可读取的成果"] = assets
         seen = entries[-1]["seq"] if entries else request["seen"]
-        results, text = shared_input(context, calls if resume else [], self.settings.context_window)
+        limit = self.settings.context_window
+        strict = bool(limit)
+        if not limit and job["backend"] == "clients":
+            limit = AUTO_CLIENT_CONTEXT_WINDOW
+        results, text = shared_input(context, calls if resume else [], limit, strict=strict)
         if attached:
             retained = {e["seq"] for e in json.loads(text)["共享记录"]}
             request["images"] = self.image_inputs([items for seq, items in attached.items() if seq == latest or seq in retained])
@@ -770,18 +778,20 @@ class Engine:
                                   sid, session["context_after"], seq, seq)
         attached = self.store.inputs.for_session(sid, min(seq - 1, session["context_after"]))
         authors = {"user": "用户", "openai": "GPT", "gemini": "Gemini"}
-        history = [{"seq": e["seq"], "from": authors.get(e["actor"], e["actor"]), "text": e["body"],
+        history = [{"seq": e["seq"], "from": authors.get(e["actor"], e["actor"]),
+                    "text": e["body"] if e["actor"] == "user" else e["body"][:4200],
                     **({"model": e["model"]} if e["model"] else {})} for e in entries]
         for entry in history:
             if entry["seq"] in attached:
                 entry["附件"] = self.describe_inputs(attached[entry["seq"]])
-        context = {"共享记录": history, "本次提问": prompt}
-        if session["context_summary"]:
-            context["历史摘要"] = session["context_summary"]
+        # 将本次提问与当前附件放在最前面，历史记录放在末尾，避免上下文过长时最新提问被截断。
+        context = {"本次提问": prompt}
         if seq in attached:
             context["当前消息附件"] = self.describe_inputs(attached[seq])
         if job["payload"].get("interrupted_turn"):
             context["中断前的进度"] = job["payload"]["interrupted_turn"]
+        if session["context_summary"]:
+            context["历史摘要"] = session["context_summary"]
         request = dict(job, cursor=None, permission="ask", speed=session["speed"],
                        daybreak=session["daybreak"], context_window=self.settings.context_window)
         self.windows.prepare_context(job, session, request, context)
@@ -792,7 +802,12 @@ class Engine:
         elif job["cursor"]:
             context["本次任务的工具记录"] = self.store.rows(
                 "SELECT name,args,result FROM calls WHERE job=? ORDER BY rowid", job["id"])
-        results, text = shared_input(context, calls if resume else [], self.settings.context_window)
+        context["共享记录"] = history
+        limit = self.settings.context_window
+        strict = bool(limit)
+        if not limit and job["backend"] == "clients":
+            limit = AUTO_CLIENT_CONTEXT_WINDOW
+        results, text = shared_input(context, calls if resume else [], limit, strict=strict)
         kept = [e["seq"] for e in json.loads(text)["共享记录"]]
         request["images"] = self.image_inputs([attached[i] for i in [*kept, seq] if i in attached])
         self.windows.attach_image(job, request)

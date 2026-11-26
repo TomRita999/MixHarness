@@ -871,13 +871,20 @@ class Timeline(QScrollArea):
         self.group_button = None
         self.group_body = None
         self.seen = 0
+        self._stick_bottom = False
+        self._auto_scrolling = False
+        self._stick_timer = QTimer(self)
+        self._stick_timer.setSingleShot(True)
+        self._stick_timer.timeout.connect(self._release_bottom)
         self.scroller = QPropertyAnimation(self.verticalScrollBar(), b"value", self)
         self.scroller.setDuration(260)
         self.scroller.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self.verticalScrollBar().valueChanged.connect(self.navigation_changed)
-        self.verticalScrollBar().rangeChanged.connect(self.navigation_changed)
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
+        self.verticalScrollBar().rangeChanged.connect(self._on_range_changed)
 
     def reset(self):
+        self.scroller.stop()
+        self._stick_timer.stop()
         while self.column.count() > 1:
             item = self.column.takeAt(0)
             item.widget().hide()
@@ -888,7 +895,42 @@ class Timeline(QScrollArea):
         self.records.clear()
         self.group_button = self.group_body = None
         self.seen = 0
+        self._stick_bottom = True
         self.navigation_changed.emit()
+
+    def scroll_to_bottom(self):
+        bar = self.verticalScrollBar()
+        self._auto_scrolling = True
+        try:
+            self.column.activate()
+            self.canvas.adjustSize()
+            bar.setValue(bar.maximum())
+        finally:
+            self._auto_scrolling = False
+
+    def _on_range_changed(self, _minimum, maximum):
+        if self._stick_bottom:
+            bar = self.verticalScrollBar()
+            self._auto_scrolling = True
+            try:
+                bar.setValue(maximum)
+            finally:
+                self._auto_scrolling = False
+            self._stick_timer.start(80)
+        self.navigation_changed.emit()
+
+    def _on_scroll_changed(self, value):
+        if not self._auto_scrolling and self._stick_bottom:
+            if value < self.verticalScrollBar().maximum() - 4:
+                self._stick_bottom = False
+                self._stick_timer.stop()
+        self.navigation_changed.emit()
+
+    def _release_bottom(self):
+        if self._stick_bottom:
+            self.scroll_to_bottom()
+            self._stick_bottom = False
+            self.navigation_changed.emit()
 
     def toPlainText(self):
         return "\n\n".join(self.records)
@@ -907,6 +949,8 @@ class Timeline(QScrollArea):
     def jump(self, index):
         rows = self.user_rows()
         if 0 <= index < len(rows):
+            self._stick_bottom = False
+            self._stick_timer.stop()
             bar = self.verticalScrollBar()
             self.scroller.stop()
             self.scroller.setStartValue(bar.value())
@@ -942,7 +986,7 @@ class Timeline(QScrollArea):
 
     def update_events(self, events, colors):
         bar = self.verticalScrollBar()
-        follow = bar.maximum() - bar.value() < 30
+        follow = self._stick_bottom or bar.maximum() - bar.value() < 30
         changed = False
         for event in events:
             if event["seq"] <= self.seen:
@@ -970,15 +1014,15 @@ class Timeline(QScrollArea):
             self.rows.append(row)
             self.column.insertWidget(self.column.count() - 1 - len(self.draft_rows), row)
         if changed and follow:
-            self.column.activate()
-            self.canvas.adjustSize()
-            bar.setValue(bar.maximum())
+            self._stick_bottom = True
+            self.scroll_to_bottom()
+            self._stick_timer.start(80)
         if changed:
             self.navigation_changed.emit()
 
     def update_drafts(self, drafts):
         bar = self.verticalScrollBar()
-        follow = bar.maximum() - bar.value() < 30
+        follow = self._stick_bottom or bar.maximum() - bar.value() < 30
         changed = False
         for jid in self.draft_rows.keys() - drafts.keys():
             row = self.draft_rows.pop(jid)
@@ -1003,9 +1047,9 @@ class Timeline(QScrollArea):
                 row.show_result()
                 changed |= not row.intermediate or row.result_toggle.isChecked()
         if changed and follow:
-            self.column.activate()
-            self.canvas.adjustSize()
-            bar.setValue(bar.maximum())
+            self._stick_bottom = True
+            self.scroll_to_bottom()
+            self._stick_timer.start(80)
 
 
 class MessageNav(QWidget):
