@@ -326,7 +326,9 @@ class AgentTests(unittest.TestCase):
                 store.save_turn(eng, "c1", 0, "", [{"cid": "q1", "name": "ask_clarification",
                                                     "args": {"question": "请在目标程序里发起一次登录请求并回复确认。"}}],
                                 backend="clients")
-            # 1) 工程任务调用 ask_clarification：直接展示提问并取消等待中的 report，不浪费报告 token
+            # 1) 工程任务（含目标模式）调用 ask_clarification：直接展示提问、暂停目标模式并取消所有其他任务，严格等待用户回复
+            with store.db:
+                store.db.execute("UPDATE sessions SET mode='goal', objective='完成联调', goal_status='active' WHERE id=?", (sid,))
             call = store.calls(store.job(eng["id"]))[0]
             with self.assertRaises(Exception):
                 asyncio.run(engine.tool(store.job(eng["id"]), call, engine.sources(store.session(sid))))
@@ -336,6 +338,8 @@ class AgentTests(unittest.TestCase):
             self.assertIn("目标程序里发起一次登录请求", q_events[0]["body"])
             self.assertFalse(q_events[0].get("intermediate"))
             self.assertEqual(store.job(rep["id"])["status"], "obsolete")
+            self.assertEqual(store.session(sid)["goal_status"], "blocked")
+            self.assertEqual(store.active_jobs(sid), [])
 
             # 2) Codex 中间日志 + Gemini 节流解读 + 3) 引导时 Gemini 协同参与
             with store.db:
@@ -382,7 +386,12 @@ class AgentTests(unittest.TestCase):
 
             asyncio.run(exercise_live())
             events = store.snapshot(sid)["events"]
-            self.assertTrue(any("Gemini 进度解读 ·" in e["body"] for e in events))
+            narrations = [e for e in events if e["kind"] == "message" and e["meta"].get("narration")]
+            self.assertEqual(len(narrations), 1)
+            self.assertIn("正在排查登录代理", narrations[0]["body"])
+            # 进度解读消息不进入后续模型的上下文历史，避免额外 token 消耗
+            _, _, next_ctx, _ = engine.turn_input(eng2, store.session(sid), [])
+            self.assertNotIn("正在排查登录代理", next_ctx)
             self.assertTrue(any("Gemini 协同引导 ·" in e["body"] for e in events))
             self.assertEqual(len(delivered), 1)
             self.assertIn("停止排查 ruffle", delivered[0])

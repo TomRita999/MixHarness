@@ -648,8 +648,8 @@ class Engine:
         try:
             with self.store.db:
                 self.store.guard(job)
-                self.store.event(sid, "progress", "gemini", "Gemini 进度解读 · " + line,
-                                 {"job": jid, "source": "Gemini", "narration": True})
+                self.store.event(sid, "message", "gemini", line,
+                                 {"job": jid, "source": "Gemini", "narration": True, "kind": "narration"})
             self.notify(sid)
         except Superseded:
             return
@@ -821,10 +821,10 @@ class Engine:
         last_instruction = self.store.db.execute("SELECT max(seq) FROM events WHERE sid=? AND actor='user' "
                                                 "AND json_extract(meta,'$.recipient') IS NULL", (sid,)).fetchone()[0] or 0
         entries = [e for e in entries if not e["meta"].get("recipient") or e["seq"] < last_instruction]
-        # 当前需求始终完整传入，较长的输出可通过持久化成果按需取回。
+        # 当前需求始终完整传入，较长的输出可通过持久化成果按需取回；跳过临时的进度解读消息以节省 token。
         history = [{"seq": e["seq"], "from": e["actor"], "type": e["kind"],
                     "text": e["body"] if e["actor"] == "user" else e["body"][:4200], "details": e["meta"]}
-                   for e in entries if e["seq"] > session["context_after"]]
+                   for e in entries if e["seq"] > session["context_after"] and not e["meta"].get("narration")]
         works = [{"id": w["id"], "kind": w["kind"], "status": w["status"], "title": w["title"],
                   "error": (w["error"] or "")[:600]}
                  for w in reversed(self.store.rows(
@@ -897,6 +897,7 @@ class Engine:
         prompt = self.store.one("SELECT body FROM events WHERE sid=? AND seq=?", sid, seq)["body"]
         entries = self.store.rows("SELECT seq,actor,body,json_extract(meta,'$.model') AS model "
                                   "FROM events WHERE sid=? AND kind='message' AND seq>? "
+                                  "AND NOT COALESCE(json_extract(meta,'$.narration'),0) "
                                   "AND (seq<? OR json_extract(meta,'$.reply_to')<?) ORDER BY seq",
                                   sid, session["context_after"], seq, seq)
         attached = self.store.inputs.for_session(sid, min(seq - 1, session["context_after"]))
@@ -1017,7 +1018,8 @@ class Engine:
                 self.set_activity(job, "正在核对项目快照")
                 sources = sources.at_snapshot(await self.verify_source(job))
             calls = self.store.calls(job)
-            for call in calls:
+            ordered_calls = sorted(calls, key=lambda c: 0 if c["name"] == "ask_clarification" else 1)
+            for call in ordered_calls:
                 if call["result"] is None and not call["child"]:
                     await self.gate(job)
                     self.set_activity(job, "正在处理 " + call["name"])
@@ -1197,11 +1199,20 @@ class Engine:
                 st.guard(job)
                 st.tool_result(call, args)
                 st.db.execute("UPDATE jobs SET payload=? WHERE id=?", (pack(dict(job["payload"], needs_input=True)), jid))
-                if job["kind"] in ("engineering", "verification"):
-                    st.db.execute(
-                        "UPDATE jobs SET status='obsolete' WHERE sid=? AND kind IN ('report','supervision') "
-                        "AND status IN ('waiting','ready')", (sid,))
+                # 严格暂停当前会话内其余非直聊任务，并在目标模式下切为 blocked 等待用户回复，避免继续自行推进。
+                st.db.execute(
+                    "UPDATE jobs SET status='obsolete' WHERE sid=? AND id!=? "
+                    "AND kind NOT IN ('gemini_chat','gpt_chat') "
+                    "AND status IN ('ready','running','waiting','needs_key')", (sid, jid))
+                st.db.execute(
+                    "UPDATE sessions SET goal_status='blocked',goal_note=?,goal_next='' "
+                    "WHERE id=? AND mode='goal' AND goal_status='active'", (args["question"], sid))
                 st.finish(job, args["question"], {"needs_input": True})
+            for other_jid, task in list(self.active.items()):
+                if other_jid != jid and not task.done():
+                    other = st.rows("SELECT sid,kind FROM jobs WHERE id=?", other_jid)
+                    if other and other[0]["sid"] == sid and other[0]["kind"] not in CHAT_JOBS.values():
+                        task.cancel()
             raise Superseded()
         if name == "request_verification":
             with st.db:

@@ -99,6 +99,7 @@ def compact(engine, session):
     sid = session["id"]
     previous = session["context_summary"]
     events = engine.store.rows("SELECT seq,actor,body FROM events WHERE sid=? AND kind IN ('message','verification','failure') "
+                               "AND NOT COALESCE(json_extract(meta,'$.narration'),0) "
                                "AND seq>? ORDER BY seq", sid, session["context_after"])
     if not events:
         return "没有需要压缩的新消息"

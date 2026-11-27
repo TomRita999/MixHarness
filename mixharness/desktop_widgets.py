@@ -701,6 +701,10 @@ class MessageRow(QWidget):
             title = {"requirements": "Gemini · 需求整理", "verification": "Gemini 请求 GPT 验证",
                      "failure": author + " · 失败"}.get(event["kind"], author)
             meta = event.get("meta", {})
+            if meta.get("narration"):
+                title = "Gemini · 进度解读"
+            elif meta.get("needs_input"):
+                title = author + " · 等待你的回复"
             model = meta.get("model")
             scope = meta.get("kind") or meta.get("report_input")
             if model:

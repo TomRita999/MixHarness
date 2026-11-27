@@ -67,7 +67,7 @@ class BrowserPage:
 @contextmanager
 def browser(executable, root, url):
     # Linux 上 Chrome 的 SingletonSocket 受 108 字节 Unix Socket 路径上限约束，使用短系统临时目录避免路径超长。
-    with tempfile.TemporaryDirectory(prefix='mh-chr-') as short_tmp:
+    with tempfile.TemporaryDirectory(prefix='mh-chr-', ignore_cleanup_errors=True) as short_tmp:
         short_root = Path(short_tmp)
         profile = short_root / 'p'
         profile.mkdir()

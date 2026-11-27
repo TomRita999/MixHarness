@@ -428,9 +428,10 @@ async def codex_turn(engine, job, cwd, prompt, schema):
             raise ClientError("Codex 未确认只读权限，任务已停止")
         fragments, actions, complete, final, plan_text = [], [], None, "", ""
         asked_questions = []
+        pending_question = None
         turn_id = None
         def event(method, params):
-            nonlocal complete, final, plan_text, turn_id
+            nonlocal complete, final, plan_text, turn_id, pending_question
             if params.get("threadId") != tid:
                 return
             if method == "turn/started":
@@ -449,6 +450,11 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                         q_text = q.get("question") if isinstance(q, dict) else str(q)
                         if q_text:
                             asked_questions.append(q_text)
+                    if asked_questions and not pending_question:
+                        parts = [text] if text and not text.startswith("{") else []
+                        parts.extend(asked_questions)
+                        pending_question = "\n\n".join(dict.fromkeys(parts))
+                        return
                 if phase == "commentary" and text:
                     engine.record_codex_progress(job, "Codex 说明 · " + text[:260], milestone=True, visible=True)
                 elif text:
@@ -523,13 +529,21 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                     raise ClientError("Codex 返回了其他轮次的引导回执")
             engine.register_steering(job, steer)
             engine.set_activity(job, "Codex 已开始生成")
-            while complete is None:
+            while complete is None and not pending_question:
                 await rpc.dispatch(await rpc.read(), event)
+            if pending_question:
+                if complete is None:
+                    try:
+                        async with asyncio.timeout(3):
+                            await interrupt()
+                    except Exception:
+                        pass
+                raise PlanQuestion(pending_question)
         if complete["status"] != "completed":
             error = complete.get("error") or {}
             raise CodexTurnError(error.get("message") or "Codex 任务未完成", started["sandbox"]["type"],
                                  error.get("codexErrorInfo"), tid, complete["id"])
-        if asked_questions and not (plan_text or final):
+        if asked_questions:
             raise PlanQuestion("\n".join(asked_questions))
         return plan_text or final or "".join(fragments)
 
