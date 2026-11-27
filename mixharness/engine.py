@@ -2,19 +2,21 @@ import asyncio
 import json
 import os
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
 from dotenv import dotenv_values
 from filelock import FileLock
+from markdown_it import MarkdownIt
 
 from . import workspace
 from .attachments import MAX_IMAGE_TOTAL, MAX_ITEMS
 from .agent_settings import (AUTO_CLIENT_CONTEXT_WINDOW, AgentSettings, PERMISSIONS, SPEEDS,
                              available_speeds, selected_skills, shared_input, skill_catalog)
 from .catalog import ModelCatalog
-from .clients import CLIENTS, ClientCatalog, CodexTurnError, private_directory, workflow_turn
-from .providers import FUNCTIONS, tool_names, google_turn, openai_turn
+from .clients import CLIENTS, ClientCatalog, CodexTurnError, antigravity_turn, private_directory, workflow_turn
+from .providers import FUNCTIONS, GuidanceReply, google_quick, google_turn, openai_turn, tool_names
 from .reasoning import api_levels, group_for, model_available, resolve_choice, select_daybreak_model
 from .shared_window import LABELS as WINDOW_LABELS, WINDOW_FUNCTIONS, WindowShares
 from .store import CHAT_JOBS, PROVIDERS, Store, Superseded, accepts_guidance, new_id, now, pack
@@ -42,6 +44,7 @@ class Engine:
         self.activity = {}
         self.steering = {}
         self.steer_workers = {}
+        self.narration = {}
         self.previews = {}
         self.changes = {}
         self.file_operations = {}
@@ -578,6 +581,116 @@ class Engine:
             with self.store.db:
                 self.store.db.execute("UPDATE jobs SET payload=? WHERE id=?", (pack(payload), job["id"]))
 
+    async def quick_gemini(self, sid, system_prompt, user_prompt, *, tag="helper", timeout=15):
+        """极轻、无历史、无工具的一次性 Gemini 辅助调用，不污染主会话上下文。"""
+        session = self.store.session(sid)
+        model = session.get("gemini")
+        if not model:
+            return None
+        try:
+            async with asyncio.timeout(timeout):
+                if session["backend"] == "api":
+                    key = self.keys.get("gemini")
+                    if not key:
+                        return None
+                    return await google_quick(key, model, system_prompt, user_prompt)
+                helper_job = {"id": new_id(), "sid": sid, "kind": "gemini_chat", "model": model,
+                              "permission": "ask", "images": []}
+                cwd = next(iter(self.sources(session).folders.values()))
+                prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
+                try:
+                    return (await antigravity_turn(self, helper_job, cwd, prompt, preview_text=False, isolated_tag=tag)).strip()
+                finally:
+                    self.activity.pop(helper_job["id"], None)
+        except Exception:
+            return None
+
+    def record_codex_progress(self, job, text, *, milestone=False, visible=False):
+        jid, sid = job["id"], job["sid"]
+        if visible:
+            try:
+                with self.store.db:
+                    self.store.guard(job)
+                    self.store.event(sid, "progress", "openai", text, {"job": jid, "source": "Codex"})
+                self.notify(sid)
+            except Superseded:
+                return
+        if job["kind"] not in ("engineering", "verification"):
+            return
+        state = self.narration.setdefault(jid, {"buffer": [], "last_at": time.monotonic(), "count": 0, "task": None})
+        state["buffer"].append(text)
+        if len(state["buffer"]) > 20:
+            state["buffer"] = state["buffer"][-20:]
+        now_t = time.monotonic()
+        enough = len(state["buffer"]) >= (3 if milestone else 5)
+        if (state["count"] < 4 and enough and (now_t - state["last_at"]) >= 25.0
+                and (state["task"] is None or state["task"].done())):
+            snippet = "\n".join(state["buffer"][-12:])[:1200]
+            state["buffer"].clear()
+            state["last_at"] = now_t
+            state["count"] += 1
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            state["task"] = loop.create_task(self._narrate_codex(job, snippet))
+
+    async def _narrate_codex(self, job, snippet):
+        jid, sid = job["id"], job["sid"]
+        system = "你是进度播报员。根据 Codex 最近的一批操作日志，用 1~2 句简短大白话（不超过 70 字）告诉用户它当前在查什么或推进到哪一步，不要照抄文件名列表，不要客套。"
+        user = f"任务：{job['title'][:200]}\n最近日志：\n{snippet}"
+        summary = await self.quick_gemini(sid, system, user, tag="narrate", timeout=15)
+        if not summary:
+            return
+        line = " ".join(summary.splitlines()).strip()[:180]
+        if not line:
+            return
+        try:
+            with self.store.db:
+                self.store.guard(job)
+                self.store.event(sid, "progress", "gemini", "Gemini 进度解读 · " + line,
+                                 {"job": jid, "source": "Gemini", "narration": True})
+            self.notify(sid)
+        except Superseded:
+            return
+
+    async def gemini_coordinate_guidance(self, job, seq, text):
+        """用户发送引导时，让 Gemini 参与协同：向用户简短确认、整理给 Codex 的指令，并同步报告侧补充要求。"""
+        jid, sid = job["id"], job["sid"]
+        session = self.store.session(sid)
+        schema = pack(GuidanceReply.model_json_schema())
+        system = ("你是双模型协作中的 Gemini 协调者。用户在 GPT 正在执行工程任务时发起了中途引导。"
+                  "请严格返回符合下方 JSON Schema 的 JSON 对象，不要输出多余文字：\n" + schema)
+        brief_text = pack(session["brief"])[:800]
+        user = f"当前需求摘要：{brief_text}\n正在执行的任务：{job['title']}\n用户最新引导：{text}"
+        raw = await self.quick_gemini(sid, system, user, tag="guide", timeout=15)
+        if not raw:
+            return None
+        cleaned = raw.strip()
+        if cleaned.startswith("~~~") or cleaned.startswith("```"):
+            blocks = MarkdownIt().parse(cleaned)
+            if len(blocks) == 1 and blocks[0].type == "fence":
+                cleaned = blocks[0].content
+        try:
+            parsed = GuidanceReply.model_validate_json(cleaned)
+        except Exception:
+            return None
+        try:
+            with self.store.db:
+                self.store.guard(job)
+                self.store.event(sid, "progress", "gemini", "Gemini 协同引导 · " + parsed.ack[:200],
+                                 {"job": jid, "guide_seq": seq, "source": "Gemini"})
+                if parsed.report_note.strip():
+                    current = self.store.session(sid)
+                    brief = dict(current["brief"])
+                    note = parsed.report_note.strip()
+                    brief["report"] = (brief["report"] + "\n补充要求：" + note) if brief.get("report") else note
+                    self.store.db.execute("UPDATE sessions SET brief=? WHERE id=?", (pack(brief), sid))
+            self.notify(sid)
+        except Superseded:
+            return None
+        return parsed.codex_instruction.strip()
+
     def register_steering(self, job, send):
         jid, sid = job["id"], job["sid"]
         queue = self.steering[jid] = asyncio.Queue()
@@ -586,7 +699,13 @@ class Engine:
             while True:
                 seq, text = await queue.get()
                 items = self.store.inputs.for_session(sid, seq - 1).get(seq, [])
+                coordinated = None
+                if PROVIDERS[job["kind"]] == "openai" and job["kind"] in ("engineering", "verification"):
+                    self.set_activity(job, "Gemini 正在协同整理引导")
+                    coordinated = await self.gemini_coordinate_guidance(job, seq, text)
                 message = "用户对当前任务的最新引导。请调整接下来的工作，并保留原有的回复格式。\n" + text
+                if coordinated:
+                    message += "\nGemini 协同整理后的执行要点：\n" + coordinated
                 if items:
                     message += "\n本条消息的附件：" + pack(self.describe_inputs(items))
                 try:
@@ -1038,6 +1157,10 @@ class Engine:
             if worker:
                 worker.cancel()
                 await asyncio.gather(worker, return_exceptions=True)
+            narrator = (self.narration.pop(jid, None) or {}).get("task")
+            if narrator and not narrator.done():
+                narrator.cancel()
+                await asyncio.gather(narrator, return_exceptions=True)
             self.previews.pop(jid, None)
             self.notify(sid)
 
@@ -1074,6 +1197,10 @@ class Engine:
                 st.guard(job)
                 st.tool_result(call, args)
                 st.db.execute("UPDATE jobs SET payload=? WHERE id=?", (pack(dict(job["payload"], needs_input=True)), jid))
+                if job["kind"] in ("engineering", "verification"):
+                    st.db.execute(
+                        "UPDATE jobs SET status='obsolete' WHERE sid=? AND kind IN ('report','supervision') "
+                        "AND status IN ('waiting','ready')", (sid,))
                 st.finish(job, args["question"], {"needs_input": True})
             raise Superseded()
         if name == "request_verification":

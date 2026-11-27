@@ -93,6 +93,7 @@ class DesktopVideoTests(unittest.TestCase):
             self.assertAlmostEqual(player.position(), player.duration() // 2, delta=130)
         finally:
             preview.close()
+            QTest.qWait(50)
 
     def open_link(self, host, document, path):
         link = document.document().find('查看录像')

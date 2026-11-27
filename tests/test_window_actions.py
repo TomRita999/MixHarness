@@ -22,6 +22,7 @@ DOCUMENT = ROOT / 'README.md'
 
 
 @unittest.skipUnless(supported(), '真实窗口交互需要 macOS 14.2 或更新版本')
+@unittest.skipIf(os.environ.get('GITHUB_ACTIONS') == 'true', 'GitHub Actions macOS 虚拟机不支持跨进程辅助功能与键鼠注入')
 @requires_isolated_desktop
 class WindowTargetCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

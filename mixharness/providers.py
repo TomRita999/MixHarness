@@ -89,6 +89,12 @@ class Clarification(Arguments):
     question: str = Field(min_length=1)
 
 
+class GuidanceReply(BaseModel):
+    ack: str = Field(min_length=1, description="给用户的一两句简短确认，说明已理解引导并将如何调整。")
+    codex_instruction: str = Field(min_length=1, description="结合当前目标和施工红线，整理给 Codex 执行的具体引导指令。")
+    report_note: str = Field(default="", description="若用户引导涉及最终报告或验收标准的调整，写明补充要求；否则留空。")
+
+
 class SupervisionVerdict(Arguments):
     verdict: Literal["pass", "reject", "escalate"]
     summary: str = Field(min_length=1, description="一句话审查结论。")
@@ -98,7 +104,7 @@ class SupervisionVerdict(Arguments):
 FUNCTIONS = {
     **WINDOW_FUNCTIONS,
     "assess_goal": (GoalAssessment, "根据本轮实际交付与验证记录更新目标进度。"),
-    "ask_clarification": (Clarification, "向用户提出制定计划前必须回答的问题。"),
+    "ask_clarification": (Clarification, "需要用户提供额外信息、在外部程序中执行操作/确认或做方案选择时，直接向用户提问并暂停当前任务等待回复。"),
     "submit_supervision": (SupervisionVerdict, "提交对 GPT 代码改动的监工审查结论（pass / reject / escalate）。"),
     "list_files": (Arguments, "列出项目文件与已注册的验证命令。"),
     "read_file": (ReadFile, "读取 UTF-8 文件内容与 SHA256 摘要。"),
@@ -116,8 +122,8 @@ TOOLS = {
     "proposal": ["list_files", "read_file", "read_artifact", "ask_clarification"],
     "goal_check": ["list_files", "read_file", "read_artifact", "assess_goal"],
     "supervision": ["read_file", "read_artifact", "submit_supervision"],
-    "engineering": ["list_files", "read_file", "edit_file", "run_check", "run_command", "read_artifact"],
-    "verification": ["list_files", "read_file", "run_check", "run_command", "read_artifact"],
+    "engineering": ["list_files", "read_file", "edit_file", "run_check", "run_command", "read_artifact", "ask_clarification"],
+    "verification": ["list_files", "read_file", "run_check", "run_command", "read_artifact", "ask_clarification"],
     "report": ["read_artifact", "save_section", "draft_section", "request_verification"],
     "section": ["read_artifact", "save_section", "request_verification"],
 }
@@ -152,8 +158,10 @@ PROMPTS = {
 审查结束后必须调用 submit_supervision：无硬伤填 pass；发现明确问题填 reject 并写明具体文件名、位置与原因；遇到需要用户权衡拍板的取舍填 escalate。""",
     "engineering": """你负责会话中的工程开发与技术研究。用工具先读文件再修改，运行验证命令检查改动。
 严格遵守施工红线：不要私自加未经要求的硬编码超时、截断、禁网限制或删除原有功能。
+如果需要用户在目标程序里发起操作、点击确认、提供缺失信息或做关键选择，必须调用 ask_clarification 直接向用户提问并等待回复，不要盲目猜测或干等。
 研究与推导需写明前提和依据。完成后用简洁自然的中文说明改动内容与验证结果，避免套话和防御性免责声明。""",
     "verification": """你负责针对具体问题做验证。检查项目快照、运行验证命令或核对资料来源，如实给出方法、结果与结论。
+如果需要用户配合执行外部操作、登录或提供额外信息，调用 ask_clarification 直接向用户提问。
 如果缺少测试条件或数据，直接说明缺什么，不要堆砌防御性套话。""",
     "report": """你负责面向读者撰写内容，使用自然、通俗易懂的中文和 Markdown，避免机器味和防御性免责声明。
 长文可用 save_section 保存章节，等待验证期间可用 draft_section 并行撰写其他章节。
@@ -194,7 +202,7 @@ def instructions(job):
 def tool_names(kind, payload=None):
     base = TOOLS[kind]
     if kind in ("engineering", "verification") and (payload or {}).get("read_only"):
-        base = TOOLS["side"]
+        base = [*TOOLS["side"], "ask_clarification"]
     return [*base, *window_tools(kind, payload)]
 
 
@@ -209,6 +217,15 @@ class Turn:
     text: str
     calls: list = field(default_factory=list)
     sources: list = field(default_factory=list)
+
+
+async def google_quick(key, model, system_instruction, prompt):
+    http_options = {"async_client_args": {"timeout": (15.0, 20.0, 15.0, 15.0)}}
+    async with genai.Client(api_key=key, vertexai=False, http_options=http_options).aio as client:
+        response = await client.interactions.create(
+            model=model, system_instruction=system_instruction, input=prompt, store=False, api_version="v1",
+        )
+        return (response.output_text or "").strip()
 
 
 async def google_turn(key, job, context, results, preview):

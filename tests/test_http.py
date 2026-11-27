@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -36,7 +37,9 @@ def service(project):
     args = [sys.executable, '-m', 'mixharness', '--web', '--project', str(project),
             '--data-dir', str(project / '.mixharness'), '--port', '0']
     with path.open('wb') as log:
-        process = subprocess.Popen(args, cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+        process = subprocess.Popen(args, cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                   creationflags=flags)
         try:
             deadline = time.monotonic() + 20
             while True:
@@ -55,12 +58,19 @@ def service(project):
             yield url
         finally:
             if process.poll() is None:
-                process.terminate()
+                if os.name == 'nt':
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    process.terminate()
                 try:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
 
 
 class HttpTests(unittest.TestCase):

@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -65,36 +66,43 @@ class BrowserPage:
 
 @contextmanager
 def browser(executable, root, url):
-    profile = root / 'browser-profile'
-    profile.mkdir()
-    log = root / 'browser.log'
-    env = dict(os.environ, TMPDIR=str(root), TEMP=str(root), TMP=str(root))
-    with log.open('wb') as output:
-        process = subprocess.Popen([executable, '--headless', '--no-first-run', '--no-default-browser-check',
-                                    '--disable-background-networking', '--disable-extensions', '--disable-sync',
-                                    '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0',
-                                    '--user-data-dir=' + str(profile), url], env=env, cwd=root,
-                                   stdout=output, stderr=subprocess.STDOUT)
-        try:
-            active = profile / 'DevToolsActivePort'
-            deadline = time.monotonic() + 15
-            while not active.is_file() or not active.stat().st_size:
-                if process.poll() is not None or time.monotonic() >= deadline:
-                    raise AssertionError(log.read_text(errors='replace')[-2000:])
-                time.sleep(0.05)
-            port = int(active.read_text().splitlines()[0])
-            with urlopen(f'http://127.0.0.1:{port}/json/list', timeout=5) as response:
-                page = next(target for target in json.load(response) if target['type'] == 'page')
-            with connect(page['webSocketDebuggerUrl'], open_timeout=8, close_timeout=3) as channel:
-                yield BrowserPage(channel)
-        finally:
-            if process.poll() is None:
-                process.terminate()
+    # Linux 上 Chrome 的 SingletonSocket 受 108 字节 Unix Socket 路径上限约束，使用短系统临时目录避免路径超长。
+    with tempfile.TemporaryDirectory(prefix='mh-chr-') as short_tmp:
+        short_root = Path(short_tmp)
+        profile = short_root / 'p'
+        profile.mkdir()
+        log = root / 'browser.log'
+        env = dict(os.environ, TMPDIR=str(short_root), TEMP=str(short_root), TMP=str(short_root))
+        args = [executable, '--headless', '--no-first-run', '--no-default-browser-check',
+                '--disable-background-networking', '--disable-extensions', '--disable-sync',
+                '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0',
+                '--user-data-dir=' + str(profile)]
+        if sys.platform.startswith('linux'):
+            args.append('--no-sandbox')
+        args.append(url)
+        with log.open('wb') as output:
+            process = subprocess.Popen(args, env=env, cwd=root,
+                                       stdout=output, stderr=subprocess.STDOUT)
             try:
-                process.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+                active = profile / 'DevToolsActivePort'
+                deadline = time.monotonic() + 15
+                while not active.is_file() or not active.stat().st_size:
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        raise AssertionError(log.read_text(errors='replace')[-2000:])
+                    time.sleep(0.05)
+                port = int(active.read_text().splitlines()[0])
+                with urlopen(f'http://127.0.0.1:{port}/json/list', timeout=5) as response:
+                    page = next(target for target in json.load(response) if target['type'] == 'page')
+                with connect(page['webSocketDebuggerUrl'], open_timeout=8, close_timeout=3) as channel:
+                    yield BrowserPage(channel)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
 
 
 class BrowserVideoTests(unittest.TestCase):

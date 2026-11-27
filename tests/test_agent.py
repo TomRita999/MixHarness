@@ -304,3 +304,86 @@ class AgentTests(unittest.TestCase):
                 store.db.execute("UPDATE jobs SET status='running' WHERE id=?", (sup2_id,))
                 store.apply_supervision(store.job(sup2_id), "pass", "已移除超时限制，无其他问题", [])
             self.assertEqual(store.job(rep["id"])["status"], "ready")
+
+    def test_engineering_question_codex_narration_and_gemini_guidance(self):
+        with open_engine(self.root, self.home) as engine:
+            store = engine.store
+            sid = new_id()
+            with store.db:
+                store.create(sid, str(self.root), "gemini", "gpt", backend="clients")
+            engine.submit(sid, "在目标程序里抓包并整理报告", new_id())
+            plan_job = store.one("SELECT * FROM jobs WHERE sid=? AND kind='plan'", sid)
+            with store.db:
+                store.db.execute("UPDATE jobs SET status='running' WHERE id=?", (plan_job["id"],))
+            store.apply_plan(plan_job, {
+                "engineering": "抓包并排查请求", "engineering_mode": "develop",
+                "report": "写排查总结", "report_after_gpt": True,
+            }, "")
+            eng = store.one("SELECT * FROM jobs WHERE sid=? AND kind='engineering'", sid)
+            rep = store.one("SELECT * FROM jobs WHERE sid=? AND kind='report'", sid)
+            with store.db:
+                store.db.execute("UPDATE jobs SET status='running' WHERE id=?", (eng["id"],))
+                store.save_turn(eng, "c1", 0, "", [{"cid": "q1", "name": "ask_clarification",
+                                                    "args": {"question": "请在目标程序里发起一次登录请求并回复确认。"}}],
+                                backend="clients")
+            # 1) 工程任务调用 ask_clarification：直接展示提问并取消等待中的 report，不浪费报告 token
+            call = store.calls(store.job(eng["id"]))[0]
+            with self.assertRaises(Exception):
+                asyncio.run(engine.tool(store.job(eng["id"]), call, engine.sources(store.session(sid))))
+            snap = store.snapshot(sid)
+            q_events = [e for e in snap["events"] if e["kind"] == "message" and e["meta"].get("needs_input")]
+            self.assertEqual(len(q_events), 1)
+            self.assertIn("目标程序里发起一次登录请求", q_events[0]["body"])
+            self.assertFalse(q_events[0].get("intermediate"))
+            self.assertEqual(store.job(rep["id"])["status"], "obsolete")
+
+            # 2) Codex 中间日志 + Gemini 节流解读 + 3) 引导时 Gemini 协同参与
+            with store.db:
+                eng2_id = store.enqueue(store.session(sid), "engineering", {"task": "继续排查"})
+                store.db.execute("UPDATE jobs SET status='running' WHERE id=?", (eng2_id,))
+            eng2 = store.one("SELECT j.*,s.backend FROM jobs j JOIN sessions s ON s.id=j.sid WHERE j.id=?", eng2_id)
+            delivered = []
+
+            async def fake_quick(target_sid, system_prompt, user_prompt, *, tag="helper", timeout=15):
+                if tag == "narrate":
+                    return "Codex 正在排查登录代理与网络请求路径，下一步将定位超时原因。"
+                if tag == "guide":
+                    return json.dumps({
+                        "ack": "收到，已让 Codex 跳过 ruffle 直接检查打包脚本，报告里也会补充说明。",
+                        "codex_instruction": "停止排查 ruffle，直接修改 macos/package.sh 并验证。",
+                        "report_note": "报告里补充打包脚本改动说明。",
+                    }, ensure_ascii=False)
+                return None
+
+            engine.quick_gemini = fake_quick
+
+            async def exercise_live():
+                engine.narration[eng2_id] = {"buffer": [], "last_at": 0.0, "count": 0, "task": None}
+                engine.record_codex_progress(eng2, "读取文件：a.py", milestone=False, visible=False)
+                engine.record_codex_progress(eng2, "读取文件：b.py", milestone=False, visible=False)
+                engine.record_codex_progress(eng2, "Codex 已运行命令：pytest（退出码 0）", milestone=True, visible=True)
+                narrator = engine.narration[eng2_id]["task"]
+                self.assertIsNotNone(narrator)
+                await narrator
+
+                done = asyncio.Event()
+                async def fake_send(msg, images):
+                    delivered.append(msg)
+                    done.set()
+
+                engine.register_steering(eng2, fake_send)
+                engine.submit(sid, "别看 ruffle 了，直接改打包脚本，报告里顺便说明一下", new_id())
+                await asyncio.wait_for(done.wait(), timeout=3)
+                await asyncio.sleep(0.05)
+                worker = engine.steer_workers.pop(eng2_id, None)
+                if worker:
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+
+            asyncio.run(exercise_live())
+            events = store.snapshot(sid)["events"]
+            self.assertTrue(any("Gemini 进度解读 ·" in e["body"] for e in events))
+            self.assertTrue(any("Gemini 协同引导 ·" in e["body"] for e in events))
+            self.assertEqual(len(delivered), 1)
+            self.assertIn("停止排查 ruffle", delivered[0])
+            self.assertIn("报告里补充打包脚本改动说明", store.session(sid)["brief"]["report"])

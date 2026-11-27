@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -38,10 +39,12 @@ class WindowEntryTests(unittest.TestCase):
             (['--data-dir', str(data), 'window', 'bind'], '--control'),
             (['--data-dir', str(data), '--project', str(library)], '启动 MixHarness 桌面应用'),
         ]
+        utf8_env = dict(os.environ, PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
         for args, expected in cases:
             with self.subTest(args=args):
                 help_output = subprocess.run([sys.executable, '-m', 'mixharness', *args, '--help'], cwd=ROOT,
-                                             capture_output=True, text=True, timeout=30, check=True)
+                                             env=utf8_env, capture_output=True, text=True, encoding='utf-8',
+                                             timeout=30, check=True)
                 self.assertIn(expected, help_output.stdout)
         self.assertFalse(data.exists())
         self.assertFalse(library.exists())
@@ -61,13 +64,15 @@ class WindowEntryTests(unittest.TestCase):
                     port_one = json.loads((data_one / 'control.json').read_text())['port']
                     port_two = json.loads((data_two / 'control.json').read_text())['port']
                     self.assertNotEqual(port_one, port_two)
+                    utf8_env = dict(os.environ, PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
                     prefix = [sys.executable, '-m', 'mixharness', '--library', str(first), '--data-dir', str(data_one), 'window']
                     for action, receipt in [('status', {'id': sid, 'share': None}), ('stop', {'id': sid, 'stopped': False})]:
                         completed = await asyncio.to_thread(subprocess.run, [*prefix, action, sid], cwd=ROOT,
-                                                            capture_output=True, text=True, check=True, timeout=30)
+                                                            env=utf8_env, capture_output=True, text=True, encoding='utf-8',
+                                                            check=True, timeout=30)
                         self.assertEqual(json.loads(completed.stdout), receipt)
                     rejected = await asyncio.to_thread(subprocess.run, [*prefix, 'status', other], cwd=ROOT,
-                                                        capture_output=True, text=True, timeout=30)
+                                                        env=utf8_env, capture_output=True, text=True, encoding='utf-8', timeout=30)
                     self.assertNotEqual(rejected.returncode, 0)
                     connected, result = await remote_command(data_two, {'command': 'window', 'window_action': 'status', 'id': other})
                     self.assertTrue(connected)
@@ -78,8 +83,8 @@ class WindowEntryTests(unittest.TestCase):
             self.assertFalse((second / '.mixharness').exists())
             unused = self.root / 'offline-data'
             status = subprocess.run([sys.executable, '-m', 'mixharness.cli', '--library', str(first), '--data-dir',
-                                     str(unused), 'window', 'status', sid], cwd=ROOT, capture_output=True,
-                                    text=True, check=True, timeout=30)
+                                     str(unused), 'window', 'status', sid], cwd=ROOT, env=utf8_env,
+                                    capture_output=True, text=True, encoding='utf-8', check=True, timeout=30)
             self.assertIsNone(json.loads(status.stdout)['share'])
             self.assertFalse(unused.exists())
         asyncio.run(exercise())

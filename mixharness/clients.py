@@ -410,7 +410,16 @@ async def codex_turn(engine, job, cwd, prompt, schema):
             config.update({"features.apps": False, "features.plugins": False})
             effective = (await rpc.request("config/read", {"cwd": str(cwd)}))["config"]
             config["mcp_servers"] = {name: {"enabled": False} for name in effective.get("mcp_servers") or {}}
-        rpc.handle_request = lambda method, params: client_approval(engine, job, method, params, read_only=readonly)
+        async def handle_codex_request(method, data):
+            if method == "item/tool/requestUserInput":
+                text = "\n".join(
+                    q["question"] + ("\n" + " / ".join(o["label"] for o in q["options"]) if q.get("options") else "")
+                    for q in data.get("questions") or ()
+                ).strip()
+                if text:
+                    raise PlanQuestion(text)
+            return await client_approval(engine, job, method, data, read_only=readonly)
+        rpc.handle_request = handle_codex_request
         started = await rpc.request("thread/start", options)
         tid = started["thread"]["id"]
         if not started["thread"]["ephemeral"]:
@@ -418,6 +427,7 @@ async def codex_turn(engine, job, cwd, prompt, schema):
         if readonly and (started["sandbox"]["type"] != "readOnly" or started["approvalPolicy"] != "never"):
             raise ClientError("Codex 未确认只读权限，任务已停止")
         fragments, actions, complete, final, plan_text = [], [], None, "", ""
+        asked_questions = []
         turn_id = None
         def event(method, params):
             nonlocal complete, final, plan_text, turn_id
@@ -431,18 +441,48 @@ async def codex_turn(engine, job, cwd, prompt, schema):
                 if job["kind"] == "gpt_chat" and schema is None:
                     engine.previews[job["id"]] = "".join(fragments)
             elif method == "item/completed" and params["item"]["type"] == "agentMessage":
-                final = params["item"]["text"]
+                item = params["item"]
+                text = (item.get("text") or "").strip()
+                phase = item.get("phase")
+                if item.get("questions"):
+                    for q in item["questions"]:
+                        q_text = q.get("question") if isinstance(q, dict) else str(q)
+                        if q_text:
+                            asked_questions.append(q_text)
+                if phase == "commentary" and text:
+                    engine.record_codex_progress(job, "Codex 说明 · " + text[:260], milestone=True, visible=True)
+                elif text:
+                    final = text
+            elif method == "item/completed" and params["item"]["type"] == "reasoning":
+                summary = " ".join(s.strip() for s in (params["item"].get("summary") or ()) if isinstance(s, str) and s.strip())
+                if summary:
+                    engine.set_activity(job, "Codex：" + summary[:60])
+                    engine.record_codex_progress(job, "思考：" + summary[:200], milestone=False, visible=False)
             elif method == "item/completed" and params["item"]["type"] == "plan":
                 plan_text = params["item"]["text"]
             elif method == "item/completed" and params["item"]["type"] == "commandExecution":
                 item = params["item"]
-                actions.append({"命令": item["command"][:500], "退出码": item.get("exitCode")})
-                if item.get("exitCode") == 0:
-                    project_reads(engine, job, cwd, (a["path"] for a in item["commandActions"] if a["type"] == "read"),
-                                  "Codex", item.get("cwd"))
+                cmd = (item.get("command") or "")[:500]
+                exit_code = item.get("exitCode")
+                actions.append({"命令": cmd, "退出码": exit_code})
+                cmd_actions = item.get("commandActions") or []
+                read_paths = [a["path"] for a in cmd_actions if a.get("type") == "read" and a.get("path")]
+                if exit_code == 0 and read_paths:
+                    project_reads(engine, job, cwd, read_paths, "Codex", item.get("cwd"))
+                    engine.record_codex_progress(job, "读取文件：" + "、".join(read_paths[:5]), milestone=False, visible=False)
+                if not cmd_actions or any(a.get("type") != "read" for a in cmd_actions):
+                    status_str = f"（退出码 {exit_code}）" if exit_code is not None else ""
+                    engine.record_codex_progress(job, f"Codex 已运行命令：{cmd[:120]}{status_str}", milestone=True, visible=True)
             elif method == "item/completed" and params["item"]["type"] == "fileChange":
                 item = params["item"]
-                actions.append({"文件变更": [c["path"] for c in item["changes"]][:20], "状态": item["status"]})
+                paths = [c["path"] for c in item.get("changes") or () if c.get("path")][:20]
+                actions.append({"文件变更": paths, "状态": item.get("status")})
+                if paths:
+                    engine.record_codex_progress(job, "Codex 已修改文件：" + "、".join(paths[:6]), milestone=True, visible=True)
+            elif method == "item/completed" and params["item"]["type"] == "webSearch":
+                query = (params["item"].get("query") or "").strip()
+                if query:
+                    engine.record_codex_progress(job, "Codex 已联网搜索：" + query[:120], milestone=True, visible=True)
             elif method == "turn/completed":
                 complete = params["turn"]
         params = {"threadId": tid, "model": model, "serviceTier": tier, "outputSchema": schema,
@@ -458,12 +498,6 @@ async def codex_turn(engine, job, cwd, prompt, schema):
         if proposal:
             params.pop("outputSchema")
             params["collaborationMode"] = {"mode": "plan", "settings": {"model": model, "reasoning_effort": effort or None}}
-            async def planning_input(method, data):
-                if method == "item/tool/requestUserInput":
-                    raise PlanQuestion("\n".join(q["question"] + ("\n" + " / ".join(o["label"] for o in q["options"])
-                                            if q.get("options") else "") for q in data["questions"]))
-                return await client_approval(engine, job, method, data, read_only=True)
-            rpc.handle_request = planning_input
 
         async def interrupt():
             def terminal_event(method, data):
@@ -495,6 +529,8 @@ async def codex_turn(engine, job, cwd, prompt, schema):
             error = complete.get("error") or {}
             raise CodexTurnError(error.get("message") or "Codex 任务未完成", started["sandbox"]["type"],
                                  error.get("codexErrorInfo"), tid, complete["id"])
+        if asked_questions and not (plan_text or final):
+            raise PlanQuestion("\n".join(asked_questions))
         return plan_text or final or "".join(fragments)
 
 
@@ -510,13 +546,14 @@ class PlanQuestion(Exception):
     pass
 
 
-async def antigravity_turn(engine, job, cwd, prompt, *, preview_text=True):
+async def antigravity_turn(engine, job, cwd, prompt, *, preview_text=True, isolated_tag=None):
     # 一个主会话只关联一条独立存储的 Antigravity 会话；并行的报告和章节顺序续接。
     sid, model, permission = job["sid"], job["model"], job["permission"]
-    direct = job["kind"] in ("gemini_chat", "supervision")
+    direct = bool(isolated_tag) or job["kind"] in ("gemini_chat", "supervision")
     profile = private_directory(engine.home, sid)
     if direct:
-        profile = str(Path(profile) / ("supervise" if job["kind"] == "supervision" else "chat"))
+        subdir = isolated_tag or ("supervise" if job["kind"] == "supervision" else "chat")
+        profile = str(Path(profile) / subdir)
     lock = asyncio.Lock() if direct else engine.client_locks.setdefault(sid, asyncio.Lock())
     async with lock, connection("antigravity", private=profile, permission=permission) as rpc:
         info = await rpc.initialize("antigravity")

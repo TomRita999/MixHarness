@@ -85,6 +85,15 @@ class VideoPreview(QDialog):
             self.error_message.show()
             self.play_button.setEnabled(False)
 
-    def done(self, result):
+    def release_media(self):
         self.player.stop()
+        self.player.setSource(QUrl())
+        self.player.setSourceDevice(None)
+
+    def done(self, result):
+        self.release_media()
         super().done(result)
+
+    def closeEvent(self, event):
+        self.release_media()
+        super().closeEvent(event)
